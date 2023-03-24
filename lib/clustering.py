@@ -8,7 +8,7 @@ import scipy.stats as stat
 from pylab import cm
 from sklearn.manifold import TSNE
 import config
-from sklearn.cluster import KMeans,SpectralCoclustering,SpectralClustering,DBSCAN,MiniBatchKMeans,OPTICS
+from sklearn.cluster import KMeans,MiniBatchKMeans
 
 def normalizetorsion(df):
     tor = df.loc[:, df.columns!='i'].to_numpy()
@@ -65,13 +65,15 @@ def pcawithG(frames,idx_noH,dim,name):
     #
     # Create the visualization plot
     #
-    # plt.bar(range(0,len(exp_var_pca)), exp_var_pca, alpha=0.5, align='center', label='Individual explained variance')
-    # plt.step(range(0,len(cum_sum_eigenvalues)), cum_sum_eigenvalues, where='mid',label='Cumulative explained variance')
-    # plt.ylabel('Explained variance ratio')
-    # plt.xlabel('Principal component index')
-    # plt.legend(loc='best')
-    # plt.tight_layout()
-    # plt.savefig(config.data_dir+name+'/output/PCA_variance.png',dpi=450)
+    fig = plt.figure()
+    plt.bar(range(0,len(exp_var_pca)), exp_var_pca, alpha=0.5, align='center', label='Individual explained variance')
+    plt.step(range(0,len(cum_sum_eigenvalues)), cum_sum_eigenvalues, where='mid',label='Cumulative explained variance')
+    plt.ylabel('Explained variance ratio')
+    plt.xlabel('Principal component index')
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.savefig(config.data_dir+name+'/output/PCA_variance.png',dpi=450)
+    plt.cla()
     return PCA_components
 
 

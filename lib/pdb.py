@@ -121,7 +121,10 @@ def exportPDBmulti(fout,pdbdata,id):
 
 def exportframeidPDB(f,framesid,name):
     import glob
-    files = glob.glob(config.data_dir+name+"/cluster/*")
+    isExist = os.path.exists(config.data_dir+name+'/clusters')
+    if not isExist:
+            os.makedirs(config.data_dir+name+'/clusters')
+    files = glob.glob(config.data_dir+name+"/clusters/*")
     for t in files:
         try:
             os.remove(t)
@@ -150,7 +153,7 @@ def exportframeidPDB(f,framesid,name):
                 if k == len(framesid):
                     break
             for i in range(len(framesid)):
-                fn= open(config.data_dir+name+"/cluster/"+str(framesid[i][1])+"_"+str("{:.2f}".format(framesid[i][2]))+".pdb","w+")
+                fn= open(config.data_dir+name+"/clusters/"+str(framesid[i][1])+"_"+str("{:.2f}".format(framesid[i][2]))+".pdb","w+")
                 fn.write("# Cluster : "+str(i)+" Size : "+str("{:.2f}".format(framesid[i][2]))+"\n")
                 for line in frames[i]:
                     fn.write(line)

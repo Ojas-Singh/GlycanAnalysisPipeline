@@ -1,22 +1,43 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-# from lib import algo,pdb
 from lib import pdb
 import py3Dmol
 from stmol import showmol
 from PIL import Image
 import matplotlib.pyplot as plt
 import plotly.express as px
-from sklearn.cluster import KMeans
 import scipy.stats as stg
 import plotly.graph_objects as go
 import config
 import time,os
-from sklearn.cluster import KMeans,SpectralCoclustering,SpectralClustering,DBSCAN,MiniBatchKMeans,OPTICS
+from sklearn.cluster import KMeans,MiniBatchKMeans
 from scipy import stats
 from sklearn import metrics
 from scipy.spatial.distance import cdist
+import glob
+import tempfile
+import zipfile
+import streamlit as st
+from pathlib import Path
+import base64
+
+
+def zip_files_in_folder(folder_path, zip_path):
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                zip_file.write(file_path, os.path.relpath(file_path, folder_path))
+
+def create_zip_download(folder_path):
+    temp_dir = tempfile.gettempdir()
+    zip_name = "zipped_files.zip"
+    zip_path = os.path.join(temp_dir, zip_name)
+
+    zip_files_in_folder(folder_path, zip_path)
+
+    return zip_path
 
 
 st.set_page_config(page_title="GlycoShape", page_icon=None, layout="wide", initial_sidebar_state="auto", menu_items=None)
@@ -35,34 +56,29 @@ dirlist = [ item for item in os.listdir(config.data_dir) if os.path.isdir(os.pat
 
 glycan = st.sidebar.selectbox('Glycan Sequence :  ',(dirlist))
 
-
 fold=config.data_dir+ "/"+ glycan +"/output/structure.pdb"
 f=config.data_dir+ glycan 
-
 
 pca_df = pd.read_csv(f+"/output/pca.csv")
 df = pd.read_csv(f+"/output/torsions.csv")
 
-
-
-# st.write(df)
 with open(fold) as ifile:
     system = "".join([x for x in ifile])
     tab1, tab2, tab4 = st.tabs(["Structure", "PCA Clusters", "Sampler"])
     with tab1:
         col1, col2 = st.columns(2)
         with col1:
-            pass
-        st.write(glycan)
-        protein = pdb.parse(fold)
-        xyzview = py3Dmol.view()
-        xyzview.addModelsAsFrames(system)
-        xyzview.setStyle({'stick':{'color':'spectrum'}})
-        xyzview.addSurface(py3Dmol.VDW, {"opacity": 0.4, "color": "lightgrey"},{"hetflag": False})
+            st.code (glycan)
+            # st.write(glycan)
+            protein = pdb.parse(fold)
+            xyzview = py3Dmol.view()
+            xyzview.addModelsAsFrames(system)
+            xyzview.setStyle({'stick':{'color':'spectrum'}})
+            xyzview.addSurface(py3Dmol.VDW, {"opacity": 0.4, "color": "lightgrey"},{"hetflag": False})
 
-        xyzview.setBackgroundColor('#FFFFFF')
-        xyzview.zoomTo()
-        showmol(xyzview,height=800,width=900)
+            xyzview.setBackgroundColor('#FFFFFF')
+            xyzview.zoomTo()
+            showmol(xyzview,height=800,width=900)
         with col2:
             btn = st.download_button(
                         label="Download PDB Structure",
@@ -72,40 +88,34 @@ with open(fold) as ifile:
                     )
 
     with tab2:
-        fig0 = px.scatter_3d(
-            pca_df,
-            x="0",
-            y="1",
-            z="2",
-            color="i",
-            # color_continuous_scale="reds",
-        )
-        # fig0 = px.scatter(
-        #     pca_df,
-        #     x="0",
-        #     y="1",
-        #     color="i",
-        #     # color_continuous_scale="reds",
-        # )
-        fig0.update_traces(marker=dict(size=2,),
-                  selector=dict(mode='markers'))
-        
-
-        st.plotly_chart(fig0, theme="streamlit", use_conatiner_width=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            fig0 = px.scatter_3d(
+                pca_df,
+                x="0",
+                y="1",
+                z="2",
+                color="i"
+            )
+            fig0.update_traces(marker=dict(size=2,),
+                    selector=dict(mode='markers'))
+            st.plotly_chart(fig0, theme="streamlit", use_conatiner_width=True)
+        with col2:
+            st.image(f+"/output/PCA_variance.png")
+        n_dim = st.slider('PCA Dimensions to Consider :', 0, 19, 10)
+        selected_columns = [str(i) for i in range(1, n_dim+1)]
         # sil_scores = [metrics.silhouette_score(pca_df[['0','1','2','3','4','5','6','7','8','9']],
         #                         # KMeans(n_clusters=k).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']]).labels_
         #                         MiniBatchKMeans(compute_labels=True,n_clusters=k,init='k-means++', reassignment_ratio=0.05,max_iter=5000,batch_size=64).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']]).labels_
         # ,metric='euclidean')  for k in range(2,20)]
         # st.write(sil_scores)
-        n_clusters = st.slider('How many clusters?', 0, 50, 10)
-        clustering = MiniBatchKMeans(compute_labels=True,n_clusters=n_clusters,init='k-means++', reassignment_ratio=0.05,max_iter=5000,batch_size=64).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']])
-        # clustering = KMeans(n_clusters).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']])
-        # clustering = DBSCAN(eps=0.2, min_samples=100).fit(pca_df[['0','1']])
-        # clustering =  OPTICS(min_samples=100).fit(pca_df[['0','1']])
+        n_clusters = st.slider('Clusters Number :', 0, 20, 4)
+        # clustering = MiniBatchKMeans(compute_labels=True,n_clusters=n_clusters,init='k-means++', reassignment_ratio=0.05,max_iter=5000,batch_size=64).fit(pca_df[selected_columns])
+        print(pca_df[selected_columns].to_numpy())
+        clustering = KMeans(n_clusters).fit(pca_df[selected_columns].to_numpy(dtype=float))
         clustering_labels= clustering.labels_
         pca_df.insert(1,"cluster",clustering_labels,False)
-        df["cluster"] = clustering_labels
-        # df.insert(1,"cluster",clustering_labels,False)
+        df.insert(1,"cluster",clustering_labels,False)
         df["cluster"] = df["cluster"].astype(str)
         pca_df["cluster"] = pca_df["cluster"].astype(str)
         
@@ -113,14 +123,13 @@ with open(fold) as ifile:
             pca_df,
             x="0",
             y="1",
-            color="cluster",
-            # color_continuous_scale="reds",
+            color="cluster"
         )
         fig1.update_traces(marker=dict(size=2,),
                   selector=dict(mode='markers'))
         st.plotly_chart(fig1, theme="streamlit", use_conatiner_width=True)
         popp=[]
-        pcanp = pca_df[['0','1','2','3','4','5','6','7','8','9']].to_numpy()
+        pcanp = pca_df[selected_columns].to_numpy()
         for i in range(n_clusters):
             df0 = pca_df.loc[df["cluster"] ==str(i)]
             o=[]
@@ -135,9 +144,21 @@ with open(fold) as ifile:
         for i in range(len(popp)):
             popp[i].append(100*float(len(df.loc[(df['cluster']==str(i)),['cluster']].iloc[:]['cluster'].to_numpy())/len(df.iloc[:]['cluster'].to_numpy())))
         st.write(popp)
-        if st.button('save cluster center pdb',key="process"):
-            fmd=config.data_dir+name+"/"+name+".dry.pdb"
-            pdb.exportframeidPDB(fmd,popp,str(name))
+        clusters=[]
+        zip_path = create_zip_download(f+'/clusters')
+        if st.button("Create Zipped File of Clusters"):
+            with open(zip_path, "rb") as f:
+                bytes_data = f.read()
+                b64 = base64.b64encode(bytes_data).decode()
+                href = f'<a href="data:file/zip;base64,{b64}" download="{Path(zip_path).name}">Download All Clusters Zip File</a>'
+                st.markdown(href, unsafe_allow_html=True)
+        # for path in glob.glob(f+'/clusters/*.pdb'):
+        #     clusters.append(path)
+        # if len(clusters)>0:
+
+        if st.button('Save new Cluster Center to the Database',key="process"):
+            fmd=config.data_dir+glycan+"/"+glycan+".pdb"
+            pdb.exportframeidPDB(fmd,popp,str(glycan))
         xax = st.selectbox(
     'Select Torsion for X axis',
     (list(df.columns.values)),key="x")
