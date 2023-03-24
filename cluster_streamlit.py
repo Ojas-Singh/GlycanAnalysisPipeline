@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from lib import prep,algo,pdb
+# from lib import algo,pdb
+from lib import pdb
 import py3Dmol
 from stmol import showmol
 from PIL import Image
@@ -17,34 +18,42 @@ from scipy import stats
 from sklearn import metrics
 from scipy.spatial.distance import cdist
 
-st.title('Glycan Conformation Sampler for Nerds')
-st.header('')
-st.subheader("")
-dirlist = [ item for item in os.listdir(config.data_dir) if os.path.isdir(os.path.join(config.data_dir, item)) ]
-name = st.selectbox('Glycan Name :  ',(dirlist))
-fold=config.data_dir+ "/"+ name +"/"+ name+ ".pdb"
-f="data/"+name+"/"+name
 
-molrep = st.selectbox('Molecular Data : ',("Graph","Torsions"))
-if molrep == "Graph":
-    pca_df = pd.read_csv(f+"_G_pca.csv")
-    tsne_df = pd.read_csv(f+"_G_tsne.csv")
-    df = pd.read_csv(config.data_dir+ "/"+ name +"/"+ name+ '_torsions_full.csv')
-else:
-    pca_df = pd.read_csv(f+"_T_pca.csv")
-    tsne_df = pd.read_csv(f+"_T_tsne.csv")
-    df = pd.read_csv(config.data_dir+ "/"+ name +"/"+ name+ '_torsions.csv')
+st.set_page_config(page_title="GlycoShape", page_icon=None, layout="wide", initial_sidebar_state="auto", menu_items=None)
+
+hide_streamlit_style = """
+            <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            </style>
+            """
+st.markdown(hide_streamlit_style, unsafe_allow_html=True) 
+image = Image.open('logo.png')
+st.sidebar.image(image, caption='')
+glycan=""
+dirlist = [ item for item in os.listdir(config.data_dir) if os.path.isdir(os.path.join(config.data_dir, item)) ]
+
+glycan = st.sidebar.selectbox('Glycan Sequence :  ',(dirlist))
+
+
+fold=config.data_dir+ "/"+ glycan +"/output/structure.pdb"
+f=config.data_dir+ glycan 
+
+
+pca_df = pd.read_csv(f+"/output/pca.csv")
+df = pd.read_csv(f+"/output/torsions.csv")
 
 
 
 # st.write(df)
 with open(fold) as ifile:
     system = "".join([x for x in ifile])
-    tab1, tab2, tab4 = st.tabs(["Structure", "pca", "Sampler"])
+    tab1, tab2, tab4 = st.tabs(["Structure", "PCA Clusters", "Sampler"])
     with tab1:
         col1, col2 = st.columns(2)
         with col1:
             pass
+        st.write(glycan)
         protein = pdb.parse(fold)
         xyzview = py3Dmol.view()
         xyzview.addModelsAsFrames(system)
@@ -54,23 +63,30 @@ with open(fold) as ifile:
         xyzview.setBackgroundColor('#FFFFFF')
         xyzview.zoomTo()
         showmol(xyzview,height=800,width=900)
+        with col2:
+            btn = st.download_button(
+                        label="Download PDB Structure",
+                        data=system,
+                        file_name=glycan+".pdb",
+                        mime='text/csv'
+                    )
 
     with tab2:
-        # fig0 = px.scatter_3d(
-        #     pca_df,
-        #     x="0",
-        #     y="1",
-        #     z="2",
-        #     color="i",
-        #     # color_continuous_scale="reds",
-        # )
-        fig0 = px.scatter(
+        fig0 = px.scatter_3d(
             pca_df,
             x="0",
             y="1",
+            z="2",
             color="i",
             # color_continuous_scale="reds",
         )
+        # fig0 = px.scatter(
+        #     pca_df,
+        #     x="0",
+        #     y="1",
+        #     color="i",
+        #     # color_continuous_scale="reds",
+        # )
         fig0.update_traces(marker=dict(size=2,),
                   selector=dict(mode='markers'))
         
@@ -252,59 +268,59 @@ with open(fold) as ifile:
     #     st.plotly_chart(fig3, theme="streamlit", use_conatiner_width=True)
         
 
-    with tab4:
-        # clustering = KMeans(50).fit(pca_df[['X','Y']])
-        # clustering_labels= clustering.labels_
-        # pca_df.insert(1,"cluster",clustering_labels,False)
-        # df.insert(1,"cluster",clustering_labels,False)
+    # with tab4:
+    #     # clustering = KMeans(50).fit(pca_df[['X','Y']])
+    #     # clustering_labels= clustering.labels_
+    #     # pca_df.insert(1,"cluster",clustering_labels,False)
+    #     # df.insert(1,"cluster",clustering_labels,False)
         
-        fig1 = px.scatter(
-            pca_df,
-            x="0",
-            y="1",
-            color="cluster",
-            # color_continuous_scale="reds",
-        )
-        fig1.update_traces(marker=dict(size=2,),
-                  selector=dict(mode='markers'))
-        st.plotly_chart(fig1, theme="streamlit", use_conatiner_width=True)
-        cluster1= st.selectbox(
-    'From cluster?',
-    (list(range(50))),key="clu")
-        torsionrange = st.slider('Random torsion range?', 0, 10, 3)
-        import os
-        try:
-            os.remove('output/wig.pdb') 
-        except:
-            pass
-        if st.button('Process',key="process"):
-            G = pdb.parse("output/cluster/"+str(cluster1)+".pdb")
-            G= pdb.to_DF(G)
-            loaded = np.load('data/bisecting/bisecting_torparts.npz',allow_pickle=True)
-            Garr = G[['X','Y','Z']].to_numpy(dtype=float)
-            # tormeta = loaded["b"]
+    #     fig1 = px.scatter(
+    #         pca_df,
+    #         x="0",
+    #         y="1",
+    #         color="cluster",
+    #         # color_continuous_scale="reds",
+    #     )
+    #     fig1.update_traces(marker=dict(size=2,),
+    #               selector=dict(mode='markers'))
+    #     st.plotly_chart(fig1, theme="streamlit", use_conatiner_width=True)
+    #     cluster1= st.selectbox(
+    # 'From cluster?',
+    # (list(range(50))),key="clu")
+    #     torsionrange = st.slider('Random torsion range?', 0, 10, 3)
+    #     import os
+    #     try:
+    #         os.remove('output/wig.pdb') 
+    #     except:
+    #         pass
+    #     if st.button('Process',key="process"):
+    #         G = pdb.parse("output/cluster/"+str(cluster1)+".pdb")
+    #         G= pdb.to_DF(G)
+    #         loaded = np.load('data/bisecting/bisecting_torparts.npz',allow_pickle=True)
+    #         Garr = G[['X','Y','Z']].to_numpy(dtype=float)
+    #         # tormeta = loaded["b"]
 
-            # torsions = loaded["c"]
+    #         # torsions = loaded["c"]
 
-            torsionpoints = loaded["a"]
-            torsionparts  = loaded["b"]
-            # torsionparts = np.asarray(torsionparts)
-            # torsionpoints= np.asarray(torsionpoints)
-            molecules = []
-            for idx in range(20):
-                Garr1 = algo.Garrfromtorsiondemo(Garr,torsionpoints,torsionrange,torsionparts)
-                Gn =  pd.DataFrame(Garr1, columns = ['X','Y','Z'])
-                G.update(Gn)
-                g1 = pdb.exportPDBmulti('output/wig.pdb',pdb.to_normal(G),idx)
-            with open('output/wig.pdb') as ifile:
-                systemx = "".join([x for x in ifile])
-                xyzview1 = py3Dmol.view()
-                xyzview1.addModelsAsFrames(systemx)
-                xyzview1.setStyle({'stick':{'color':'spectrum'}})
-                # xyzview1.addSurface(py3Dmol.VDW, {"opacity": 0.4, "color": "lightgrey"},{"hetflag": False})
+    #         torsionpoints = loaded["a"]
+    #         torsionparts  = loaded["b"]
+    #         # torsionparts = np.asarray(torsionparts)
+    #         # torsionpoints= np.asarray(torsionpoints)
+    #         molecules = []
+    #         for idx in range(20):
+    #             Garr1 = algo.Garrfromtorsiondemo(Garr,torsionpoints,torsionrange,torsionparts)
+    #             Gn =  pd.DataFrame(Garr1, columns = ['X','Y','Z'])
+    #             G.update(Gn)
+    #             g1 = pdb.exportPDBmulti('output/wig.pdb',pdb.to_normal(G),idx)
+    #         with open('output/wig.pdb') as ifile:
+    #             systemx = "".join([x for x in ifile])
+    #             xyzview1 = py3Dmol.view()
+    #             xyzview1.addModelsAsFrames(systemx)
+    #             xyzview1.setStyle({'stick':{'color':'spectrum'}})
+    #             # xyzview1.addSurface(py3Dmol.VDW, {"opacity": 0.4, "color": "lightgrey"},{"hetflag": False})
 
-                xyzview1.setBackgroundColor('#FFFFFF') 
-                xyzview1.zoomTo()
-                xyzview1.animate({'loop': "forward"})
-                xyzview1.show()
-                showmol(xyzview1,height=800,width=900)
+    #             xyzview1.setBackgroundColor('#FFFFFF') 
+    #             xyzview1.zoomTo()
+    #             xyzview1.animate({'loop': "forward"})
+    #             xyzview1.show()
+    #             showmol(xyzview1,height=800,width=900)

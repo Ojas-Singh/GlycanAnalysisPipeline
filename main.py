@@ -5,6 +5,23 @@ import config
 from scipy import stats
 import os
 
+def extract_first_frame(input_pdb, output_pdb):
+    with open(input_pdb, 'r') as infile, open(output_pdb, 'w') as outfile:
+        model_started = False
+        for line in infile:
+            if line.startswith('MODEL'):
+                if not model_started:
+                    model_started = True
+                else:
+                    break
+            if model_started:
+                outfile.write(line)
+                
+        if not model_started:
+            print(f"No model found in {input_pdb}.")
+            return
+    print(f"First frame extracted and saved as {output_pdb}.")
+
 def list_directories(folder_path):
     directories = [
         d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d))
@@ -13,6 +30,7 @@ def list_directories(folder_path):
 
 def big_calculations(name):
     f=config.data_dir+name+"/"+name+".pdb"
+    extract_first_frame(f,config.data_dir+name+"/output/structure.pdb")
     pdbdata, frames = pdb.multi(f)
     df = pdb.to_DF(pdbdata)
     idx_noH=df.loc[(df['Element']!="H"),['Number']].iloc[:]['Number']-1
@@ -31,15 +49,13 @@ def big_calculations(name):
     torsiondataDF.to_csv(config.data_dir+name+"/output/torsions.csv",index_label="i")
 
 
-
-
 if __name__ == "__main__":
     folder_path = config.data_dir
     directory_list = list_directories(folder_path)
     print("Directories in folder:")
     for directory in directory_list:
+        print("Processing : ",directory)
         isExist = os.path.exists(config.data_dir+directory+'/output')
         if not isExist:
-                # Create a new directory because it does not exist
                 os.makedirs(config.data_dir+directory+'/output')
-        big_calculations(directory)
+                big_calculations(directory)

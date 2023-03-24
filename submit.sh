@@ -12,4 +12,4 @@ module load conda/2
 
 source activate /ichec/work/mulif007a/ojas/envs/analysis
 
-python prepare.py
+python main.py
