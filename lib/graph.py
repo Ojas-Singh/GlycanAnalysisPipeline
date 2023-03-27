@@ -5,7 +5,7 @@ import networkx as nx
 
 def Gfunction(r):
     # return 1/(r+.01)
-    return r
+    return 5-r
 
 def G_flatten(frame):
     G = distance.cdist(frame, frame, 'euclidean')

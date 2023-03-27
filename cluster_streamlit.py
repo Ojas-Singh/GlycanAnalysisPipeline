@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from lib import pdb
+from lib import clustering as clus
 import py3Dmol
 from stmol import showmol
 from PIL import Image
@@ -11,10 +12,9 @@ import scipy.stats as stg
 import plotly.graph_objects as go
 import config
 import time,os
-from sklearn.cluster import KMeans,MiniBatchKMeans
+from sklearn.cluster import MiniBatchKMeans
 from scipy import stats
 from sklearn import metrics
-from scipy.spatial.distance import cdist
 import glob
 import tempfile
 import zipfile
@@ -104,15 +104,16 @@ with open(fold) as ifile:
             st.image(f+"/output/PCA_variance.png")
         n_dim = st.slider('PCA Dimensions to Consider :', 0, 19, 10)
         selected_columns = [str(i) for i in range(1, n_dim+1)]
-        # sil_scores = [metrics.silhouette_score(pca_df[['0','1','2','3','4','5','6','7','8','9']],
-        #                         # KMeans(n_clusters=k).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']]).labels_
-        #                         MiniBatchKMeans(compute_labels=True,n_clusters=k,init='k-means++', reassignment_ratio=0.05,max_iter=5000,batch_size=64).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']]).labels_
-        # ,metric='euclidean')  for k in range(2,20)]
-        # st.write(sil_scores)
+        if st.button('Calculate Sil Score',key="score"):
+            sil_scores = [metrics.silhouette_score(pca_df[selected_columns],
+                                    # KMeans(n_clusters=k).fit(pca_df[['0','1','2','3','4','5','6','7','8','9']]).labels_
+                                    MiniBatchKMeans(compute_labels=True,n_clusters=k,init='k-means++',batch_size=64).fit(pca_df[selected_columns]).labels_
+            ,metric='euclidean')  for k in range(2,12)]
+            for i in range(2-2,12-2):
+                st.write("Cluster Number ",i+2," : ",sil_scores[i])
         n_clusters = st.slider('Clusters Number :', 0, 20, 4)
-        # clustering = MiniBatchKMeans(compute_labels=True,n_clusters=n_clusters,init='k-means++', reassignment_ratio=0.05,max_iter=5000,batch_size=64).fit(pca_df[selected_columns])
-        print(pca_df[selected_columns].to_numpy())
-        clustering = KMeans(n_clusters).fit(pca_df[selected_columns].to_numpy(dtype=float))
+        clustering = MiniBatchKMeans(compute_labels=True,n_clusters=n_clusters,init='random', reassignment_ratio=0.05,max_iter=5000,batch_size=8).fit(pca_df[selected_columns])
+
         clustering_labels= clustering.labels_
         pca_df.insert(1,"cluster",clustering_labels,False)
         df.insert(1,"cluster",clustering_labels,False)
@@ -130,78 +131,99 @@ with open(fold) as ifile:
         st.plotly_chart(fig1, theme="streamlit", use_conatiner_width=True)
         popp=[]
         pcanp = pca_df[selected_columns].to_numpy()
-        for i in range(n_clusters):
-            df0 = pca_df.loc[df["cluster"] ==str(i)]
-            o=[]
-            pp=clustering.cluster_centers_[i]
-            for j in range(len(df0.iloc[:,0])):
-                o.append([np.linalg.norm(np.asarray(pp[:])-pcanp[j]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
-                # o.append([np.linalg.norm(np.asarray(pp[:])-[pca_df[['0','1','2','3','4','5','6','7','8','9']].iloc[j]]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
-            o.sort()
-            popp.append([o[0][1],o[0][2]])
-        # st.write(popp)
-        sizee=[]
-        for i in range(len(popp)):
-            popp[i].append(100*float(len(df.loc[(df['cluster']==str(i)),['cluster']].iloc[:]['cluster'].to_numpy())/len(df.iloc[:]['cluster'].to_numpy())))
-        st.write(popp)
-        clusters=[]
-        zip_path = create_zip_download(f+'/clusters')
-        if st.button("Create Zipped File of Clusters"):
-            with open(zip_path, "rb") as f:
-                bytes_data = f.read()
-                b64 = base64.b64encode(bytes_data).decode()
-                href = f'<a href="data:file/zip;base64,{b64}" download="{Path(zip_path).name}">Download All Clusters Zip File</a>'
-                st.markdown(href, unsafe_allow_html=True)
-        # for path in glob.glob(f+'/clusters/*.pdb'):
-        #     clusters.append(path)
-        # if len(clusters)>0:
+        if st.button('Calculate KDE Centers of CLusters',key="kdee"):
+            #Test KDE centers
+            kde_centers=[]
+            for i in range(n_clusters):
+                data = pca_df.loc[df["cluster"] ==str(i)]
+                data = data[selected_columns].to_numpy()
+                # data = data[['0','1']].to_numpy()
+                # print(data)
+                bandwidth = clus.find_optimal_bandwidth(data)
 
-        if st.button('Save new Cluster Center to the Database',key="process"):
-            fmd=config.data_dir+glycan+"/"+glycan+".pdb"
-            pdb.exportframeidPDB(fmd,popp,str(glycan))
-        xax = st.selectbox(
-    'Select Torsion for X axis',
-    (list(df.columns.values)),key="x")
-        yax = st.selectbox(
-        'Select Torsion for Y axis',
-        (list(df.columns.values)),key="y")
-        t = np.linspace(-1, 1.2, 2000)
-        psi = df[xax]
-        phi = df[yax]
-        x=psi
-        y=phi
-        fig = go.Figure(go.Histogram2dContour(
-                x = x,
-                y = y,
-                colorscale = 'Blues'
-        ))
-        print()
-        # fig.add_trace(go.Scatter(pca_df.loc[(pca_df['i'] in list(np.asarray(popp).T[0])).item(),['0']].iloc[:]['0'], pca_df.loc[(pca_df['i'] in list(np.asarray(popp).T[0])).item(),['1']].iloc[:]['1'],mode='markers'
-        #             ))
-        fig.add_trace(go.Scatter(x=psi[np.asarray(popp,dtype=int).T[0]],y=phi[np.asarray(popp,dtype=int).T[0]],mode='markers'
-                    ))
+                kde_model = clus.KernelDensity(kernel='gaussian', bandwidth=bandwidth)
+                kde_model.fit(data)
 
-        st.plotly_chart(fig, theme="streamlit", use_container_width=True)
-        fig2 = px.scatter(
-            df,
-            x=xax,
-            y=yax,
-            color="i",
-            # color_continuous_scale="reds",
-        )
-        fig2.update_traces(marker=dict(size=2,),
-                  selector=dict(mode='markers'))
-        st.plotly_chart(fig2, theme="streamlit", use_conatiner_width=True)
-        fig3 = px.scatter(
-            df,
-            x=xax,
-            y=yax,
-            color="cluster",
-            # color_continuous_scale="reds",
-        )
-        fig3.update_traces(marker=dict(size=2,),
-                  selector=dict(mode='markers'))
-        st.plotly_chart(fig3, theme="streamlit", use_conatiner_width=True)
+                closest_point = clus.find_closest_point_to_max_kde(data, kde_model)
+                kde_centers.append(closest_point)
+                print("cluster", i ,"  :",closest_point)
+            for i in range(n_clusters):
+                df0 = pca_df.loc[df["cluster"] ==str(i)]
+                o=[]
+                # pp=clustering.cluster_centers_[i]
+                pp = kde_centers[i]
+                # print(pp)
+                for j in range(len(df0.iloc[:,0])):
+                    o.append([np.linalg.norm(np.asarray(pp[:])-pcanp[j]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
+                    # o.append([np.linalg.norm(np.asarray(pp[:])-[pca_df[['0','1','2','3','4','5','6','7','8','9']].iloc[j]]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
+                o.sort()
+                popp.append([o[0][1],o[0][2]])
+            # st.write(popp)
+            sizee=[]
+            for i in range(len(popp)):
+                popp[i].append(100*float(len(df.loc[(df['cluster']==str(i)),['cluster']].iloc[:]['cluster'].to_numpy())/len(df.iloc[:]['cluster'].to_numpy())))
+            st.write(popp)
+            clusters=[]
+            zip_path = create_zip_download(f+'/clusters')
+            if st.button("Create Zipped File of Clusters"):
+                with open(zip_path, "rb") as f:
+                    bytes_data = f.read()
+                    b64 = base64.b64encode(bytes_data).decode()
+                    href = f'<a href="data:file/zip;base64,{b64}" download="{Path(zip_path).name}">Download All Clusters Zip File</a>'
+                    st.markdown(href, unsafe_allow_html=True)
+            # for path in glob.glob(f+'/clusters/*.pdb'):
+            #     clusters.append(path)
+            # if len(clusters)>0:
+
+            
+
+
+            if st.button('Save new Cluster Center to the Database',key="process"):
+                fmd=config.data_dir+glycan+"/"+glycan+".pdb"
+                pdb.exportframeidPDB(fmd,popp,str(glycan))
+            xax = st.selectbox(
+        'Select Torsion for X axis',
+        (list(df.columns.values)),key="x")
+            yax = st.selectbox(
+            'Select Torsion for Y axis',
+            (list(df.columns.values)),key="y")
+            t = np.linspace(-1, 1.2, 2000)
+            psi = df[xax]
+            phi = df[yax]
+            x=psi
+            y=phi
+            fig = go.Figure(go.Histogram2dContour(
+                    x = x,
+                    y = y,
+                    colorscale = 'Blues'
+            ))
+            print()
+            # fig.add_trace(go.Scatter(pca_df.loc[(pca_df['i'] in list(np.asarray(popp).T[0])).item(),['0']].iloc[:]['0'], pca_df.loc[(pca_df['i'] in list(np.asarray(popp).T[0])).item(),['1']].iloc[:]['1'],mode='markers'
+            #             ))
+            fig.add_trace(go.Scatter(x=psi[np.asarray(popp,dtype=int).T[0]],y=phi[np.asarray(popp,dtype=int).T[0]],mode='markers'
+                        ))
+
+            st.plotly_chart(fig, theme="streamlit", use_container_width=True)
+            fig2 = px.scatter(
+                df,
+                x=xax,
+                y=yax,
+                color="i",
+                # color_continuous_scale="reds",
+            )
+            fig2.update_traces(marker=dict(size=2,),
+                    selector=dict(mode='markers'))
+            st.plotly_chart(fig2, theme="streamlit", use_conatiner_width=True)
+            fig3 = px.scatter(
+                df,
+                x=xax,
+                y=yax,
+                color="cluster",
+                # color_continuous_scale="reds",
+            )
+            fig3.update_traces(marker=dict(size=2,),
+                    selector=dict(mode='markers'))
+            st.plotly_chart(fig3, theme="streamlit", use_conatiner_width=True)
         
     # with tab3:
     #     fig0 = px.scatter(

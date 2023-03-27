@@ -5,66 +5,22 @@ from lib import graph
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import scipy.stats as stat
-from pylab import cm
-from sklearn.manifold import TSNE
 import config
 from sklearn.cluster import KMeans,MiniBatchKMeans
+from sklearn.neighbors import KernelDensity
+from sklearn.model_selection import GridSearchCV
+from scipy.optimize import minimize_scalar
 
-def normalizetorsion(df):
-    tor = df.loc[:, df.columns!='i'].to_numpy()
-    torxy=[]
-    for angle in range(len(tor)): 
-        torr=[]
-        x = 0
-        y = 0
-        for i in tor[angle]:
-            x += np.cos(np.deg2rad(i))
-            y += np.sin(np.deg2rad(i))
-        for i in range(len(tor[angle])):
-            torr.append(x)
-            torr.append(y)
-        torxy.append(torr)
-    torxy = np.asarray(torxy)
-    return torxy
-
-def pcawithT(tor,dim):
-    pca = PCA(n_components=dim)
-    t = pca.fit_transform(tor)
-    return pd.DataFrame(t)
-
-def tsnewithT(tor,dim):
-    t= TSNE(n_components=dim, perplexity=50.0, early_exaggeration=12.0, learning_rate='auto', n_iter=1000,n_iter_without_progress=300, min_grad_norm=1e-07, metric='euclidean', metric_params=None, init='pca', verbose=0, random_state=None, n_jobs=-1).fit_transform(tor)
-    return pd.DataFrame(t)
 
 def pcawithG(frames,idx_noH,dim,name):
     G = np.zeros((len(frames),int(len(frames[0][np.asarray(idx_noH,dtype=int)])*(len(frames[0][np.asarray(idx_noH,dtype=int)])+1)/2)))
     for i in range(len(frames)):
         G[i]= graph.G_flatten(frames[i][np.asarray(idx_noH,dtype=int)])
-    #
-    # Scale the dataset; This is very important before you apply PCA
-    #
-    # from sklearn.preprocessing import StandardScaler
-    # sc = StandardScaler()
-    # sc.fit(G)
-    # G_std = sc.transform(G)
-    #
-    # Determine transformed features
-    #
     pca = PCA(n_components=dim)
     t = pca.fit_transform(G)
     PCA_components = pd.DataFrame(t)
-    #
-    # Determine explained variance using explained_variance_ration_ attribute
-    #
     exp_var_pca = pca.explained_variance_ratio_
-    #
-    # Cumulative sum of eigenvalues; This will be used to create step plot
-    # for visualizing the variance explained by each principal component.
-    #
     cum_sum_eigenvalues = np.cumsum(exp_var_pca)
-    #
-    # Create the visualization plot
-    #
     fig = plt.figure()
     plt.bar(range(0,len(exp_var_pca)), exp_var_pca, alpha=0.5, align='center', label='Individual explained variance')
     plt.step(range(0,len(cum_sum_eigenvalues)), cum_sum_eigenvalues, where='mid',label='Cumulative explained variance')
@@ -75,16 +31,6 @@ def pcawithG(frames,idx_noH,dim,name):
     plt.savefig(config.data_dir+name+'/output/PCA_variance.png',dpi=450)
     plt.cla()
     return PCA_components
-
-
-def tsnewithG(frames,idx_noH,dim):
-    G = np.zeros((len(frames),int(len(frames[0][np.asarray(idx_noH,dtype=int)])*(len(frames[0][np.asarray(idx_noH,dtype=int)])+1)/2)))
-    for i in range(len(frames)):
-        G[i]= graph.G_flatten(frames[i][np.asarray(idx_noH,dtype=int)])
-    t= TSNE(n_components=dim,  perplexity=30.0, early_exaggeration=12.0, learning_rate='auto', n_iter=5000,n_iter_without_progress=300, min_grad_norm=1e-07, metric='euclidean', metric_params=None, init='pca', verbose=0, random_state=None, method='barnes_hut', angle=0.5, n_jobs=-1).fit_transform(G)
-    return pd.DataFrame(t)
-
-
 
 def findmaxima(f):
     f = -1*f
@@ -234,3 +180,28 @@ def plot3dkde(data):
     ax.contourf(xx, yy, f, zdir='z', offset=-0.8, cmap=plt.cm.YlGnBu_r)
     plt.show()
     # plt.savefig('output/PCA_KDE.png',dpi=450)
+
+def generate_data(n_samples, n_dimensions):
+    return np.random.rand(n_samples, n_dimensions)
+
+def find_optimal_bandwidth(data):
+    grid = GridSearchCV(KernelDensity(kernel='gaussian'),
+                        {'bandwidth': np.linspace(0.1, 1.0, 30)},
+                        cv=5)
+    grid.fit(data)
+    return grid.best_params_['bandwidth']
+
+def kde_score(point, kde_model):
+    return -kde_model.score_samples([point])
+
+def find_closest_point_to_max_kde(data, kde_model):
+    max_score = None
+    max_score_point = None
+
+    for point in data:
+        score = kde_score(point, kde_model)
+        if max_score is None or score < max_score:
+            max_score = score
+            max_score_point = point
+
+    return max_score_point
