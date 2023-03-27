@@ -144,7 +144,7 @@ with open(fold) as ifile:
 
                 closest_point = clus.find_closest_point_to_max_kde(data, kde_model)
                 kde_centers.append(closest_point)
-                print("cluster", i ,"  :",closest_point)
+            #     print("cluster", i ,"  :",closest_point)
             for i in range(n_clusters):
                 df0 = pca_df.loc[df["cluster"] ==str(i)]
                 o=[]
@@ -159,9 +159,9 @@ with open(fold) as ifile:
             for i in range(len(popp)):
                 popp[i].append(100*float(len(df.loc[(df['cluster']==str(i)),['cluster']].iloc[:]['cluster'].to_numpy())/len(df.iloc[:]['cluster'].to_numpy())))
             st.write(popp)
-            if st.button('Save new Cluster Center to the Database',key="process"):
-                fmd=config.data_dir+glycan+"/"+glycan+".pdb"
-                pdb.exportframeidPDB(fmd,popp,str(glycan))
+            # if st.button('Save new Cluster Center to the Database',key="process"):
+            fmd=config.data_dir+glycan+"/"+glycan+".pdb"
+            pdb.exportframeidPDB(fmd,popp,str(glycan))
             clusters=[]
             
         
@@ -189,7 +189,7 @@ with open(fold) as ifile:
                     y = y,
                     colorscale = 'Blues'
             ))
-            print()
+            # print()
             # fig.add_trace(go.Scatter(pca_df.loc[(pca_df['i'] in list(np.asarray(popp).T[0])).item(),['0']].iloc[:]['0'], pca_df.loc[(pca_df['i'] in list(np.asarray(popp).T[0])).item(),['1']].iloc[:]['1'],mode='markers'
             #             ))
             fig.add_trace(go.Scatter(x=psi[np.asarray(popp,dtype=int).T[0]],y=phi[np.asarray(popp,dtype=int).T[0]],mode='markers'
