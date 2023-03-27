@@ -137,8 +137,6 @@ with open(fold) as ifile:
             for i in range(n_clusters):
                 data = pca_df.loc[df["cluster"] ==str(i)]
                 data = data[selected_columns].to_numpy()
-                # data = data[['0','1']].to_numpy()
-                # print(data)
                 bandwidth = clus.find_optimal_bandwidth(data)
 
                 kde_model = clus.KernelDensity(kernel='gaussian', bandwidth=bandwidth)
@@ -152,10 +150,8 @@ with open(fold) as ifile:
                 o=[]
                 # pp=clustering.cluster_centers_[i]
                 pp = kde_centers[i]
-                # print(pp)
                 for j in range(len(df0.iloc[:,0])):
                     o.append([np.linalg.norm(np.asarray(pp[:])-pcanp[j]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
-                    # o.append([np.linalg.norm(np.asarray(pp[:])-[pca_df[['0','1','2','3','4','5','6','7','8','9']].iloc[j]]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
                 o.sort()
                 popp.append([o[0][1],o[0][2]])
             # st.write(popp)
@@ -163,8 +159,12 @@ with open(fold) as ifile:
             for i in range(len(popp)):
                 popp[i].append(100*float(len(df.loc[(df['cluster']==str(i)),['cluster']].iloc[:]['cluster'].to_numpy())/len(df.iloc[:]['cluster'].to_numpy())))
             st.write(popp)
+            if st.button('Save new Cluster Center to the Database',key="process"):
+                fmd=config.data_dir+glycan+"/"+glycan+".pdb"
+                pdb.exportframeidPDB(fmd,popp,str(glycan))
             clusters=[]
             zip_path = create_zip_download(f+'/clusters')
+
             if st.button("Create Zipped File of Clusters"):
                 with open(zip_path, "rb") as f:
                     bytes_data = f.read()
@@ -178,9 +178,7 @@ with open(fold) as ifile:
             
 
 
-            if st.button('Save new Cluster Center to the Database',key="process"):
-                fmd=config.data_dir+glycan+"/"+glycan+".pdb"
-                pdb.exportframeidPDB(fmd,popp,str(glycan))
+            
             xax = st.selectbox(
         'Select Torsion for X axis',
         (list(df.columns.values)),key="x")
