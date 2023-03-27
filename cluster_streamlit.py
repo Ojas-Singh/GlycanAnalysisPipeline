@@ -131,7 +131,7 @@ with open(fold) as ifile:
         st.plotly_chart(fig1, theme="streamlit", use_conatiner_width=True)
         popp=[]
         pcanp = pca_df[selected_columns].to_numpy()
-        if st.button('Calculate KDE Centers of CLusters',key="kdee"):
+        if st.button('Calculate KDE Centers of Clusters',key="kdee"):
             #Test KDE centers
             kde_centers=[]
             for i in range(n_clusters):
@@ -163,14 +163,8 @@ with open(fold) as ifile:
                 fmd=config.data_dir+glycan+"/"+glycan+".pdb"
                 pdb.exportframeidPDB(fmd,popp,str(glycan))
             clusters=[]
-            zip_path = create_zip_download(f+'/clusters')
-
-            if st.button("Create Zipped File of Clusters"):
-                with open(zip_path, "rb") as f:
-                    bytes_data = f.read()
-                    b64 = base64.b64encode(bytes_data).decode()
-                    href = f'<a href="data:file/zip;base64,{b64}" download="{Path(zip_path).name}">Download All Clusters Zip File</a>'
-                    st.markdown(href, unsafe_allow_html=True)
+            
+        
             # for path in glob.glob(f+'/clusters/*.pdb'):
             #     clusters.append(path)
             # if len(clusters)>0:
@@ -222,7 +216,15 @@ with open(fold) as ifile:
             fig3.update_traces(marker=dict(size=2,),
                     selector=dict(mode='markers'))
             st.plotly_chart(fig3, theme="streamlit", use_conatiner_width=True)
-        
+        zip_path = create_zip_download(f+'/clusters')
+        isExist = os.path.exists(f+'/clusters')
+        if isExist:
+            if st.button("Create Zipped File of Clusters"):
+                with open(zip_path, "rb") as f:
+                    bytes_data = f.read()
+                    b64 = base64.b64encode(bytes_data).decode()
+                    href = f'<a href="data:file/zip;base64,{b64}" download="{Path(zip_path).name}">Download All Clusters Zip File</a>'
+                    st.markdown(href, unsafe_allow_html=True)
     # with tab3:
     #     fig0 = px.scatter(
     #         tsne_df,
