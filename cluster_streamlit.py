@@ -92,6 +92,8 @@ with open(fold) as ifile:
                 lines = file.readlines()
                 exec(lines[0])
                 exec(lines[1])
+                exec(lines[2])
+            st.info('Dimensions considered for the clustering is ',n_dim)
             if st.button("Create Zipped File of Clusters"):
                 with open(zip_path, "rb") as f:
                     bytes_data = f.read()
@@ -167,6 +169,8 @@ with open(fold) as ifile:
                 with open(f+'/clusters/info.txt', 'w') as file:
                     file.write(f"n_clusters = {n_clusters}\n")
                     file.write(f"popp = {list(popp)}\n")
+                    file.write(f"n_dim = {list(n_dim)}\n")
+
                 
                 st.info('Please refresh this Page to View the Result!')
 
