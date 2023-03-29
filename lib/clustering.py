@@ -6,10 +6,11 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import scipy.stats as stat
 import config
-from sklearn.cluster import KMeans,MiniBatchKMeans
 from sklearn.neighbors import KernelDensity
 from sklearn.model_selection import GridSearchCV
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize
+import streamlit as st
+from sklearn import metrics
 
 
 def pcawithG(frames,idx_noH,dim,name):
@@ -125,30 +126,6 @@ def filterlow(data,k):
         popp.append([i,o[0][1]])
     return idx_top,popp
 
-def cluster(data,numofcluster,idx_top):
-    from sklearn.metrics.pairwise import pairwise_distances_argmin
-    s = data.loc[:, data.columns!='i'].to_numpy()
-    # s = normalizetorsion(data)
-    s = s[idx_top]
-    # clustering = SpectralClustering(n_clusters=numofcluster).fit(s)
-    clustering = MiniBatchKMeans(compute_labels=True,n_clusters=numofcluster,init='k-means++', max_iter=5000,batch_size=4).fit(s)
-    # mbk_means_cluster_centers = np.sort(clustering.cluster_centers_, axis = 0)
-    # clustering_labels = pairwise_distances_argmin(s, mbk_means_cluster_centers)
-    # clustering =  DBSCAN(eps=8, min_samples=10).fit(s)
-    # clustering = KMeans(n_clusters=numofcluster).fit(s)
-    # clustering =  OPTICS(min_samples=100).fit(s)
-    clustering_labels= clustering.labels_
-    label = []
-    k=0
-    for i in idx_top:
-        if i:
-            label.append(clustering_labels[k])
-            k+=1
-        else:
-            label.append(-1)
-
-    data["cluster"] = label
-    return data,label
 
 def plot3dkde(data):
     x=data["0"].to_numpy()
@@ -181,8 +158,6 @@ def plot3dkde(data):
     plt.show()
     # plt.savefig('output/PCA_KDE.png',dpi=450)
 
-def generate_data(n_samples, n_dimensions):
-    return np.random.rand(n_samples, n_dimensions)
 
 def find_optimal_bandwidth(data):
     grid = GridSearchCV(KernelDensity(kernel='gaussian'),
@@ -194,14 +169,68 @@ def find_optimal_bandwidth(data):
 def kde_score(point, kde_model):
     return -kde_model.score_samples([point])
 
-def find_closest_point_to_max_kde(data, kde_model):
-    max_score = None
-    max_score_point = None
+def kde_score_vec(points, kde_model):
+    return -kde_model.score_samples(points)
 
-    for point in data:
-        score = kde_score(point, kde_model)
-        if max_score is None or score < max_score:
-            max_score = score
-            max_score_point = point
+def find_closest_point_to_max_kde(cluster_data, kde_model):
+    bounds = [(min(cluster_data[:, dim]), max(cluster_data[:, dim])) for dim in range(cluster_data.shape[1])]
+    def neg_kde_score(x):
+        return kde_score_vec([x], kde_model)[0]
+    result = minimize(neg_kde_score, cluster_data.mean(axis=0), bounds=bounds, method='L-BFGS-B')
+    return result.x
 
-    return max_score_point
+
+from sklearn.mixture import GaussianMixture
+def best_clustering(n,data):
+    gmm = GaussianMixture(n_components=n, covariance_type='full', random_state=42)
+    gmm.fit(data)
+    labels = gmm.predict(data)
+    centroids = gmm.means_
+    return labels,centroids
+
+@st.cache_data
+def kde_c(n_clusters,pca_df,selected_columns):
+    popp=[]
+
+    pcanp = pca_df[selected_columns].to_numpy()
+    kde_centers=[]
+    for i in range(n_clusters):
+        data = pca_df.loc[pca_df["cluster"] ==str(i)]
+        data = data[selected_columns].to_numpy()
+        bandwidth = find_optimal_bandwidth(data)
+        kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth)
+        kde_model.fit(data)
+        closest_point = find_closest_point_to_max_kde(data, kde_model)
+        kde_centers.append(closest_point)
+    for i in range(n_clusters):
+        df0 = pca_df.loc[pca_df["cluster"] ==str(i)]
+        o=[]
+        # pp=clustering.cluster_centers_[i]
+        pp = kde_centers[i]
+        for j in range(len(df0.iloc[:,0])):
+            o.append([np.linalg.norm(np.asarray(pp[:])-pcanp[j]),df0["i"].iloc[j],df0["cluster"].iloc[j]])
+        o.sort()
+        popp.append([o[0][1],o[0][2]])
+    sizee=[]
+    for i in range(len(popp)):
+        popp[i].append(100*float(len(pca_df.loc[(pca_df['cluster']==str(i)),['cluster']].iloc[:]['cluster'].to_numpy())/len(pca_df.iloc[:]['cluster'].to_numpy())))
+
+    return popp
+
+def plot_Silhouette(pca_df,name):
+    selected_columns = [i for i in range(1, config.n_dim+1)]
+    x = [x for x in range(2,12)]
+    y = []
+    for i in x:
+        y.append(metrics.silhouette_score(pca_df[selected_columns],
+                                        best_clustering(i,pca_df[selected_columns])[0]
+                ,metric='euclidean'))
+    fig = plt.figure()
+    plt.plot(x, y)
+    plt.scatter(x,y)
+    plt.xlabel('Number of clusters')
+    plt.ylabel('Silhouette Score')
+    plt.title('Silhouette Score vs Number of Clusters')
+    plt.tight_layout()
+    plt.savefig(config.data_dir+name+'/output/Silhouette_Score.png',dpi=450)
+    plt.cla()
