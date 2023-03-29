@@ -58,6 +58,11 @@ if __name__ == "__main__":
         if not isExist:
                 print("Processing : ",directory)
                 os.makedirs(config.data_dir+directory+'/output')
-                big_calculations(directory)
+                try:
+                    big_calculations(directory)
+                    print("success!")
+                except:
+                    print("failed!")
+                    pass
         else:
             print("Skipping : ",directory)
