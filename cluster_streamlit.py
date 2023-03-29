@@ -93,7 +93,7 @@ with open(fold) as ifile:
                 exec(lines[0])
                 exec(lines[1])
                 exec(lines[2])
-            st.info('Dimensions considered for the clustering is ',n_dim)
+            st.write('Dimensions considered for the clustering is ',n_dim)
             if st.button("Create Zipped File of Clusters"):
                 with open(zip_path, "rb") as f:
                     bytes_data = f.read()
