@@ -146,7 +146,7 @@ with open(fold) as ifile:
                 st.info('Please, refresh this page to proceed!')
         else:
             st.warning('Clusters does not exist in Database, Please make clusters below!', icon=None)
-            n_dim = st.slider('PCA Dimensions to Consider :', 0, 19, 10)
+            n_dim = st.slider('PCA Dimensions to Consider :', 0, 19, 10,key="dim")
             selected_columns = [str(i) for i in range(1, n_dim+1)]
             if st.button('Calculate silhouette_score',key="score"):
                 for i in range(2-2,12-2):
@@ -169,7 +169,7 @@ with open(fold) as ifile:
                 with open(f+'/clusters/info.txt', 'w') as file:
                     file.write(f"n_clusters = {n_clusters}\n")
                     file.write(f"popp = {list(popp)}\n")
-                    file.write(f"n_dim = {list(n_dim)}\n")
+                    file.write(f"n_dim = {n_dim}\n")
 
                 
                 st.info('Please refresh this Page to View the Result!')
