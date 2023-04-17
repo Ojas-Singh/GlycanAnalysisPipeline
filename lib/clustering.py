@@ -22,6 +22,8 @@ def pcawithG(frames,idx_noH,dim,name):
     PCA_components = pd.DataFrame(t)
     exp_var_pca = pca.explained_variance_ratio_
     cum_sum_eigenvalues = np.cumsum(exp_var_pca)
+    # Find the index where cumulative explained variance is greater or equal to config.explained_variance
+    n_dim = np.argmax(cum_sum_eigenvalues >= config.explained_variance) + 1
     fig = plt.figure()
     plt.bar(range(0,len(exp_var_pca)), exp_var_pca, alpha=0.5, align='center', label='Individual explained variance')
     plt.step(range(0,len(cum_sum_eigenvalues)), cum_sum_eigenvalues, where='mid',label='Cumulative explained variance')
@@ -31,7 +33,7 @@ def pcawithG(frames,idx_noH,dim,name):
     plt.tight_layout()
     plt.savefig(config.data_dir+name+'/output/PCA_variance.png',dpi=450)
     plt.cla()
-    return PCA_components
+    return PCA_components,n_dim
 
 def findmaxima(f):
     f = -1*f
@@ -217,8 +219,8 @@ def kde_c(n_clusters,pca_df,selected_columns):
 
     return popp
 
-def plot_Silhouette(pca_df,name):
-    selected_columns = [i for i in range(1, config.n_dim+1)]
+def plot_Silhouette(pca_df,name,n_dim):
+    selected_columns = [i for i in range(1, n_dim)]
     x = [x for x in range(2,12)]
     y = []
     for i in x:
@@ -230,7 +232,7 @@ def plot_Silhouette(pca_df,name):
     plt.scatter(x,y)
     plt.xlabel('Number of clusters')
     plt.ylabel('Silhouette Score')
-    plt.title('Silhouette Score vs Number of Clusters')
+    plt.title('Silhouette Score vs Number of Clusters [n_dim : {n_dim}]')
     plt.tight_layout()
     plt.savefig(config.data_dir+name+'/output/Silhouette_Score.png',dpi=450)
     plt.cla()

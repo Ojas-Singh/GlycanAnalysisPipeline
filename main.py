@@ -33,8 +33,8 @@ def big_calculations(name):
     pdbdata, frames = pdb.multi(f)
     df = pdb.to_DF(pdbdata)
     idx_noH=df.loc[(df['Element']!="H"),['Number']].iloc[:]['Number']-1
-    pcaG= clustering.pcawithG(frames,idx_noH,config.number_of_dimensions,name)
-    clustering.plot_Silhouette(pcaG,name)
+    pcaG,n_dim= clustering.pcawithG(frames,idx_noH,config.number_of_dimensions,name)
+    clustering.plot_Silhouette(pcaG,name,n_dim)
     pcaG.to_csv(config.data_dir+name+"/output/pca.csv",index_label="i")
 
     pairs,external,internal = tfindr.torsionspairs(pdbdata,name)
