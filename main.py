@@ -28,25 +28,46 @@ def list_directories(folder_path):
     return directories
 
 def big_calculations(name):
-    f=config.data_dir+name+"/"+name+".pdb"
-    extract_first_frame(f,config.data_dir+name+"/output/structure.pdb")
-    pdbdata, frames = pdb.multi(f)
-    df = pdb.to_DF(pdbdata)
-    idx_noH=df.loc[(df['Element']!="H"),['Number']].iloc[:]['Number']-1
-    pcaG,n_dim= clustering.pcawithG(frames,idx_noH,config.number_of_dimensions,name)
-    clustering.plot_Silhouette(pcaG,name,n_dim)
-    pcaG.to_csv(config.data_dir+name+"/output/pca.csv",index_label="i")
+    # Set the input and output file paths
+    input_file = config.data_dir + name + "/" + name + ".pdb"
+    output_structure = config.data_dir + name + "/output/structure.pdb"
+    output_pca = config.data_dir + name + "/output/pca.csv"
+    output_torsions = config.data_dir + name + "/output/torsions.csv"
 
-    pairs,external,internal = tfindr.torsionspairs(pdbdata,name)
+    # Extract the first frame from the input file and save it to the output file
+    extract_first_frame(input_file, output_structure)
+
+    # Load the data and convert it to DataFrame format
+    pdb_data, frames = pdb.multi(input_file)
+    df = pdb.to_DF(pdb_data)
+
+    # Filter out hydrogen atoms and get their indices
+    idx_noH = df.loc[df['Element'] != "H", 'Number'] - 1
+
+    # Perform PCA with Gaussian clustering and plot the Silhouette score
+    pcaG, n_dim = clustering.pcawithG(frames, idx_noH, config.number_of_dimensions, name)
+    clustering.plot_Silhouette(pcaG, name, n_dim)
+
+    # Save the PCA data to a CSV file
+    pcaG.to_csv(output_pca, index_label="i")
+
+    # Compute torsion pairs for the protein structure
+    pairs, external, internal = tfindr.torsionspairs(pdb_data, name)
     pairs = np.asarray(pairs)
 
-    torsion_names = dihedral.pairtoname(external,df)
-    ext_DF = dihedral.pairstotorsion(external,frames,torsion_names)
-    for i in range(len(internal)):
+    # Convert pairs to torsion names
+    torsion_names = dihedral.pairtoname(external, df)
+    ext_DF = dihedral.pairstotorsion(external, frames, torsion_names)
+
+    # Add "internal" to torsion_names for internal torsions
+    for _ in range(len(internal)):
         torsion_names.append("internal")
 
-    torsiondataDF= dihedral.pairstotorsion(pairs,frames,torsion_names)
-    torsiondataDF.to_csv(config.data_dir+name+"/output/torsions.csv",index_label="i")
+    # Calculate torsion data and save it to a DataFrame
+    torsion_data_DF = dihedral.pairstotorsion(pairs, frames, torsion_names)
+
+    # Save the torsion data to a CSV file
+    torsion_data_DF.to_csv(output_torsions, index_label="i")
 
 
 if __name__ == "__main__":

@@ -232,7 +232,7 @@ def plot_Silhouette(pca_df,name,n_dim):
     plt.scatter(x,y)
     plt.xlabel('Number of clusters')
     plt.ylabel('Silhouette Score')
-    plt.title('Silhouette Score vs Number of Clusters [n_dim : {n_dim}]')
+    plt.title('Silhouette Score vs Number of Clusters [n_dim : '+str(n_dim)+' ]')
     plt.tight_layout()
     plt.savefig(config.data_dir+name+'/output/Silhouette_Score.png',dpi=450)
     plt.cla()
