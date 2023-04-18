@@ -163,7 +163,8 @@ with open(fold) as ifile:
                 popp = clustering.kde_c(n_clusters,pca_df,selected_columns)        
                 st.write(popp)
                 fmd=config.data_dir+glycan+"/"+glycan+".pdb"
-                pdb.exportframeidPDB(fmd,popp,str(glycan))
+                output_cluster_folder = config.data_dir + glycan + "/clusters/"
+                pdb.exportframeidPDB(fmd,popp,output_cluster_folder)
                 clusters=[]
 
                 with open(f+'/clusters/info.txt', 'w') as file:

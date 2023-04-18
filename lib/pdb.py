@@ -1,7 +1,6 @@
 #PDB Format from https://www.cgl.ucsf.edu/chimera/docs/UsersGuide/tutorials/pdbintro.html
 import numpy as np
 import pandas as pd
-import config
 import os
 
 def to_DF(pdbddata):
@@ -119,17 +118,10 @@ def exportPDBmulti(fout,pdbdata,id):
     fn.write("ENDMDL\n")
     return k
 
-def exportframeidPDB(f,framesid,name):
-    import glob
-    isExist = os.path.exists(config.data_dir+name+'/clusters')
+def exportframeidPDB(f,framesid,output_folder):
+    isExist = os.path.exists(output_folder)
     if not isExist:
-            os.makedirs(config.data_dir+name+'/clusters')
-    files = glob.glob(config.data_dir+name+"/clusters/*")
-    for t in files:
-        try:
-            os.remove(t)
-        except:
-            pass
+            os.makedirs(output_folder)
     frames=[]
     framesid.sort()
     for i in framesid:
@@ -146,26 +138,15 @@ def exportframeidPDB(f,framesid,name):
                     i+=1
                 if pp:
                     frames[k].append(line)
-
                 if pp== True and line.startswith("ENDMDL"):
                     pp=False
                     k+=1
                 if k == len(framesid):
                     break
             for i in range(len(framesid)):
-                fn= open(config.data_dir+name+"/clusters/"+str(framesid[i][1])+"_"+str("{:.2f}".format(framesid[i][2]))+".pdb","w+")
+                fn= open(output_folder+str(framesid[i][1])+"_"+str("{:.2f}".format(framesid[i][2]))+".pdb","w+")
                 fn.write("# Cluster : "+str(i)+" Size : "+str("{:.2f}".format(framesid[i][2]))+"\n")
                 for line in frames[i]:
                     fn.write(line)
                 fn.close()
                 
-# def mergepdb(f):
-#     frames=[]
-#     for i in f:
-#         fn=open(i, 'r')
-#         lines = fn.readlines()
-#         for line in lines:
-#             frames.append(line)
-#         fn.close()
-#     fo = open("")
-#     for i in frames
