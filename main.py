@@ -52,7 +52,7 @@ def big_calculations(name):
 
     # Saving the n_dim and n_clus to output/info.txt
     with open(output_info, 'w') as file:
-        file.write(f"n_clusters = {n_clus}\n")
+        file.write(f"n_clus = {n_clus}\n")
         file.write(f"n_dim = {n_dim}\n")
 
     # Save the PCA data to a CSV file
