@@ -1,7 +1,5 @@
 from scipy.spatial import distance
 import numpy as np
-import networkx as nx
-
 
 def Gfunction(r):
     return r

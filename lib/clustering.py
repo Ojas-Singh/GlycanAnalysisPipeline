@@ -7,9 +7,9 @@ import config
 from sklearn.neighbors import KernelDensity
 from sklearn.model_selection import GridSearchCV
 from scipy.optimize import minimize
-import streamlit as st
 from sklearn import metrics
 from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
 
 
 def pcawithG(frames,idx_noH,dim,name):
@@ -38,7 +38,7 @@ def pcawithG(frames,idx_noH,dim,name):
 def find_optimal_bandwidth(data):
     grid = GridSearchCV(KernelDensity(kernel='gaussian'),
                         {'bandwidth': np.linspace(0.1, 1.0, 30)},
-                        cv=5)
+                        cv=5,n_jobs=-1)
     grid.fit(data)
     return grid.best_params_['bandwidth']
 
@@ -62,7 +62,7 @@ def best_clustering(n,data):
     centroids = gmm.means_
     return labels,centroids
 
-@st.cache_data
+
 def kde_c(n_clusters,pca_df,selected_columns):
     popp=[]
     pcanp = pca_df[selected_columns].to_numpy()
@@ -70,6 +70,10 @@ def kde_c(n_clusters,pca_df,selected_columns):
     for i in range(n_clusters):
         data = pca_df.loc[pca_df["cluster"] ==str(i)]
         data = data[selected_columns].to_numpy()
+        # Scale data
+        scaler = StandardScaler()
+        data = scaler.fit_transform(data)
+
         bandwidth = find_optimal_bandwidth(data)
         kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth)
         kde_model.fit(data)

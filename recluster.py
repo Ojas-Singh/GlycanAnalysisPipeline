@@ -26,6 +26,10 @@ if __name__ == "__main__":
                             exec(lines[0])
                             exec(lines[1])
                             if flip.is_alpha(str(directory)):
+                                output_info = config.data_dir+directory+'/clusters/info.txt'
+                                input_torsion = config.data_dir+directory+'/output/torsions.csv'
+                                output_torsion = config.data_dir+directory+'/clusters/torsions.csv'
+                                output_pca = config.data_dir+directory+'/clusters/pca.csv'
                                 output_dir = config.data_dir+directory+'/clusters/alpha/'
                                 output_dir_flip = config.data_dir+directory+'/clusters/beta/'
                                 pca = config.data_dir+directory + "/output/pca.csv"
@@ -37,6 +41,15 @@ if __name__ == "__main__":
                                 pca_df["cluster"] = pca_df["cluster"].astype(str)
                                 popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
                                 pdb.exportframeidPDB(input_file,popp,output_dir)
+                                df = pd.read_csv(input_torsion)
+                                df.insert(1,"cluster",clustering_labels,False)
+                                df.to_csv(output_torsion, index_label="i")
+                                pca_df.to_csv(output_pca, index_label="i")
+                                # Saving the n_dim and n_clus to output/info.txt
+                                with open(output_info, 'w') as file:
+                                    file.write(f"n_clus = {n_clus}\n")
+                                    file.write(f"n_dim = {n_dim}\n")
+                                    file.write(f"popp = {list(popp)}\n")
                                 try:
                                     pdb_files = [f for f in os.listdir(output_dir) if f.endswith(".pdb")]
                                     print(pdb_files)
@@ -47,6 +60,10 @@ if __name__ == "__main__":
                                     print("failed!")
                                     pass
                             else: 
+                                output_info = config.data_dir+directory+'/clusters/info.txt'
+                                input_torsion = config.data_dir+directory+'/output/torsions.csv'
+                                output_torsion = config.data_dir+directory+'/clusters/torsions.csv'
+                                output_pca = config.data_dir+directory+'/clusters/pca.csv'
                                 output_dir = config.data_dir+directory+'/clusters/beta/'
                                 output_dir_flip = config.data_dir+directory+'/clusters/alpha/'
                                 pca = config.data_dir+directory + "/output/pca.csv"
@@ -58,6 +75,15 @@ if __name__ == "__main__":
                                 pca_df["cluster"] = pca_df["cluster"].astype(str)
                                 popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
                                 pdb.exportframeidPDB(input_file,popp,output_dir)
+                                df = pd.read_csv(input_torsion)
+                                df.insert(1,"cluster",clustering_labels,False)
+                                df.to_csv(output_torsion, index_label="i")
+                                pca_df.to_csv(output_pca, index_label="i")
+                                # Saving the n_dim and n_clus to output/info.txt
+                                with open(output_info, 'w') as file:
+                                    file.write(f"n_clus = {n_clus}\n")
+                                    file.write(f"n_dim = {n_dim}\n")
+                                    file.write(f"popp = {list(popp)}\n")
                                 try:
                                     pdb_files = [f for f in os.listdir(output_dir) if f.endswith(".pdb")]
                                     print(pdb_files)

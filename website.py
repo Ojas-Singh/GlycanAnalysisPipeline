@@ -47,8 +47,8 @@ dirlist = [ item for item in os.listdir(config.data_dir) if os.path.isdir(os.pat
 glycan = st.sidebar.selectbox('Glycan Sequence :  ',(dirlist))
 fold=config.data_dir+ "/"+ glycan +"/output/structure.pdb"
 f=config.data_dir+ glycan 
-pca_df = pd.read_csv(f+"/output/pca.csv")
-df = pd.read_csv(f+"/output/torsions.csv")
+pca_df = pd.read_csv(f+"/clusters/pca.csv")
+df = pd.read_csv(f+"/clusters/torsions.csv")
 with open(fold) as ifile:
     system = "".join([x for x in ifile])
     tab1, tab2, tab3 = st.tabs(["Structure", "GAP Clusters", "Manual Cluster"])
@@ -86,10 +86,11 @@ with open(fold) as ifile:
         if isExist:
             st.info('Fetched Cluster from Database!')
             
-            with open(f+'/output/info.txt', 'r') as file:
+            with open(f+'/clusters/info.txt', 'r') as file:
                 lines = file.readlines()
                 exec(lines[0])
                 exec(lines[1])
+                exec(lines[2])
             selected_columns = [str(i) for i in range(1, n_dim+1)]
             st.write('Dimensions considered for the clustering is ',n_dim)
             if st.button("Create Zipped File of Clusters"):
@@ -98,31 +99,32 @@ with open(fold) as ifile:
                     b64 = base64.b64encode(bytes_data).decode()
                     href = f'<a href="data:file/zip;base64,{b64}" download="{Path(zip_path).name}">Download All Clusters Zip File</a>'
                     st.markdown(href, unsafe_allow_html=True)
-            clustering_labels,pp = clustering.best_clustering(n_clus,pca_df[selected_columns])
-            pca_df.insert(1,"cluster",clustering_labels,False)
-            df.insert(1,"cluster",clustering_labels,False)
+            # clustering_labels,pp = clustering.best_clustering(n_clus,pca_df[selected_columns])
+            # pca_df.insert(1,"cluster",clustering_labels,False)
+            # df.insert(1,"cluster",clustering_labels,False)
             df["cluster"] = df["cluster"].astype(str)
             pca_df["cluster"] = pca_df["cluster"].astype(str)
             fig1 = px.scatter_3d(pca_df,x="0",y="1",z="2",color="cluster")
             fig1.update_traces(marker=dict(size=2,),selector=dict(mode='markers'))
             st.plotly_chart(fig1, theme="streamlit", use_conatiner_width=True)
+            st.write(popp)
 
             list_torsion = list(df.columns.values)
             list_torsion.pop(0)
             list_torsion.pop(0)
             xax = st.selectbox(
             'Select Torsion for X axis',
-            (list_torsion),key="x",index=0)
+            (list_torsion),key="x",index=1)
             yax = st.selectbox(
             'Select Torsion for Y axis',
-            (list_torsion),key="y",index=1)
+            (list_torsion),key="y",index=2)
             t = np.linspace(-1, 1.2, 2000)
             psi = df[xax]
             phi = df[yax]
             x=psi
             y=phi
             fig = go.Figure(go.Histogram2dContour(x = x,y = y,colorscale = 'Blues'))
-            # fig.add_trace(go.Scatter(x=psi[np.asarray(popp,dtype=int).T[0]],y=phi[np.asarray(popp,dtype=int).T[0]],mode='markers'))
+            fig.add_trace(go.Scatter(x=psi[np.asarray(popp,dtype=int).T[0]],y=phi[np.asarray(popp,dtype=int).T[0]],mode='markers'))
             fig.update_yaxes(range=(-180, 180),constrain='domain')               
             fig.update_xaxes(range=(-180, 180),constrain='domain')
             st.plotly_chart(fig, theme="streamlit", use_container_width=True)
@@ -135,7 +137,10 @@ with open(fold) as ifile:
             fig3.update_yaxes(range=(-180, 180),constrain='domain')               
             fig3.update_xaxes(range=(-180, 180),constrain='domain')
             fig3.update_traces(marker=dict(size=2,),selector=dict(mode='markers'))
+            # fig3.add_trace(go.Scatter(x=psi[np.asarray(popp,dtype=int).T[0]],y=phi[np.asarray(popp,dtype=int).T[0]],mode='markers'))
+
             st.plotly_chart(fig3, theme="streamlit", use_conatiner_width=True)
+
 
 
     with tab3:

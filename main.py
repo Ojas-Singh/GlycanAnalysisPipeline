@@ -50,11 +50,7 @@ def big_calculations(name):
     pcaG, n_dim = clustering.pcawithG(frames, idx_noH, config.number_of_dimensions, name)
     n_clus = clustering.plot_Silhouette(pcaG, name, n_dim)
 
-    # Saving the n_dim and n_clus to output/info.txt
-    with open(output_info, 'w') as file:
-        file.write(f"n_clus = {n_clus}\n")
-        file.write(f"n_dim = {n_dim}\n")
-
+    
     # Save the PCA data to a CSV file
     pcaG.to_csv(output_pca, index_label="i")
 
@@ -66,6 +62,13 @@ def big_calculations(name):
     pca_df["cluster"] = pca_df["cluster"].astype(str)
     popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
     pdb.exportframeidPDB(input_file,popp,output_cluster_folder)
+
+    # Saving the n_dim and n_clus to output/info.txt
+    with open(output_info, 'w') as file:
+        file.write(f"n_clus = {n_clus}\n")
+        file.write(f"n_dim = {n_dim}\n")
+        file.write(f"popp = {list(popp)}\n")
+
 
     # Compute torsion pairs for the protein structure
     pairs, external, internal = tfindr.torsionspairs(pdb_data, name)
