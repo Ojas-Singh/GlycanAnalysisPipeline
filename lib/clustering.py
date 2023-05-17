@@ -13,7 +13,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 def pcawithG(frames,idx_noH,dim,name):
-    G = np.zeros((len(frames),int(len(frames[0][np.asarray(idx_noH,dtype=int)])*(len(frames[0][np.asarray(idx_noH,dtype=int)])+1)/2)))
+    G = np.zeros((len(frames),int(len(frames[0][np.asarray(idx_noH,dtype=int)])*(len(frames[0][np.asarray(idx_noH,dtype=int)])-1)/2)))
     for i in range(len(frames)):
         G[i]= graph.G_flatten(frames[i][np.asarray(idx_noH,dtype=int)])
     pca = PCA(n_components=dim)

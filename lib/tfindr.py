@@ -35,8 +35,8 @@ def parse_mol2_bonds(file_path):
 
 
 def savetotorparts(name):
-    f=config.data_dir+name+"/"+name+".pdb"
-    f2 = config.data_dir+name+"/"+"graph"
+    f=config.data_dir+name+"/output/structure.pdb"
+    f2 = config.data_dir+name+"/"+name+".mol2"
     pdbdata = pdb.parse(f)
     df = pdb.to_DF(pdbdata)
     connect = parse_mol2_bonds(f2)
@@ -67,10 +67,37 @@ def savetotorparts(name):
         # elif df.loc[(df['Number']==node),['Element']].iloc[0]['Element']=="O":
         #     color_map.append('green')
         else: 
-            color_map.append('blue') 
+            color_map.append('orange') 
 
-    nx.draw(G, pos=nx.kamada_kawai_layout(G),node_color=color_map, with_labels = True)
-    plt.show()
+            # Define node and edge properties
+        node_size = 800
+        node_alpha = 0.8
+        node_color_map = color_map # Your color_map is assumed to be defined here
+        edge_width = 2
+        edge_alpha = 0.6
+        font_size = 18
+        bg_color = 'white'
+
+        # Set the plot background color
+        plt.figure(figsize=(10, 10))
+        ax = plt.gca()
+        ax.set_facecolor(bg_color)
+
+        # Draw the graph with modified properties
+        nx.draw(
+            G,
+            pos=nx.kamada_kawai_layout(G),
+            node_size=node_size,
+            node_color=node_color_map,
+            alpha=node_alpha,
+            with_labels=True,
+            width=edge_width,
+            edge_color='grey',
+            font_size=font_size,
+        )
+        plt.savefig(config.data_dir+name+'/output/graph.png',dpi=450)
+        # Show the plot
+        # plt.show()
 
     anotherlist=[]
 

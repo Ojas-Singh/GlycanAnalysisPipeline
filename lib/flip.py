@@ -29,6 +29,7 @@ def flip_alpha_beta(input_pdb, output_pdb):
     HO1O1_vector = HO1.coord - O1.coord
 
     new_O1_coord = C1.coord + CH1_vector
+    new_O1_coord = C1.coord + CH1_vector * 1.43 / np.linalg.norm(CH1_vector)
     O1.set_coord(new_O1_coord)
 
     new_H1_coord = C1.coord + CO1_vector
