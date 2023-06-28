@@ -11,15 +11,24 @@ def flip_alpha_beta(input_pdb, output_pdb):
     O1 = None
     HO1 = None
 
-    for atom in structure.get_atoms():
-        if atom.get_name() == "C1" and atom.get_parent().get_id()[1] == 2:
-            C1 = atom
-        elif atom.get_name() == "H1" and atom.get_parent().get_id()[1] == 2:
-            H1 = atom
-        elif atom.get_name() == "O1" and atom.get_parent().get_id()[1] == 1:
-            O1 = atom
-        elif atom.get_name() == "HO1" and atom.get_parent().get_id()[1] == 1:
-            HO1 = atom
+    for residue in structure.get_residues():
+        if residue.get_id()[1] == 2:  # Checks for ResID 2
+            resname = residue.get_resname()
+            # Switch the last character from 'A' to 'B' or vice versa
+            if resname[-1] == "A":
+                residue.resname = resname[:-1] + 'B'
+            elif resname[-1] == "B":
+                residue.resname = resname[:-1] + 'A'
+
+        for atom in residue:
+            if atom.get_name() == "C1" and residue.get_id()[1] == 2:
+                C1 = atom
+            elif atom.get_name() == "H1" and residue.get_id()[1] == 2:
+                H1 = atom
+            elif atom.get_name() == "O1" and residue.get_id()[1] == 1:
+                O1 = atom
+            elif atom.get_name() == "HO1" and residue.get_id()[1] == 1:
+                HO1 = atom
 
     if not (C1 and H1 and O1 and HO1):
         raise ValueError("One or more of the required atoms (C1, H1, O1, HO1) not found in the input PDB file.")
