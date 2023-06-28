@@ -62,7 +62,7 @@ def find_alpha_or_beta_oh_from_filename(filename):
     glycan_sequence = get_glycan_sequence_from_filename(filename)
     last_residue = glycan_sequence[-1]
     
-    if "a1-OH" in last_residue:
+    if "a1-OH" in last_residue or "a2-OH" in last_residue:
         return "Alpha OH"
     elif "b1-OH" in last_residue:
         return "Beta OH"
