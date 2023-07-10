@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
-from lib import pdb,graph,dihedral,clustering,tfindr
+from lib import pdb,dihedral,clustering,tfindr
 import config
-import os,sys,traceback
+import os,traceback,logging
 
 def extract_first_frame(input_pdb, output_pdb):
     with open(input_pdb, 'r') as infile, open(output_pdb, 'w') as outfile:
@@ -46,29 +46,33 @@ def big_calculations(name):
     # Filter out hydrogen atoms and get their indices
     idx_noH = df.loc[df['Element'] != "H", 'Number'] - 1
 
-    # Perform PCA with Gaussian clustering and plot the Silhouette score, plot_Silhouette function also gives n_clus (best number of clusters)
-    pcaG, n_dim = clustering.pcawithG(frames, idx_noH, config.number_of_dimensions, name)
-    n_clus = clustering.plot_Silhouette(pcaG, name, n_dim)
+    try:
+        # Perform PCA with Gaussian clustering and plot the Silhouette score, plot_Silhouette function also gives n_clus (best number of clusters)
+        pcaG, n_dim = clustering.pcawithG(frames, idx_noH, config.number_of_dimensions, name)
+        # Save the PCA data to a CSV file
+        pcaG.to_csv(output_pca, index_label="i")
 
-    
-    # Save the PCA data to a CSV file
-    pcaG.to_csv(output_pca, index_label="i")
+        n_clus = clustering.plot_Silhouette(pcaG, name, n_dim)
+        
 
-    # clustering 
-    pca_df = pd.read_csv(output_pca)
-    selected_columns = [str(i) for i in range(1, n_dim+1)]
-    clustering_labels,pp = clustering.best_clustering(n_clus,pca_df[selected_columns])
-    pca_df.insert(1,"cluster",clustering_labels,False)
-    pca_df["cluster"] = pca_df["cluster"].astype(str)
-    popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
-    pdb.exportframeidPDB(input_file,popp,output_cluster_folder)
+        # clustering 
+        pca_df = pd.read_csv(output_pca)
+        selected_columns = [str(i) for i in range(1, n_dim+1)]
+        clustering_labels,pp = clustering.best_clustering(n_clus,pca_df[selected_columns])
+        pca_df.insert(1,"cluster",clustering_labels,False)
+        pca_df["cluster"] = pca_df["cluster"].astype(str)
+        popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
+        pdb.exportframeidPDB(input_file,popp,output_cluster_folder)
 
-    # Saving the n_dim and n_clus to output/info.txt
-    with open(output_info, 'w') as file:
-        file.write(f"n_clus = {n_clus}\n")
-        file.write(f"n_dim = {n_dim}\n")
-        file.write(f"popp = {list(popp)}\n")
-
+        # Saving the n_dim and n_clus to output/info.txt
+        with open(output_info, 'w') as file:
+            file.write(f"n_clus = {n_clus}\n")
+            file.write(f"n_dim = {n_dim}\n")
+            file.write(f"popp = {list(popp)}\n")
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        print("PCA failed!")
+        pass
 
     # Compute torsion pairs for the protein structure
     pairs, external, internal = tfindr.torsionspairs(pdb_data, name)

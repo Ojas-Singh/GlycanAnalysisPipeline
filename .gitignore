@@ -11,3 +11,4 @@ glycors/target/*
 glycors/Cargo.lock
 to-do
 experimental
+test.py

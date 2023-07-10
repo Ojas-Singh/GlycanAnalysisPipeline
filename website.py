@@ -20,7 +20,11 @@ import shutil
 
 def zip_files_in_folder(folder_path, zip_path):
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for root, _, files in os.walk(folder_path):
+        for root, _, files in os.walk(folder_path+"/alpha"):
+            for file in files:
+                file_path = os.path.join(root, file)
+                zip_file.write(file_path, os.path.relpath(file_path, folder_path))
+        for root, _, files in os.walk(folder_path+"/beta"):
             for file in files:
                 file_path = os.path.join(root, file)
                 zip_file.write(file_path, os.path.relpath(file_path, folder_path))
