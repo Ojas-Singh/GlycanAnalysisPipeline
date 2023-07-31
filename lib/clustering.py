@@ -110,5 +110,20 @@ def plot_Silhouette(pca_df,name,n_dim):
     plt.tight_layout()
     plt.savefig(config.data_dir+name+'/output/Silhouette_Score.png',dpi=450)
     plt.cla()
-    n_clus = 5
-    return n_clus
+    n_clus = find_peaks(y)[0]+2
+    s_scores = y
+    return n_clus,s_scores
+
+def find_peaks(array):
+    peaks = []
+
+    if len(array) >= 3:  # Peaks only exist in arrays of 3 or more elements
+        # Check elements excluding the first and last ones
+        for i in range(1, len(array)-1):
+            if array[i] > array[i-1] and array[i] > array[i+1]:
+                peaks.append((i, array[i]))
+
+    # Sort by peak value in descending order, then extract indices
+    peaks = [i for i, _ in sorted(peaks, key=lambda x: x[1], reverse=True)]
+
+    return peaks

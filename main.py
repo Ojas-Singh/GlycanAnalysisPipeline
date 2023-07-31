@@ -52,7 +52,7 @@ def big_calculations(name):
         # Save the PCA data to a CSV file
         pcaG.to_csv(output_pca, index_label="i")
 
-        n_clus = clustering.plot_Silhouette(pcaG, name, n_dim)
+        n_clus,s_scores = clustering.plot_Silhouette(pcaG, name, n_dim)
         
 
         # clustering 
@@ -69,6 +69,7 @@ def big_calculations(name):
             file.write(f"n_clus = {n_clus}\n")
             file.write(f"n_dim = {n_dim}\n")
             file.write(f"popp = {list(popp)}\n")
+            file.write(f"s_scores = {list(s_scores)}\n")
     except Exception as e:
         logging.error(traceback.format_exc())
         print("PCA failed!")
@@ -91,6 +92,9 @@ def big_calculations(name):
 
     # Save the torsion data to a CSV file
     torsion_data_DF.to_csv(output_torsions, index_label="i")
+
+    with open(output_info, 'a') as file:
+            file.write(f"flexibility = {len(external)}\n")
 
 
 if __name__ == "__main__":
