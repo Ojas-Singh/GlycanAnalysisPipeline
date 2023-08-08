@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from lib import pdb
-from lib import clustering
+from lib import pdb,clustering,align
 import py3Dmol
 from stmol import showmol
 from PIL import Image
@@ -79,6 +78,41 @@ if not glycan=="":
                             file_name=glycan+".pdb",
                             mime='text/csv'
                         )
+            def get_number_after_underscore(filename):
+                return float(filename.split("_")[1].split(".")[0])
+            
+            path = config.data_dir+ glycan+"/clusters/beta/"
+            filenames = os.listdir(path)
+            pdb_files = [filename for filename in filenames if filename.endswith(".pdb")]
+            files_to_align =[path+x for x in pdb_files]
+            sorted_pdb_files = sorted(pdb_files, key=get_number_after_underscore,reverse=True)
+            reference_file = path+sorted_pdb_files[0]
+            output_files = [config.data_dir+ glycan+"/clusters/align/"+ x for x in sorted_pdb_files]  
+
+            if os.path.exists(config.data_dir+ glycan+"/clusters/align/"):
+                color = ["red","green","blue","yellow","orange","purple","pink","cyan","magenta","lime","brown","grey","olive","navy","teal","maroon","white","black"]
+                st.info('PDB Files are already aligned!')
+                systems = []
+                for i in output_files:
+                    with open(i) as ifile:
+                        systems.append("".join([x for x in ifile]))
+                xyzview_a = py3Dmol.view()
+                for x,i in enumerate(systems):
+                    xyzview_a.addModelsAsFrames(i)
+                    xyzview_a.setStyle({'model': x}, {'stick':{'color':color[x]}})
+                xyzview_a.setBackgroundColor('#FFFFFF')
+                xyzview_a.zoomTo()
+                showmol(xyzview_a,height=800,width=900)
+            else:
+                if st.button('Align PDB Files'):
+                    if not os.path.exists(config.data_dir+ glycan+"/clusters/align/"):
+                        os.makedirs(config.data_dir+ glycan+"/clusters/align/")
+                    align.align_pdb_files(reference_file, files_to_align, output_files)
+                    st.info('PDB Files are successfully aligned!')
+                    st.info('Please, refresh this page to proceed!') 
+            
+
+            
         with tab2:
             fig0 = px.scatter_3d(pca_df,x="0",y="1",z="2",color="i")
             fig0.update_traces(marker=dict(size=2,),selector=dict(mode='markers'))
