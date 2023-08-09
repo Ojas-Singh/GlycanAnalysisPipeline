@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 import base64
 import shutil
-
+import streamlit.components.v1 as components
 
 def zip_files_in_folder(folder_path, zip_path):
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -64,13 +64,14 @@ if not glycan=="":
             with col1:
                 st.code (glycan)
                 protein = pdb.parse(fold)
-                xyzview = py3Dmol.view()
-                xyzview.addModelsAsFrames(system)
-                xyzview.setStyle({'stick':{'color':'spectrum'}})
-                xyzview.addSurface(py3Dmol.VDW, {"opacity": 0.4, "color": "lightgrey"},{"hetflag": False})
-                xyzview.setBackgroundColor('#FFFFFF')
-                xyzview.zoomTo()
-                showmol(xyzview,height=800,width=900)
+                components.iframe("https://healoor.me/litemol/index.html?pdbUrl=https://glycoshape.healoor.me/database/"+glycan+"output/structure.pdb",height=600)
+                # xyzview = py3Dmol.view()
+                # xyzview.addModelsAsFrames(system)
+                # xyzview.setStyle({'stick':{'color':'spectrum'}})
+                # xyzview.addSurface(py3Dmol.VDW, {"opacity": 0.4, "color": "lightgrey"},{"hetflag": False})
+                # xyzview.setBackgroundColor('#FFFFFF')
+                # xyzview.zoomTo()
+                # showmol(xyzview,height=800,width=900)
             with col2:
                 btn = st.download_button(
                             label="Download PDB Structure",
