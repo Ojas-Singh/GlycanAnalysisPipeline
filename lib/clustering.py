@@ -22,9 +22,12 @@ def pcawithG(frames,idx_noH,dim,name):
     exp_var_pca = pca.explained_variance_ratio_
     cum_sum_eigenvalues = np.cumsum(exp_var_pca)
     # Find the index where cumulative explained variance is greater or equal to config.explained_variance
-    n_dim = np.argmax(cum_sum_eigenvalues >= config.explained_variance) + 1
+    # n_dim = np.argmax(cum_sum_eigenvalues >= config.explained_variance) + 1
+    n_dim = config.hard_dim
     fig = plt.figure()
     plt.bar(range(0,len(exp_var_pca)), exp_var_pca, alpha=0.5, align='center', label='Individual explained variance')
+    newlist= [x/(i+1) for i,x in enumerate(cum_sum_eigenvalues)]
+    plt.plot(newlist, label='new', color='red')
     plt.step(range(0,len(cum_sum_eigenvalues)), cum_sum_eigenvalues, where='mid',label='Cumulative explained variance')
     plt.ylabel('Explained variance ratio')
     plt.xlabel('Principal component index')
@@ -32,6 +35,20 @@ def pcawithG(frames,idx_noH,dim,name):
     plt.tight_layout()
     plt.savefig(config.data_dir+name+'/output/PCA_variance.png',dpi=450)
     plt.cla()
+    eigenvalues = pca.explained_variance_
+        
+    # Step 3: Find the number of components with eigenvalues > 1
+    components_to_retain = sum(eigenvalues > 1)
+
+    print(f"Number of components to retain: {components_to_retain}")
+
+    # Step 4 (optional): Plot the eigenvalues
+    plt.plot(eigenvalues, 'o-')
+    plt.title('Scree Plot')
+    plt.xlabel('Component number')
+    plt.ylabel('Eigenvalue')
+    plt.axhline(y=1, color='r', linestyle='--')
+    plt.savefig(config.data_dir+name+'/output/PCA_eigen.png',dpi=450)
     return PCA_components,n_dim
 
 
@@ -126,4 +143,4 @@ def find_peaks(array):
     # Sort by peak value in descending order, then extract indices
     peaks = [i for i, _ in sorted(peaks, key=lambda x: x[1], reverse=True)]
 
-    return peaks
+    return sorted(peaks,reverse=True)

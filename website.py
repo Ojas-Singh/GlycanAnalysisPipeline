@@ -64,7 +64,6 @@ if not glycan=="":
             with col1:
                 st.code (glycan)
                 protein = pdb.parse(fold)
-                components.iframe("https://healoor.me/litemol/index.html?pdbUrl=https://glycoshape.healoor.me/database/"+glycan+"output/structure.pdb",height=600)
                 # xyzview = py3Dmol.view()
                 # xyzview.addModelsAsFrames(system)
                 # xyzview.setStyle({'stick':{'color':'spectrum'}})
@@ -79,6 +78,8 @@ if not glycan=="":
                             file_name=glycan+".pdb",
                             mime='text/csv'
                         )
+            components.iframe("https://healoor.me/litemol/index.html?pdbUrl=https://glycoshape.healoor.me/database/"+glycan+"/output/structure.pdb",height=900)
+
             def get_number_after_underscore(filename):
                 return float(filename.split("_")[1].split(".")[0])
             

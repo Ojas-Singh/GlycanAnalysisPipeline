@@ -1,7 +1,13 @@
-from lib import flip,pdb,clustering
+from lib import flip,pdb,clustering,align
 import config
-import os,sys,traceback
+import os,sys,traceback,shutil
 import pandas as pd
+
+
+
+def get_number_after_underscore(filename):
+                return float(filename.split("_")[1].split(".")[0])
+            
 
 def list_directories(folder_path):
     directories = [
@@ -30,7 +36,8 @@ if __name__ == "__main__":
                                 input_torsion = config.data_dir+directory+'/output/torsions.csv'
                                 output_torsion = config.data_dir+directory+'/clusters/torsions.csv'
                                 output_pca = config.data_dir+directory+'/clusters/pca.csv'
-                                output_dir = config.data_dir+directory+'/clusters/alpha/'
+                                output_dir = config.data_dir+directory+'/clusters/alpha_temp/'
+                                output_dir_final = config.data_dir+directory+'/clusters/alpha/'
                                 output_dir_flip = config.data_dir+directory+'/clusters/beta/'
                                 pca = config.data_dir+directory + "/output/pca.csv"
                                 input_file = config.data_dir + directory + "/" + directory + ".pdb"
@@ -46,15 +53,25 @@ if __name__ == "__main__":
                                 df.to_csv(output_torsion, index_label="i")
                                 pca_df.to_csv(output_pca, index_label="i")
                                 # Saving the n_dim and n_clus to output/info.txt
+
+                                filenames = os.listdir(output_dir)
+                                pdb_files = [filename for filename in filenames if filename.endswith(".pdb")]
+                                files_to_align =[output_dir+x for x in pdb_files]
+                                sorted_pdb_files = sorted(pdb_files, key=get_number_after_underscore,reverse=True)
+                                reference_file = output_dir+sorted_pdb_files[0]
+                                output_files = [output_dir_final+ x for x in sorted_pdb_files]  
+                                align.align_pdb_files(reference_file, files_to_align, output_files)
+                                shutil.rmtree(output_dir)
+
                                 with open(output_info, 'w') as file:
                                     file.write(f"n_clus = {n_clus}\n")
                                     file.write(f"n_dim = {n_dim}\n")
                                     file.write(f"popp = {list(popp)}\n")
                                 try:
-                                    pdb_files = [f for f in os.listdir(output_dir) if f.endswith(".pdb")]
+                                    pdb_files = [f for f in os.listdir(output_dir_final) if f.endswith(".pdb")]
                                     print(pdb_files)
                                     for i in pdb_files:
-                                        flip.flip_alpha_beta(output_dir+i,output_dir_flip+i)
+                                        flip.flip_alpha_beta(output_dir_final+i,output_dir_flip+i)
                                     print("success!")
                                 except:
                                     print("failed!")
@@ -64,7 +81,8 @@ if __name__ == "__main__":
                                 input_torsion = config.data_dir+directory+'/output/torsions.csv'
                                 output_torsion = config.data_dir+directory+'/clusters/torsions.csv'
                                 output_pca = config.data_dir+directory+'/clusters/pca.csv'
-                                output_dir = config.data_dir+directory+'/clusters/beta/'
+                                output_dir = config.data_dir+directory+'/clusters/beta_temp/'
+                                output_dir_final = config.data_dir+directory+'/clusters/beta/'
                                 output_dir_flip = config.data_dir+directory+'/clusters/alpha/'
                                 pca = config.data_dir+directory + "/output/pca.csv"
                                 input_file = config.data_dir + directory + "/" + directory + ".pdb"
@@ -80,15 +98,26 @@ if __name__ == "__main__":
                                 df.to_csv(output_torsion, index_label="i")
                                 pca_df.to_csv(output_pca, index_label="i")
                                 # Saving the n_dim and n_clus to output/info.txt
+
+                                
+                                filenames = os.listdir(output_dir)
+                                pdb_files = [filename for filename in filenames if filename.endswith(".pdb")]
+                                files_to_align =[output_dir+x for x in pdb_files]
+                                sorted_pdb_files = sorted(pdb_files, key=get_number_after_underscore,reverse=True)
+                                reference_file = output_dir+sorted_pdb_files[0]
+                                output_files = [output_dir_final+ x for x in sorted_pdb_files]  
+                                align.align_pdb_files(reference_file, files_to_align, output_files)
+                                shutil.rmtree(output_dir)
+
                                 with open(output_info, 'w') as file:
                                     file.write(f"n_clus = {n_clus}\n")
                                     file.write(f"n_dim = {n_dim}\n")
                                     file.write(f"popp = {list(popp)}\n")
                                 try:
-                                    pdb_files = [f for f in os.listdir(output_dir) if f.endswith(".pdb")]
+                                    pdb_files = [f for f in os.listdir(output_dir_final) if f.endswith(".pdb")]
                                     print(pdb_files)
                                     for i in pdb_files:
-                                        flip.flip_alpha_beta(output_dir+i,output_dir_flip+i)
+                                        flip.flip_alpha_beta(output_dir_final+i,output_dir_flip+i)
                                     print("success!")
                                 except:
                                     print("failed!")

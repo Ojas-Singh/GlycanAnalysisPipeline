@@ -1,5 +1,7 @@
 [server]
-port = 3000  
+port = 8888
+enableStaticServing = true
+
 [browser]
 gatherUsageStats = false
 
