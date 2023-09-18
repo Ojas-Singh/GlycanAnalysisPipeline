@@ -26,8 +26,6 @@ def pcawithG(frames,idx_noH,dim,name):
     n_dim = config.hard_dim
     fig = plt.figure()
     plt.bar(range(0,len(exp_var_pca)), exp_var_pca, alpha=0.5, align='center', label='Individual explained variance')
-    newlist= [x/(i+1) for i,x in enumerate(cum_sum_eigenvalues)]
-    plt.plot(newlist, label='new', color='red')
     plt.step(range(0,len(cum_sum_eigenvalues)), cum_sum_eigenvalues, where='mid',label='Cumulative explained variance')
     plt.ylabel('Explained variance ratio')
     plt.xlabel('Principal component index')
@@ -143,4 +141,4 @@ def find_peaks(array):
     # Sort by peak value in descending order, then extract indices
     peaks = [i for i, _ in sorted(peaks, key=lambda x: x[1], reverse=True)]
 
-    return sorted(peaks,reverse=True)
+    return peaks
