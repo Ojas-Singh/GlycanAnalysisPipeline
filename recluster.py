@@ -1,6 +1,6 @@
 from lib import flip,pdb,clustering,align
 import config
-import os,sys,traceback,shutil
+import os,sys,traceback,shutil,json
 import pandas as pd
 
 
@@ -25,17 +25,25 @@ if __name__ == "__main__":
             if not isExist:
                         print("Processing : ",directory)
                         os.makedirs(config.data_dir+directory+'/clusters/')
+                        os.makedirs(config.data_dir+directory+'/clusters/pack')
                         os.makedirs(config.data_dir+directory+'/clusters/alpha')
                         os.makedirs(config.data_dir+directory+'/clusters/beta')
                         with open(config.data_dir+directory+'/output/info.txt', 'r') as file:
                             lines = file.readlines()
                             exec(lines[0])
                             exec(lines[1])
+                            exec(lines[2])
+                            exec(lines[3])
+                            exec(lines[4])
                             if flip.is_alpha(str(directory)):
+                                shutil.copy(config.data_dir+directory + "/output/torparts.npz", config.data_dir+directory+'/clusters/pack/torparts.npz')
+                                shutil.copy(config.data_dir+directory + "/output/PCA_variance.png", config.data_dir+directory+'/clusters/pack/PCA_variance.png')
+                                shutil.copy(config.data_dir+directory + "/output/Silhouette_Score.png", config.data_dir+directory+'/clusters/pack/Silhouette_Score.png')
+
                                 output_info = config.data_dir+directory+'/clusters/info.txt'
                                 input_torsion = config.data_dir+directory+'/output/torsions.csv'
-                                output_torsion = config.data_dir+directory+'/clusters/torsions.csv'
-                                output_pca = config.data_dir+directory+'/clusters/pca.csv'
+                                output_torsion = config.data_dir+directory+'/clusters/pack/torsions.csv'
+                                output_pca = config.data_dir+directory+'/clusters/pack/pca.csv'
                                 output_dir = config.data_dir+directory+'/clusters/alpha_temp/'
                                 output_dir_final = config.data_dir+directory+'/clusters/alpha/'
                                 output_dir_flip = config.data_dir+directory+'/clusters/beta/'
@@ -48,10 +56,30 @@ if __name__ == "__main__":
                                 pca_df["cluster"] = pca_df["cluster"].astype(str)
                                 popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
                                 pdb.exportframeidPDB(input_file,popp,output_dir)
+                                sorted_popp = sorted(popp, key=lambda x: int(x[1]))
+                                sorted_popp_values = [int(item[0]) for item in sorted_popp]
+                                s_scores = [float(i) for i in s_scores]
+                                data = {
+                                    "n_clus": n_clus,
+                                    "n_dim": n_dim,
+                                    "popp": sorted_popp_values,
+                                    "s_scores": s_scores,
+                                    "flexibility": int(flexibility)
+                                }
+                                
+
+
+                                with open(config.data_dir+directory+'/clusters/pack/info.json', "w") as json_file:
+                                    json.dump(data, json_file, indent=4)
+
                                 df = pd.read_csv(input_torsion)
                                 df.insert(1,"cluster",clustering_labels,False)
-                                df.to_csv(output_torsion, index_label="i")
-                                pca_df.to_csv(output_pca, index_label="i")
+                                # Remove columns containing the word "internal" from df
+                                cols_to_drop = [col for col in df.columns if "internal" in col]
+                                df = df.drop(columns=cols_to_drop)
+                                df.to_csv(output_torsion,index=False)
+                                pca_df = pca_df[["0", "1", "2", "i", "cluster"]]
+                                pca_df.to_csv(output_pca,index=False)
                                 # Saving the n_dim and n_clus to output/info.txt
 
                                 filenames = os.listdir(output_dir)
@@ -77,10 +105,14 @@ if __name__ == "__main__":
                                     print("failed!")
                                     pass
                             else: 
+                                shutil.copy(config.data_dir+directory + "/output/torparts.npz", config.data_dir+directory+'/clusters/pack/torparts.npz')
+                                shutil.copy(config.data_dir+directory + "/output/PCA_variance.png", config.data_dir+directory+'/clusters/pack/PCA_variance.png')
+                                shutil.copy(config.data_dir+directory + "/output/Silhouette_Score.png", config.data_dir+directory+'/clusters/pack/Silhouette_Score.png')
+
                                 output_info = config.data_dir+directory+'/clusters/info.txt'
                                 input_torsion = config.data_dir+directory+'/output/torsions.csv'
-                                output_torsion = config.data_dir+directory+'/clusters/torsions.csv'
-                                output_pca = config.data_dir+directory+'/clusters/pca.csv'
+                                output_torsion = config.data_dir+directory+'/clusters/pack/torsions.csv'
+                                output_pca = config.data_dir+directory+'/clusters/pack/pca.csv'
                                 output_dir = config.data_dir+directory+'/clusters/beta_temp/'
                                 output_dir_final = config.data_dir+directory+'/clusters/beta/'
                                 output_dir_flip = config.data_dir+directory+'/clusters/alpha/'
@@ -93,10 +125,31 @@ if __name__ == "__main__":
                                 pca_df["cluster"] = pca_df["cluster"].astype(str)
                                 popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
                                 pdb.exportframeidPDB(input_file,popp,output_dir)
+
+                                sorted_popp = sorted(popp, key=lambda x: int(x[1]))
+                                sorted_popp_values = [item[0] for item in sorted_popp]
+                                s_scores = [str(i) for i in s_scores]
+                                data = {
+                                    "n_clus": n_clus,
+                                    "n_dim": n_dim,
+                                    "popp": sorted_popp_values,
+                                    "s_scores": s_scores,
+                                    "flexibility": flexibility
+                                }
+                                
+
+                                with open(config.data_dir+directory+'/clusters/pack/info.json', "w") as json_file:
+                                    json.dump(data, json_file, indent=4)
+
+
                                 df = pd.read_csv(input_torsion)
                                 df.insert(1,"cluster",clustering_labels,False)
-                                df.to_csv(output_torsion, index_label="i")
-                                pca_df.to_csv(output_pca, index_label="i")
+                                # Remove columns containing the word "internal" from df
+                                cols_to_drop = [col for col in df.columns if "internal" in col]
+                                df = df.drop(columns=cols_to_drop)
+                                df.to_csv(output_torsion,index=False)
+                                pca_df = pca_df[["0", "1", "2", "i", "cluster"]]
+                                pca_df.to_csv(output_pca,index=False)
                                 # Saving the n_dim and n_clus to output/info.txt
 
                                 
