@@ -127,7 +127,7 @@ if __name__ == "__main__":
                                 pdb.exportframeidPDB(input_file,popp,output_dir)
 
                                 sorted_popp = sorted(popp, key=lambda x: int(x[1]))
-                                sorted_popp_values = [item[0] for item in sorted_popp]
+                                sorted_popp_values = [int(item[0]) for item in sorted_popp]
                                 s_scores = [str(i) for i in s_scores]
                                 data = {
                                     "n_clus": n_clus,
