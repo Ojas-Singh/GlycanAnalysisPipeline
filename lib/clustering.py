@@ -140,5 +140,7 @@ def find_peaks(array):
 
     # Sort by peak value in descending order, then extract indices
     peaks = [i for i, _ in sorted(peaks, key=lambda x: x[1], reverse=True)]
+    if peaks == []:
+        peaks = [0]
 
     return peaks
