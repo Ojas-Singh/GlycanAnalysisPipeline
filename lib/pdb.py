@@ -83,9 +83,9 @@ def multi(f):
             i=0
             for line in lines:
                 if line.startswith("ATOM"):
-                    mat[i,0]=float(line[31:38])
-                    mat[i,1]=float(line[39:46])
-                    mat[i,2]=float(line[47:54])
+                    mat[i,0]=float(line[30:38])
+                    mat[i,1]=float(line[38:46])
+                    mat[i,2]=float(line[46:54])
                     i+=1
                 if line.startswith("ENDMDL"):
                     j+=1
