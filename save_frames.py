@@ -10,9 +10,9 @@ def process_folders(root_dir):
         if os.path.isdir(folder_path):
             pdb_file = os.path.join(folder_path, folder_name + ".pdb")
             if flip.is_alpha(folder_name):
-                output_pdb_file = os.path.join(folder_path,  "/output/beta.pdb")
+                output_pdb_file = os.path.join(folder_path,  "output/beta.pdb")
             else:
-                output_pdb_file = os.path.join(folder_path,  "/output/alpha.pdb")
+                output_pdb_file = os.path.join(folder_path,  "output/alpha.pdb")
 
             if os.path.isfile(pdb_file):
                 print(f"Processing {pdb_file}")
@@ -36,7 +36,9 @@ def process_folders(root_dir):
                         output_file_path = os.path.join(subdirectory_path, "alpha.npy")
                         b,frame = pdb.multi(output_pdb_file)
                         np.save(output_file_path, frame)
+                    print(f"Saved flipped .npy to /clusters/pack/alpha.npy and /clusters/pack/beta.npy")
                     os.remove(output_pdb_file)
+                    print(f"Removed {output_pdb_file}")
                 except Exception as e:
                     print(f"Error processing {pdb_file}: {e}")
             else:
