@@ -1,54 +1,31 @@
 # GlycanAnalysisPipeline
 
 
+From every glycan simulated, a directory is made titled with the name of the particular glycan in GLYCAM condensed format. Within this directory is a multiframe PDB of the concatenated replicas of MD simulation, and a single frame MOL2 file. The GAP pipeline is then ran on these directories to create further subdirectories titled "output" and "clusters" which contain the outputs of both the PCA and GMM and the representative cluster structures, respectively.
+
+The DB script then takes the structural information from these directories, coupled with APIs and other packages, to create the information necessary for the GDB. For the is, the DB directory contains subdirectories titled with the name of each glycan in IUPAC condensed format. Within these subdirectories are JSON files with the relecant nomeclature, chemical, and biological data of the glycan and an SVG file of the glycan 2D structure in SNFG format. Also located within this directory are further subdirectories containing the representative cluster structures in different naming formats, specifically CHARMM, GLYCAM, and PDB.
+
+
 # Installation
 ```
 conda create -n GAP python=3.10
 conda activate GAP
 pip install -r requirements.txt
-streamlit run cluster_streamlit.py
-```
-
-python3 -m pip -r requirements.txt
-export PATH="$HOME/.local/bin:$PATH"
-
-
-modify config.py 
 
 ```
-python main.py
-```
+modify config.py to set data_dir variable to the folder where we have all the simulations multiframe pdb and mol2 file for the molecule, the folder name should be the GLYCAM name of the glycan.
 
 
-# Oracle firewall fix
+# Running
 ```
-sudo iptables -P INPUT ACCEPT
-sudo iptables -P OUTPUT ACCEPT
-sudo iptables -P FORWARD ACCEPT
-sudo iptables -F
-sudo ufw allow 22
-sudo ufw allow 80
-sudo ufw allow 8080
-sudo ufw allow 443
-sudo ufw enable
+python main.py && python recluster.py && python plot_dist.py && python save_frames.py
+
+python GlycoShape_DB.py
+
 ```
 
+# 
 
-#localhost/loopback
-```
-sudo iptables -t nat -I OUTPUT -p tcp -d 127.0.0.1 --dport 80 -j REDIRECT --to-ports 3000
-```
-#external
-```
-sudo iptables -t nat -I PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 3000
-```
-
-
-
-screen -S name
-screen -r name
-ctr a + d   -> to detach
-pkill screen
 
 # Citation
 
