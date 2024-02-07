@@ -25,7 +25,7 @@ modify config.py to set data_dir variable to the folder where we have all the si
 ```
 python main.py && python recluster.py && python plot_dist.py && python save_frames.py
 ```
-
+this will produce "clusters" and "output" folder in each glycan dir with required files for Database and [Re-Glyco](https://github.com/Ojas-Singh/Re-Glyco).
 
 # Note 
 The DB script then takes the structural information from these directories, coupled with APIs and other packages, to create the information necessary for the GDB. For the is, the DB directory contains subdirectories titled with the name of each glycan in IUPAC condensed format. Within these subdirectories are JSON files with the relecant nomeclature, chemical, and biological data of the glycan and an SVG file of the glycan 2D structure in SNFG format. Also located within this directory are further subdirectories containing the representative cluster structures in different naming formats, specifically CHARMM, GLYCAM, and PDB.
