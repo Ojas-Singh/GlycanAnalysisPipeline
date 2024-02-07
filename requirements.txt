@@ -11,3 +11,7 @@ tqdm
 Pyarrow
 seaborn
 glycowork
+drawsvg
+openpyxl
+glyles
+glycowork[chem]

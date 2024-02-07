@@ -12,3 +12,6 @@ glycors/Cargo.lock
 to-do
 experimental
 test.py
+dummy_data_dir/DManpa1-2DManpa1-OH/clusters
+dummy_data_dir/DManpa1-2DManpa1-OH/output
+Duplicate_Entries.txt

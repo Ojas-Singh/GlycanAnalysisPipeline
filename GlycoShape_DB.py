@@ -156,7 +156,15 @@ def get_clusters_alpha(glycam):
                 except:
                     pdb_file = glob.glob(f'*_{file:.1f}.pdb')[0]
                 # shutil.copyfile(pdb_file, os.path.join(output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
-                shutil.copyfile(pdb_file, os.path.join(output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb"))
+                if not os.path.exists(output_path):
+                    os.makedirs(output_path) 
+                path =os.path.join(output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb")
+                print(path)
+                try:
+                    shutil.copyfile(pdb_file, path)
+                except Exception as e:
+                    print(f"Error copying file: {e}")
+                shutil.copyfile(pdb_file, path)
                 pdb_remark_adder(os.path.join(output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb"))
                 cluster_ids.append(f"Cluster {n}")
                 cluster_occupancies.append(file)
@@ -238,7 +246,7 @@ def iupac2smiles(iupac):
 
 def canonicalize_iupac(iupac):
     from glycowork.motif.processing import canonicalize_iupac
-    return canonicalize_iupac(iupac)
+    return canonicalize_iupac([iupac])
 
 # Function to fetch data from SugarBase for the glycan of interest...
 def iupac2sugarbase(iupac):
@@ -303,6 +311,9 @@ def pdb_remark_adder(filename):
 glycoshape_files = glob.glob(os.path.join(input_path,"*OH"))
 glycoshape_list = [glycan.split("/")[-1] for glycan in glycoshape_files]
 
+wurcs_check_list = []
+with open("Duplicate_Entries.txt", "w") as log:
+    log.write("GLYCOSHAPE DUPLICATE ENTRIES\n\n\n")
 
 glycoshape = {}
 n_glycans = []
@@ -319,14 +330,17 @@ hybrid = []
 hybrid_mass = []
 sim_time = []
 
+no_glytoucan = []
 for glycam, i in zip(glycoshape_list,tqdm(range(len(glycoshape_list)))):
-    print(glycam)
+    print(i, glycam)
     n_glycan = False
 
     # Tidying up the nomeclature of our glycans...
     glycam_tidy = glycamtidy(glycam)
     iupac_untidy = str(glycam2iupac(glycam_tidy))
-    iupac = canonicalize_iupac(iupac_untidy)[2:-2]
+    print(iupac_untidy)
+    iupac = iupac_untidy
+    # iupac = canonicalize_iupac(iupac_untidy)[2:-2]
 
     # Making the necessary output directories
     if (os.path.exists(os.path.join(output_path,iupac)) and update==False):
@@ -340,179 +354,188 @@ for glycam, i in zip(glycoshape_list,tqdm(range(len(glycoshape_list)))):
     composition = iupac2composition(iupac)
     glytoucan, wurcs = iupac2wurcs_glytoucan(iupac)
     glytoucan = glytoucan[0]
-    wurcs = wurcs [0]
-    glycoct, IGNORE = glytoucan2glygen(glytoucan)
-    try:
-        mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = iupac2properties(iupac)
-    except:
-        mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
-    try:
-        motifs = iupac2motif(iupac)
-    except:
-        motifs = None
-    Species, Genus, Family, Order, Class, Phylum, Kingdom, Domain, predicted_taxonomy, glycan_type, disease_association, tissue_sample, Composition = iupac2sugarbase(iupac) 
-    try:
-        Composition = ast.literal_eval(Composition)
-    except:
+    if glytoucan == None:
+        no_glytoucan.append(iupac)
+    wurcs = wurcs[0]
+
+    # In place to check for missed duplicate entries
+    if (wurcs in wurcs_check_list) and (wurcs != None):
+        with open("Duplicate_Entries.txt", "a") as log:
+            log.write(f"{iupac}, {wurcs}, {glytoucan}")
         pass
-    snfg = iupac2snfg(iupac) 
-    smiles = iupac2smiles(iupac)
-    try:
-        termini = iupac2termini(iupac) 
-    except:
-        termini = None
-    print()
+    else:
+        glycoct, IGNORE = glytoucan2glygen(glytoucan)
+        try:
+            mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = iupac2properties(iupac)
+        except:
+            mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
+        try:
+            motifs = iupac2motif(iupac)
+        except:
+            motifs = None
+        Species, Genus, Family, Order, Class, Phylum, Kingdom, Domain, predicted_taxonomy, glycan_type, disease_association, tissue_sample, Composition = iupac2sugarbase(iupac) 
+        try:
+            Composition = ast.literal_eval(Composition)
+        except:
+            pass
+        snfg = iupac2snfg(iupac) 
+        smiles = iupac2smiles(iupac)
+        try:
+            termini = iupac2termini(iupac) 
+        except:
+            termini = None
+        print()
 
-    ID, length, package, FF, temp, pressure, salt, contributor = get_md_info(glycam_tidy)
-    cluster_dict = get_clusters_alpha(glycam)
-    cluster_dict_beta = get_clusters_beta(glycam)          
+        ID, length, package, FF, temp, pressure, salt, contributor = get_md_info(glycam_tidy)
+        cluster_dict = get_clusters_alpha(glycam)
+        cluster_dict_beta = get_clusters_beta(glycam)          
 
-    glycan_data = {"ID":ID,
-    "glycam":glycam_tidy,
-    "iupac":iupac,
-    "wurcs":wurcs,
-    "glycoct":glycoct,
-    "smiles":smiles, 
-    "components":str(composition)[1:-1].replace("'",'').replace(",",", "),
-    "composition":str(Composition)[1:-1].replace("'",'').replace(",",", "),
+        glycan_data = {"ID":ID,
+        "glycam":glycam_tidy,
+        "iupac":iupac,
+        "wurcs":wurcs,
+        "glycoct":glycoct,
+        "smiles":smiles, 
+        "components":str(composition)[1:-1].replace("'",'').replace(",",", "),
+        "composition":str(Composition)[1:-1].replace("'",'').replace(",",", "),
 
-    "components_search":composition,
-    "composition_search":Composition,
+        "components_search":composition,
+        "composition_search":Composition,
 
-    "mass":np.float64(mass).round(1),
-    "motifs":remove_underscores_list(motifs), 
-    "termini":termini, 
-    # "tpsa":tpsa, # CMI removed on 20231018
-    "rot_bonds":rot_bonds, 
-    "hbond_donor":hbond_donor, 
-    "hbond_acceptor":hbond_acceptor, 
-    "glycan_type":glycan_type,
-    "glytoucan_id":glytoucan,
-    "disease":", ".join(remove_underscores_eval(disease_association)) if remove_underscores_eval(disease_association) != None else remove_underscores_eval(disease_association),
-    "tissue":", ".join(remove_underscores_eval(tissue_sample)) if remove_underscores_eval(tissue_sample) != None else remove_underscores_eval(tissue_sample),
-    "species":", ".join(remove_underscores_eval(Species)) if remove_underscores_eval(Species) != None else remove_underscores_eval(Species),
-    "genus":", ".join(remove_underscores_eval(Genus)) if remove_underscores_eval(Genus) != None else remove_underscores_eval(Genus),
-    "family":", ".join(remove_underscores_eval(Family)) if remove_underscores_eval(Family) != None else remove_underscores_eval(Family),
-    "order":", ".join(remove_underscores_eval(Order)) if remove_underscores_eval(Order) != None else remove_underscores_eval(Order),
-    "class":", ".join(remove_underscores_eval(Class)) if remove_underscores_eval(Class) != None else remove_underscores_eval(Class),
-    "phylum":", ".join(remove_underscores_eval(Phylum)) if remove_underscores_eval(Phylum) != None else remove_underscores_eval(Phylum),
-    "kingdom":", ".join(remove_underscores_eval(Kingdom)) if remove_underscores_eval(Kingdom) != None else remove_underscores_eval(Kingdom),
-    "domain":", ".join(remove_underscores_eval(Domain)) if remove_underscores_eval(Domain) != None else remove_underscores_eval(Domain),
+        "mass":np.float64(mass).round(1),
+        "motifs":remove_underscores_list(motifs), 
+        "termini":termini, 
+        # "tpsa":tpsa, # CMI removed on 20231018
+        "rot_bonds":rot_bonds, 
+        "hbond_donor":hbond_donor, 
+        "hbond_acceptor":hbond_acceptor, 
+        "glycan_type":glycan_type,
+        "glytoucan_id":glytoucan,
+        "disease":", ".join(remove_underscores_eval(disease_association)) if remove_underscores_eval(disease_association) != None else remove_underscores_eval(disease_association),
+        "tissue":", ".join(remove_underscores_eval(tissue_sample)) if remove_underscores_eval(tissue_sample) != None else remove_underscores_eval(tissue_sample),
+        "species":", ".join(remove_underscores_eval(Species)) if remove_underscores_eval(Species) != None else remove_underscores_eval(Species),
+        "genus":", ".join(remove_underscores_eval(Genus)) if remove_underscores_eval(Genus) != None else remove_underscores_eval(Genus),
+        "family":", ".join(remove_underscores_eval(Family)) if remove_underscores_eval(Family) != None else remove_underscores_eval(Family),
+        "order":", ".join(remove_underscores_eval(Order)) if remove_underscores_eval(Order) != None else remove_underscores_eval(Order),
+        "class":", ".join(remove_underscores_eval(Class)) if remove_underscores_eval(Class) != None else remove_underscores_eval(Class),
+        "phylum":", ".join(remove_underscores_eval(Phylum)) if remove_underscores_eval(Phylum) != None else remove_underscores_eval(Phylum),
+        "kingdom":", ".join(remove_underscores_eval(Kingdom)) if remove_underscores_eval(Kingdom) != None else remove_underscores_eval(Kingdom),
+        "domain":", ".join(remove_underscores_eval(Domain)) if remove_underscores_eval(Domain) != None else remove_underscores_eval(Domain),
 
-    # "disease_search":remove_underscores_eval(disease_association),
-    # "tissue_search":remove_underscores_eval(tissue_sample),
-    # "species_search":remove_underscores_eval(Species),
-    # "genus_search":remove_underscores_eval(Genus),
-    # "family_search":remove_underscores_eval(Family),
-    # "order_search":remove_underscores_eval(Order),
-    # "class_search":remove_underscores_eval(Class),
-    # "phylum_search":remove_underscores_eval(Phylum),
-    # "kingdom_search":remove_underscores_eval(Kingdom),
-    # "domain_search":remove_underscores_eval(Domain),
+        # "disease_search":remove_underscores_eval(disease_association),
+        # "tissue_search":remove_underscores_eval(tissue_sample),
+        # "species_search":remove_underscores_eval(Species),
+        # "genus_search":remove_underscores_eval(Genus),
+        # "family_search":remove_underscores_eval(Family),
+        # "order_search":remove_underscores_eval(Order),
+        # "class_search":remove_underscores_eval(Class),
+        # "phylum_search":remove_underscores_eval(Phylum),
+        # "kingdom_search":remove_underscores_eval(Kingdom),
+        # "domain_search":remove_underscores_eval(Domain),
 
-    "clusters":cluster_dict,
-    "length":length,
-    "package":package,
-    "forcefield":FF,
-    "temperature":temp,
-    "pressure":pressure,
-    "salt":salt
-    }
+        "clusters":cluster_dict,
+        "length":length,
+        "package":package,
+        "forcefield":FF,
+        "temperature":temp,
+        "pressure":pressure,
+        "salt":salt
+        }
 
-    json_object = json.dumps(glycan_data, indent=4)
-    with open(os.path.join(output_path,f"{iupac}/{iupac}.json"), "w") as outfile:
-        outfile.write(json_object)
+        json_object = json.dumps(glycan_data, indent=4)
+        with open(os.path.join(output_path,f"{iupac}/{iupac}.json"), "w") as outfile:
+            outfile.write(json_object)
 
-    glycoshape[ID] = glycan_data
+        glycoshape[ID] = glycan_data
 
-    shutil.copytree(os.path.join(input_path,f"{glycam}/clusters/pack"), os.path.join(output_path,f"{iupac}/output"), dirs_exist_ok=True)
+        shutil.copytree(os.path.join(input_path,f"{glycam}/clusters/pack"), os.path.join(output_path,f"{iupac}/output"), dirs_exist_ok=True)
 
-    if glycan_type == "N":
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycan_type == "O":
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    elif glycam.endswith("DGlcpNAcb1-4DGlcpNAca1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4DGlcpNAcb1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-6]DGlcpNAca1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3]DGlcpNAca1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3]DGlcpNAcb1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAca1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAcb1-OH"):
-        n_glycans.append(iupac)
-        n_glycans_mass.append(mass)
-        n_glycan = True
-    elif glycam.endswith("Fucpa1-OH"):
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    elif glycam.endswith("Manpa1-OH"):
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    elif glycam.endswith("Xylpa1-OH"):
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    elif glycam.endswith("Xylpb1-OH"):
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    elif glycam.endswith("Glcpb1-OH"):
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    elif glycam.endswith("GalNAcpa1-OH"):
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
+        if glycan_type == "N":
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycan_type == "O":
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        elif glycam.endswith("DGlcpNAcb1-4DGlcpNAca1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4DGlcpNAcb1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-6]DGlcpNAca1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3]DGlcpNAca1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3]DGlcpNAcb1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAca1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("DGlcpNAcb1-4[LFucpa1-3][LFucpa1-6]DGlcpNAcb1-OH"):
+            n_glycans.append(iupac)
+            n_glycans_mass.append(mass)
+            n_glycan = True
+        elif glycam.endswith("Fucpa1-OH"):
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        elif glycam.endswith("Manpa1-OH"):
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        elif glycam.endswith("Xylpa1-OH"):
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        elif glycam.endswith("Xylpb1-OH"):
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        elif glycam.endswith("Glcpb1-OH"):
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        elif glycam.endswith("GalNAcpa1-OH"):
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
 
-    if glycam == "DGlcpNAcb1-OH":
-        o_glycans.append(iupac)
-        o_glycans_mass.append(mass)
-    if glycam == "DManpa1-OH":
-        c_glycans.append(iupac)
-        c_glycans_mass.append(mass)
+        if glycam == "DGlcpNAcb1-OH":
+            o_glycans.append(iupac)
+            o_glycans_mass.append(mass)
+        if glycam == "DManpa1-OH":
+            c_glycans.append(iupac)
+            c_glycans_mass.append(mass)
 
-    try:
-        if (n_glycan == True) and (composition["Man"] >=5) and (composition["GlcNAc"] == 2):
-            oligomannose.append(iupac)
-            oligomannose_mass.append(mass)
-    except:
-        pass
-    try:
-        if (n_glycan == True) and (composition["Man"] >=3) and (composition["GlcNAc"] > 2):
-            complex.append(iupac)
-            complex_mass.append(mass)
-    except:
-        pass
-    try:
-        if (n_glycan == True) and (composition["Man"] >=4) and (composition["GlcNAc"] > 2):
-            hybrid.append(iupac)
-            hybrid_mass.append(mass)
-    except:
-        pass
+        try:
+            if (n_glycan == True) and (composition["Man"] >=5) and (composition["GlcNAc"] == 2):
+                oligomannose.append(iupac)
+                oligomannose_mass.append(mass)
+        except:
+            pass
+        try:
+            if (n_glycan == True) and (composition["Man"] >=3) and (composition["GlcNAc"] > 2):
+                complex.append(iupac)
+                complex_mass.append(mass)
+        except:
+            pass
+        try:
+            if (n_glycan == True) and (composition["Man"] >=4) and (composition["GlcNAc"] > 2):
+                hybrid.append(iupac)
+                hybrid_mass.append(mass)
+        except:
+            pass
 
 
-    sim_time.append(np.float64(length))
+        sim_time.append(np.float64(length))
 
 json_object = json.dumps(glycoshape, indent=4)
 with open(os.path.join(output_path,"GLYCOSHAPE.json"), "w") as outfile:
@@ -552,7 +575,11 @@ GAG = ["GlcNS(a1-4)IdoA(a1-4)GlcNS(a1-4)GlcA(b1-4)GlcNAc6S(a1-4)GlcA(b1-4)GlcNS6
        "GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc",
        "GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc",
        "GlcA(b1-4)GlcNAc(a1-4)IdoA(a1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)IdoA(a1-4)GlcNAc",
-       "GlcA2S(b1-4)GlcNS3S6S(a1-4)GlcA2S(b1-4)GlcNS3S6S(a1-4)GlcA2S(b1-4)GlcNS3S6S(a1-4)GlcA2S(b1-4)GlcNS3S6S"
+       "GlcA2S(b1-4)GlcNS3S6S(a1-4)GlcA2S(b1-4)GlcNS3S6S(a1-4)GlcA2S(b1-4)GlcNS3S6S(a1-4)GlcA2S(b1-4)GlcNS3S6S",
+       "GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc",
+       "DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-OH",
+       "DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-4DGlcpAb1-4DGlcpNAca1-OH",
+       "GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc(a1-4)GlcA(b1-4)GlcNAc"
        ]
 
 # For searching...
@@ -597,6 +624,10 @@ with open(os.path.join(output_path,"GLYCAN_TYPE.json"), "w") as outfile:
 with open(os.path.join(output_path,"sim_details.txt"), 'w') as f:
     f.write(f"num_sims = {len(sim_time)}\n")
     f.write(f"sim_length = {sum(sim_time)}")
+
+with open(os.path.join(output_path,"missing_glytoucan.txt"), 'w') as f:
+    for glycan in no_glytoucan:
+        f.write(f"{glycan}\n")
 
 # Run the conversion script...
 os.system("python GlycoShape_converter.py")

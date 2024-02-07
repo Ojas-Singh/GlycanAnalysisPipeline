@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="200" height="110" viewBox="-150.0 -55.0 200 110">
+<defs>
+<path d="M-100,0 L0,0" stroke-width="4.0" stroke="#000000" id="d0" />
+<path d="M-50,25.0 L50,25.0" stroke-width="0" id="d1" />
+<path d="M-50,0 L50,0" stroke-width="0" id="d2" />
+<path d="M-150,25.0 L-50,25.0" stroke-width="0" id="d3" />
+<path d="M-150,0 L-50,0" stroke-width="0" id="d4" />
+</defs>
+<g transform="rotate(0 100.0 55.0)">
+<use xlink:href="#d0" />
+<text font-size="20" font-family="century gothic" text-anchor="middle" fill="#000000" valign="middle"><textPath xlink:href="#d0" startOffset="50%">
+<tspan dy="-0.5em">α 2</tspan>
+</textPath></text>
+<circle cx="0" cy="0" r="25.0" fill="#058F60" stroke-width="2.0" stroke="#000000" />
+<use xlink:href="#d1" />
+<text font-size="17.5" font-family="century gothic" font-weight="bold" fill="#000000" text-anchor="middle"><textPath xlink:href="#d1" startOffset="50%"></textPath></text>
+<use xlink:href="#d2" />
+<text font-size="17.5" font-family="century gothic" font-style="italic" fill="#000000" text-anchor="middle"><textPath xlink:href="#d2" startOffset="50%"></textPath></text>
+<circle cx="-100" cy="0" r="25.0" fill="#058F60" stroke-width="2.0" stroke="#000000" />
+<use xlink:href="#d3" />
+<text font-size="17.5" font-family="century gothic" font-weight="bold" fill="#000000" text-anchor="middle"><textPath xlink:href="#d3" startOffset="50%"></textPath></text>
+<use xlink:href="#d4" />
+<text font-size="17.5" font-family="century gothic" font-style="italic" fill="#000000" text-anchor="middle"><textPath xlink:href="#d4" startOffset="50%"></textPath></text>
+</g>
+</svg>

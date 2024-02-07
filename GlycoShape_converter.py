@@ -5,7 +5,7 @@ import re
 import glob
 import shutil
 
-directories = glob.glob("/mnt/database/DB_temp/*/")
+directories = glob.glob("DB_temp/*/")
 for directory in directories:
     print(f"Converting for {directory.split('/')[-2]}")
     
