@@ -29,11 +29,22 @@ def glycamtidy(glycam):
 def glycam2iupac(glycam):
     # Define a dictionary of default stereochemistry for common monosaccharides
     default_stereochemistry = {
-        "Glc": "D", "Gal": "D", "Man": "D", "Fuc": "L", "Rha": "L",
-        "Xyl": "D", "Ara": "L", "Ido": "D", "Alt": "D", "Tal": "D",
-        "All": "D", "Gul": "D", "Neu5Ac": "D", "Neu5Gc": "D", "Kdn": "D",
-        "MurNAc": "D", "Qui": "L"
-        # Add more monosaccharides as needed
+        "4eLeg": "D", "6dAlt": "L", "6dAltNAc": "L", "6dGul": "D",
+        "6dTal": "D", "6dTalNAc": "D", "8eAci": "D", "8eLeg": "L",
+        "Abe": "D", "Aci": "L", "All": "D", "AllA": "D", "AllN": "D",
+        "AllNAc": "D", "Alt": "L", "AltA": "L", "AltN": "L", "AltNAc": "L",
+        "Api": "L", "Ara": "L", "Bac": "D", "Col": "L", "DDmanHep": "D",
+        "Dha": "D", "Dig": "D", "Fru": "D", "Fuc": "L", "FucNAc": "L",
+        "Gal": "D", "GalA": "D", "GalN": "D", "GalNAc": "D", "Glc": "D",
+        "GlcA": "D", "GlcN": "D", "GlcNAc": "D", "Gul": "D", "GulA": "D",
+        "GulN": "D", "GulNAc": "D", "Ido": "L", "IdoA": "L", "IdoN": "L",
+        "IdoNAc": "L", "Kdn": "D", "Kdo": "D", "Leg": "D", "LDmanHep": "L",
+        "Lyx": "D", "Man": "D", "ManA": "D", "ManN": "D", "ManNAc": "D",
+        "Mur": "D", "MurNAc": "D", "MurNGc": "D", "Neu": "D", "Neu5Ac": "D",
+        "Neu5Gc": "D", "Oli": "D", "Par": "D", "Pse": "L", "Psi": "D",
+        "Qui": "D", "QuiNAc": "D", "Rha": "L", "RhaNAc": "L", "Rib": "D",
+        "Sia": "D", "Sor": "L", "Tag": "D", "Tal": "D", "TalA": "D",
+        "TalN": "D", "TalNAc": "D", "Tyv": "D", "Xyl": "D"
     }
     
     if glycam == "DGalpb1-4DGalpa1-3[2,4-diacetimido-2,4,6-trideoxyhexose]":
