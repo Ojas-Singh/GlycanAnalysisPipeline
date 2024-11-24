@@ -25,24 +25,45 @@ def glycamtidy(glycam):
     return glycam
     
 
-# Function to convert from the glycam nomenclature to the condensed IUPAC nomeclature...
+
 def glycam2iupac(glycam):
+    # Define a dictionary of default stereochemistry for common monosaccharides
+    default_stereochemistry = {
+        "Glc": "D", "Gal": "D", "Man": "D", "Fuc": "L", "Rha": "L",
+        "Xyl": "D", "Ara": "L", "Ido": "D", "Alt": "D", "Tal": "D",
+        "All": "D", "Gul": "D", "Neu5Ac": "D", "Neu5Gc": "D", "Kdn": "D",
+        "MurNAc": "D", "Qui": "L"
+        # Add more monosaccharides as needed
+    }
+    
     if glycam == "DGalpb1-4DGalpa1-3[2,4-diacetimido-2,4,6-trideoxyhexose]":
         iupac = "Gal(b1-4)Gal(a1-3)2,4-diacetimido-2,4,6-trideoxyhexose"
     else:
         glycam_components = glycam.split("-")
+        print(glycam_components)
         mod_component_list = []
         for component in glycam_components:
             mod_component = component
+            
+            # Check for stereochemistry and modify appropriately
+            for sugar, default in default_stereochemistry.items():
+                if sugar in mod_component:
+                    if default == "D":
+                        mod_component = mod_component.replace("D", "")
+                        mod_component = mod_component.replace("L", "L-")
+                    elif default == "L":
+                        mod_component = mod_component.replace("L", "")
+                        mod_component = mod_component.replace("D", "D-")
+            mod_component = mod_component.replace("p", "")
+            # mod_component = mod_component.replace("f", "")
+            
+            # Handle glycosidic linkages
             if component != glycam_components[-1]:
                 mod_component = mod_component.replace(mod_component[-2:], f"({mod_component[-2:]}-", 1)
             if component != glycam_components[0]:
                 mod_component = mod_component.replace(mod_component[0], f"{mod_component[0]})", 1)
-            mod_component = mod_component.replace("D", "D-")
-            mod_component = mod_component.replace("L", "L-")
-            mod_component = mod_component.replace("p", "")
-            # mod_component = mod_component.replace("f", "")
-            # Hard coded for now, need to improve this for modifications...
+            
+            # Replace common modifications
             mod_component = mod_component.replace("[2S]", "2S")
             mod_component = mod_component.replace("[3S]", "3S")
             mod_component = mod_component.replace("[4S]", "4S")
@@ -64,9 +85,13 @@ def glycam2iupac(glycam):
             mod_component = mod_component.replace("[4A]", "4Ac")
             mod_component = mod_component.replace("[9A]", "9Ac")
             mod_component = mod_component.replace("[6PC]", "6Pc")
+            
             mod_component_list.append(mod_component)
+        
         iupac = "".join(mod_component_list)
     return iupac
+
+
 
 
 def clean_iupac(iupac):
@@ -203,7 +228,7 @@ def get_clusters_beta(glycam):
 # Function to get an SNFG image from an IUPAC name..
 def iupac2snfg(iupac):
     from glycowork.motif.draw import GlycoDraw
-    snfg = GlycoDraw(clean_iupac(iupac), filepath=os.path.join(config.output_path,f'{iupac}/{iupac}.svg'), show_linkage=True)
+    snfg = GlycoDraw(iupac, filepath=os.path.join(config.output_path,f'{iupac}/{iupac}.svg'), show_linkage=True)
     return os.path.join(config.output_path,f'{iupac}/{iupac}.svg')
 
 # Function to get motifs from an IUPAC name...

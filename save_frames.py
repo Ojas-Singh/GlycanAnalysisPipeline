@@ -80,6 +80,9 @@ def main() -> None:
     
     for folder in data_dir.iterdir():
         if folder.is_dir():
+            if folder.name.endswith(('a2-OH', 'b2-OH')):
+                logger.info(f"Skipping {folder.name} - a2-OH/b2-OH molecule")
+                continue
             process_molecule(folder)
 
 if __name__ == "__main__":
