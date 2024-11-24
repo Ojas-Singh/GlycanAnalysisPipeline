@@ -1,11 +1,24 @@
+from pathlib import Path
+from typing import List, Tuple, Optional
+import logging
+import traceback
+
 import numpy as np
 import pandas as pd
-from lib import pdb,dihedral,clustering,tfindr
+from lib import pdb, dihedral, clustering, tfindr
 import config
-import os,traceback,logging
 
-def extract_first_frame(input_pdb, output_pdb):
-    with open(input_pdb, 'r') as infile, open(output_pdb, 'w') as outfile:
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def extract_first_frame(input_path: Path, output_path: Path) -> None:
+    """Extract the first model frame from a PDB file.
+
+    Args:
+        input_path: Path to input PDB file
+        output_path: Path to save the extracted frame
+    """
+    with open(input_path, 'r') as infile, open(output_path, 'w') as outfile:
         model_started = False
         for line in infile:
             if line.startswith('MODEL'):
@@ -15,103 +28,110 @@ def extract_first_frame(input_pdb, output_pdb):
                     break
             if model_started:
                 outfile.write(line)
-                
+
         if not model_started:
-            print(f"No model found in {input_pdb}.")
+            logger.warning(f"No model found in {input_path}")
             return
-    print(f"First frame extracted and saved as {output_pdb}.")
+    logger.info(f"First frame extracted and saved as {output_path}")
 
-def list_directories(folder_path):
-    directories = [
-        d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d))
-    ]
-    return directories
+def get_subdirectories(folder_path: Path) -> List[Path]:
+    """List all subdirectories in the given path.
 
-def big_calculations(name):
-    # Set the input and output file paths
-    input_file = config.data_dir + name + "/" + name + ".pdb"
-    output_structure = config.data_dir + name + "/output/structure.pdb"
-    output_pca = config.data_dir + name + "/output/pca.csv"
-    output_torsions = config.data_dir + name + "/output/torsions.csv"
-    output_info = config.data_dir + name + "/output/info.txt"
-    output_cluster_folder = config.data_dir + name + "/output/cluster_default/"
+    Args:
+        folder_path: Path to parent directory
 
-    # Extract the first frame from the input file and save it to the output file
-    extract_first_frame(input_file, output_structure)
+    Returns:
+        List of subdirectory paths
+    """
+    return [d for d in folder_path.iterdir() if d.is_dir()]
 
-    # Load the data and convert it to DataFrame format
-    pdb_data, frames = pdb.multi(input_file)
+def process_molecule(name: str) -> None:
+    """Process molecular calculations for the given structure.
+    
+    Args:
+        name: Name of the molecule/directory to process
+    """
+    data_dir = Path(config.data_dir)
+    input_file = data_dir / name / f"{name}.pdb"
+    output_dir = data_dir / name / "output"
+    output_paths = {
+        'structure': output_dir / "structure.pdb",
+        'pca': output_dir / "pca.csv",
+        'torsions': output_dir / "torsions.csv",
+        'info': output_dir / "info.txt",
+        'clusters': output_dir / "cluster_default/" 
+    }
+
+    # Extract first frame
+    extract_first_frame(input_file, output_paths['structure'])
+
+    # Load and prepare data
+    pdb_data, frames = pdb.multi(str(input_file))
     df = pdb.to_DF(pdb_data)
-
-    # Filter out hydrogen atoms and get their indices
     idx_noH = df.loc[df['Element'] != "H", 'Number'] - 1
 
     try:
-        # Perform PCA with Gaussian clustering and plot the Silhouette score, plot_Silhouette function also gives n_clus (best number of clusters)
+        # PCA and clustering analysis
         pcaG, n_dim = clustering.pcawithG(frames, idx_noH, config.number_of_dimensions, name)
-        # Save the PCA data to a CSV file
-        pcaG.to_csv(output_pca, index_label="i")
+        pcaG.to_csv(output_paths['pca'], index_label="i")
 
-        n_clus,s_scores = clustering.plot_Silhouette(pcaG, name, n_dim)
+        n_clus, s_scores = clustering.plot_Silhouette(pcaG, name, n_dim)
         
-
-        # clustering 
-        pca_df = pd.read_csv(output_pca)
-        selected_columns = [str(i) for i in range(1, n_dim+1)]
-        clustering_labels,pp = clustering.best_clustering(n_clus,pca_df[selected_columns])
-        pca_df.insert(1,"cluster",clustering_labels,False)
+        # Cluster processing
+        pca_df = pd.read_csv(output_paths['pca'])
+        selected_columns = [str(i) for i in range(1, n_dim + 1)]
+        clustering_labels, _ = clustering.best_clustering(n_clus, pca_df[selected_columns])
+        pca_df.insert(1, "cluster", clustering_labels)
         pca_df["cluster"] = pca_df["cluster"].astype(str)
-        popp = clustering.kde_c(n_clus,pca_df,selected_columns) 
-        pdb.exportframeidPDB(input_file,popp,output_cluster_folder)
+        
+        popp = clustering.kde_c(n_clus, pca_df, selected_columns)
+        cluster_dir = output_paths['clusters']
+        cluster_dir.mkdir(parents=True, exist_ok=True)
+        pdb.exportframeidPDB(str(input_file), popp, str(cluster_dir)+"/")
 
-        # Saving the n_dim and n_clus to output/info.txt
-        with open(output_info, 'w') as file:
-            file.write(f"n_clus = {n_clus}\n")
-            file.write(f"n_dim = {n_dim}\n")
-            file.write(f"popp = {list(popp)}\n")
-            file.write(f"s_scores = {list(s_scores)}\n")
+        # Save analysis info
+        with open(output_paths['info'], 'w') as f:
+            f.write(f"n_clus = {n_clus}\n"
+                   f"n_dim = {n_dim}\n"
+                   f"popp = {list(popp)}\n"
+                   f"s_scores = {list(s_scores)}\n")
+
     except Exception as e:
-        logging.error(traceback.format_exc())
-        print("PCA failed!")
-        pass
+        logger.error(f"PCA failed: {traceback.format_exc()}")
 
-    # Compute torsion pairs for the protein structure
+    # Torsion analysis
     pairs, external, internal = tfindr.torsionspairs(pdb_data, name)
-    pairs = np.asarray(pairs)
-
-    # Convert pairs to torsion names
     torsion_names = dihedral.pairtoname(external, df)
     ext_DF = dihedral.pairstotorsion(external, frames, torsion_names)
+    
+    torsion_names.extend(["internal"] * len(internal))
+    torsion_data_DF = dihedral.pairstotorsion(np.asarray(pairs), frames, torsion_names)
+    torsion_data_DF.to_csv(output_paths['torsions'], index_label="i")
 
-    # Add "internal" to torsion_names for internal torsions
-    for _ in range(len(internal)):
-        torsion_names.append("internal")
+    with open(output_paths['info'], 'a') as f:
+        f.write(f"flexibility = {len(external)}\n")
 
-    # Calculate torsion data and save it to a DataFrame
-    torsion_data_DF = dihedral.pairstotorsion(pairs, frames, torsion_names)
-
-    # Save the torsion data to a CSV file
-    torsion_data_DF.to_csv(output_torsions, index_label="i")
-
-    with open(output_info, 'a') as file:
-            file.write(f"flexibility = {len(external)}\n")
-
+def main() -> None:
+    """Main execution function."""
+    data_dir = Path(config.data_dir)
+    directories = get_subdirectories(data_dir)
+    
+    logger.info(f"Processing directories in: {data_dir}")
+    
+    for directory in directories:
+        output_dir = directory / 'output'
+        if output_dir.exists():
+            logger.info(f"Skipping: {directory.name}")
+            continue
+            
+        logger.info(f"Processing: {directory.name}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            process_molecule(directory.name)
+            logger.info("Success!")
+        except Exception:
+            logger.error(f"Failed: {traceback.format_exc()}")
 
 if __name__ == "__main__":
-    folder_path = config.data_dir
-    directory_list = list_directories(folder_path)
-    print("Directories in folder: ",config.data_dir)
-    for directory in directory_list:
-        isExist = os.path.exists(config.data_dir+directory+'/output')
-        if not isExist:
-                print("Processing : ",directory)
-                os.makedirs(config.data_dir+directory+'/output')
-                try:
-                    big_calculations(directory)
-                    print("success!")
-                except Exception:
-                    traceback.print_exc()
-                    print("failed!")
-                    pass
-        else:
-            print("Skipping : ",directory)
+    main()

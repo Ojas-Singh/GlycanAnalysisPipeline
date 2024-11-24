@@ -10,3 +10,6 @@ bio
 tqdm
 Pyarrow
 seaborn
+glycowork
+glycowork[draw]
+glypy

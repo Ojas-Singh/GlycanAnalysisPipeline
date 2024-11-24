@@ -53,6 +53,7 @@ def flip_alpha_beta(input_pdb, output_pdb):
     io.save(output_pdb)
 
 
+
 def get_glycan_sequence_from_filename(filename):
     pattern = re.compile(r'[A-Za-z0-9]+-?OH?')
     sequence = pattern.findall(filename)
@@ -64,7 +65,7 @@ def find_alpha_or_beta_oh_from_filename(filename):
     
     if "a1-OH" in last_residue or "a2-OH" in last_residue:
         return "Alpha OH"
-    elif "b1-OH" in last_residue:
+    elif "b1-OH" in last_residue or "b2-OH" in last_residue:
         return "Beta OH"
     else:
         return "OH not found"
@@ -76,13 +77,14 @@ def is_alpha(name):
         return False
     
 
-
-
-def flip_alpha_beta_multi(input_pdb, output_pdb):
+def flip_alpha_beta_multi(input_pdb, output_pdb, step_size):
     parser = PDBParser()
     structure = parser.get_structure("input", input_pdb)
-
-    for model in structure:
+    num_models = len(structure)
+    if num_models < step_size:
+        step_size = 1
+    for i, model in enumerate(structure):
+        if i % step_size == 0:
             # Initialize variables for each model
             C1 = None
             H1 = None
@@ -111,7 +113,7 @@ def flip_alpha_beta_multi(input_pdb, output_pdb):
 
             if not (C1 and H1 and O1 and HO1):
                 raise ValueError("One or more of the required atoms (C1, H1, O1, HO1) not found in the input PDB file.")
-
+                
             CO1_vector = O1.coord - C1.coord
             CH1_vector = H1.coord - C1.coord
             HO1O1_vector = HO1.coord - O1.coord

@@ -1,62 +1,86 @@
-import os, shutil
+from pathlib import Path
+from typing import Optional
+import logging
+import shutil
+
+import numpy as np
 from lib import flip, pdb
 import config
-import numpy as np
 
-def process_folders(root_dir):
-    for folder_name in os.listdir(root_dir):
-        folder_path = os.path.join(root_dir, folder_name)
-        if os.path.isdir(folder_path):
-            pdb_file = os.path.join(folder_path, folder_name + ".pdb")
-            subdirectory_path = os.path.join(folder_path, "clusters/pack")
-            alpha_file_path = os.path.join(subdirectory_path, "alpha.npy")
-            beta_file_path = os.path.join(subdirectory_path, "beta.npy")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-            if os.path.isfile(pdb_file):
-                print(f"Processing {pdb_file}")
-                try:
-                    if os.path.isfile(alpha_file_path) and os.path.isfile(beta_file_path):
-                        print(f"Skipping {folder_name} as alpha.npy and beta.npy already exist.")
-                        continue
+def save_frames(pdb_path: Path, output_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Save frames from PDB file.
+    
+    Args:
+        pdb_path: Path to PDB file
+        output_path: Path to save frames
+        
+    Returns:
+        Tuple of (pdb_data, frame data)
+    """
+    pdb_data, frames = pdb.multi(str(pdb_path))
+    np.save(output_path, frames)
+    logger.info(f"Saved frames to {output_path}")
+    return pdb_data, frames
 
-                    output_pdb_file = None
-                    if flip.is_alpha(folder_name):
-                        output_pdb_file = os.path.join(folder_path, "output/beta.pdb")
-                    else:
-                        output_pdb_file = os.path.join(folder_path, "output/alpha.pdb")
+def process_molecule(folder_path: Path) -> None:
+    """Process a single molecule directory.
+    
+    Args:
+        folder_path: Path to molecule directory
+    """
+    molecule_name = folder_path.name
+    pdb_file = folder_path / f"{molecule_name}.pdb"
+    pack_dir = folder_path / "clusters" / "pack"
+    alpha_file = pack_dir / "alpha.npy"
+    beta_file = pack_dir / "beta.npy"
 
-                    print(f"Will try to save flipped PDB to {output_pdb_file}")
-                    flip.flip_alpha_beta_multi(pdb_file, output_pdb_file)
-                    print(f"Saved flipped PDB to {output_pdb_file}")
+    if not pdb_file.exists():
+        logger.warning(f"No PDB file found in {folder_path}")
+        return
 
-                    # Ensure the subdirectory exists
-                    os.makedirs(subdirectory_path, exist_ok=True)
+    if alpha_file.exists() and beta_file.exists():
+        logger.info(f"Skipping {molecule_name} - output files already exist")
+        return
 
-                    if flip.is_alpha(folder_name):
-                        output_file_path = alpha_file_path
-                        a, frame = pdb.multi(pdb_file)
-                        np.save(output_file_path, frame)
+    try:
+        # Create output directory
+        pack_dir.mkdir(parents=True, exist_ok=True)
 
-                        output_file_path = beta_file_path
-                        b, frame = pdb.multi(output_pdb_file)
-                        np.save(output_file_path, frame)
-                    else:
-                        output_file_path = beta_file_path
-                        a, frame = pdb.multi(pdb_file)
-                        np.save(output_file_path, frame)
+        # Determine molecule type and output paths
+        is_alpha = flip.is_alpha(molecule_name)
+        output_pdb = folder_path / "output" / ("beta.pdb" if is_alpha else "alpha.pdb")
+        
+        # Generate flipped structure
+        logger.info(f"Processing {pdb_file}")
+        flip.flip_alpha_beta_multi(str(pdb_file), str(output_pdb), step_size=10)
+        logger.info(f"Generated flipped structure: {output_pdb}")
 
-                        output_file_path = alpha_file_path
-                        b, frame = pdb.multi(output_pdb_file)
-                        np.save(output_file_path, frame)
+        # Save frames for original structure
+        if is_alpha:
+            save_frames(pdb_file, alpha_file)
+            save_frames(output_pdb, beta_file)
+        else:
+            save_frames(pdb_file, beta_file)
+            save_frames(output_pdb, alpha_file)
 
-                    print(f"Saved flipped .npy to /clusters/pack/alpha.npy and /clusters/pack/beta.npy")
-                    os.remove(output_pdb_file)
-                    print(f"Removed {output_pdb_file}")
-                except Exception as e:
-                    print(f"Error processing {pdb_file}: {e}")
-            else:
-                print(f"No PDB file found in {folder_path}")
+        # Cleanup
+        output_pdb.unlink()
+        logger.info(f"Removed temporary file: {output_pdb}")
 
+    except Exception as e:
+        logger.error(f"Failed to process {molecule_name}: {str(e)}")
 
+def main() -> None:
+    """Main execution function."""
+    data_dir = Path(config.data_dir)
+    logger.info(f"Processing molecules in: {data_dir}")
+    
+    for folder in data_dir.iterdir():
+        if folder.is_dir():
+            process_molecule(folder)
 
-process_folders(config.data_dir)
+if __name__ == "__main__":
+    main()

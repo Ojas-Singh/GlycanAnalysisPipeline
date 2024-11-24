@@ -34,7 +34,8 @@ The final output database has format of dummy_database/. This directory format i
 
 # Citation
 
-All of the data provided is freely available for academic use under Creative Commons Attribution 4.0 (CC BY-NC-ND 4.0 Deed) licence terms. Please contact us at elisa.fadda@mu.ie for Commercial licence. If you use this resource, please cite the following papers:
+All of the data provided is freely available for academic use under Creative Commons Attribution 4.0 (CC BY-NC-ND 4.0 Deed) licence terms. Please contact us at elisa.fadda@soton.ac.uk for Commercial licence. If you use this resource, please cite the following papers:
 
-Callum M Ives and Ojas Singh et al. Restoring Protein Glycosylation with GlycoShape [bioRxiv (2023)](https://www.biorxiv.org/content/10.1101/2023.12.11.571101v1.full).
+Callum M Ives and Ojas Singh et al. Restoring Protein Glycosylation with GlycoShape [Nat Methods (2024).](https://doi.org/10.1038/s41592-024-02464-7).
+
 

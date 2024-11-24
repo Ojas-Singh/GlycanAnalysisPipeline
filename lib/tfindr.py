@@ -1,241 +1,214 @@
+from pathlib import Path
+from typing import List, Tuple, Any
+import logging
+
 import numpy as np
-from lib import pdb,graph,dihedral
-import matplotlib.pyplot as plt
+import pandas as pd
 import networkx as nx
+import matplotlib.pyplot as plt
+
+from lib import pdb, graph, dihedral
 import config
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def parse_mol2_bonds(file_path):
-    with open(file_path, 'r') as file:
-        lines = file.readlines()
+def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
+    """Parse bond information from MOL2 file.
+    
+    Args:
+        file_path: Path to MOL2 file
+        
+    Returns:
+        List of tuples containing bonded atom pairs
+    """
+    try:
+        with open(file_path, 'r') as file:
+            lines = file.readlines()
 
-    # Find the start and end line numbers for the BOND section
-    bond_start = -1
-    bond_end = -1
-    for i, line in enumerate(lines):
-        if line.strip() == "@<TRIPOS>BOND":
-            bond_start = i + 1
-        elif bond_start != -1 and line.strip().startswith("@<TRIPOS>"):
-            bond_end = i
-            break
+        bond_start = -1
+        bond_end = -1
+        for i, line in enumerate(lines):
+            if line.strip() == "@<TRIPOS>BOND":
+                bond_start = i + 1
+            elif bond_start != -1 and line.strip().startswith("@<TRIPOS>"):
+                bond_end = i
+                break
 
-    if bond_start == -1:
-        raise ValueError("No @<TRIPOS>BOND section found in the mol2 file.")
+        if bond_start == -1:
+            raise ValueError("No @<TRIPOS>BOND section found in the mol2 file.")
 
-    if bond_end == -1:
-        bond_end = len(lines)
+        if bond_end == -1:
+            bond_end = len(lines)
 
-    # Extract bonded atom pairs from the BOND section
-    bonded_atoms = []
-    for line in lines[bond_start:bond_end]:
-        _, atom1, atom2, _ = line.strip().split()
-        bonded_atoms.append((int(atom1), int(atom2)))
+        bonded_atoms = []
+        for line in lines[bond_start:bond_end]:
+            try:
+                _, atom1, atom2, _ = line.strip().split()
+                bonded_atoms.append((int(atom1), int(atom2)))
+            except ValueError:
+                logger.warning(f"Skipping invalid bond line: {line.strip()}")
+                continue
 
-    return bonded_atoms
+        return bonded_atoms
+    except Exception as e:
+        logger.error(f"Failed to parse MOL2 file {file_path}: {str(e)}")
+        raise
 
+def torsionspairs(pdbdata: Any, name: str) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
+    """Calculate torsion pairs for a molecule.
+    
+    Args:
+        pdbdata: PDB structure data
+        name: Molecule name
+        
+    Returns:
+        Tuple of (all pairs, external torsions, internal torsions)
+    """
+    try:
+        mol2_path = Path(config.data_dir) / name / f"{name}.mol2"
+        df = pdb.to_DF(pdbdata)
+        connect = parse_mol2_bonds(mol2_path)
 
-def savetotorparts(name):
-    f=config.data_dir+name+"/output/structure.pdb"
-    f2 = config.data_dir+name+"/"+name+".mol2"
-    pdbdata = pdb.parse(f)
-    df = pdb.to_DF(pdbdata)
-    connect = parse_mol2_bonds(f2)
-    G = nx.Graph()
-    G.add_edges_from(connect)
-    H_list = df.loc[(df['Element']=="H"),['Number']].iloc[:]['Number']
-    for i in H_list:
-        G.remove_node(i)
-    cycle=[]
-    for i in nx.cycle_basis(G):
-        for j in i:
-            cycle.append(j)
-    color_map = []
-    pairs=[]
-    for node in G:
-        if G.degree(node) ==2 and node not in cycle:
-            color_map.append('red')
-            j = list(G.neighbors(node))[0]
-            k = list(G.neighbors(node))[1]
-            if G.degree(j)>1:
-                l = list(G.neighbors(j))
-                l = [x for x in l if x != node]
-                pairs.append([l[0],j,node,k])
-            if G.degree(k)>1:
-                m = list(G.neighbors(k))
-                m = [x for x in m if x != node]
-                pairs.append([m[0],k,node,j])
-        # elif df.loc[(df['Number']==node),['Element']].iloc[0]['Element']=="O":
-        #     color_map.append('green')
-        else: 
-            color_map.append('orange') 
+        G = nx.Graph()
+        G.add_edges_from(connect)
+        
+        # Remove hydrogens
+        H_list = df.loc[df['Element']=="H", 'Number']
+        G.remove_nodes_from(H_list)
 
-            # Define node and edge properties
-        node_size = 800
-        node_alpha = 0.8
-        node_color_map = color_map # Your color_map is assumed to be defined here
-        edge_width = 2
-        edge_alpha = 0.6
-        font_size = 18
-        bg_color = 'white'
+        # Find cycles
+        cycle = [atom for c in nx.cycle_basis(G) for atom in c]
+        
+        # Identify red nodes (degree 2, not in cycle)
+        red = [node for node in G if G.degree(node)==2 and node not in cycle]
+        
+        # Create color map for visualization
+        color_map = ['red' if node in red else 'orange' for node in G.nodes()]
+        
+        # Plot network graph
+        plot_network_graph(G, color_map, name)
+        
+        external = []
+        internal = []
 
-        # Set the plot background color
+        # Process red nodes
+        for node in red:
+            j, k = list(G.neighbors(node))
+            
+            if j in red or k in red:
+                _process_red_neighbors(df, G, node, j, k, red, external)
+            else:
+                _process_normal_nodes(df, G, node, j, k, cycle, external, internal)
+
+        # Save results
+        pairs = external + internal
+        _save_torsion_parts(pdbdata, name, pairs, connect)
+
+        logger.info(f"Processed {len(pairs)} torsion pairs for {name}")
+        return pairs, external, internal
+
+    except Exception as e:
+        logger.error(f"Failed to process torsions for {name}: {str(e)}")
+        raise
+
+def _process_red_neighbors(df: pd.DataFrame, G: nx.Graph, node: int, j: int, k: int, 
+                         red: List[int], external: List[List[int]]) -> None:
+    """Process torsions for nodes with red neighbors."""
+    if df.loc[df['Number']==node, 'Name'].iloc[0] != "O6":
+        return
+        
+    for neighbor, other in [(j,k), (k,j)]:
+        if neighbor not in red:
+            continue
+            
+        l = [x for x in G.neighbors(neighbor) if x != node]
+        m = [x for x in G.neighbors(other) if x != node]
+        
+        aa = df.loc[df['Number']==m[0], 'Name'].iloc[0]
+        external.append([l[0], neighbor, node, other])
+        
+        if df.loc[df['Number']==other, 'Name'].iloc[0] in ["C1", "C2"]:
+            external.append([m[0] if aa in ["O5","C1"] else m[1], other, node, neighbor])
+            
+        res_id = df.loc[df['Number']==l[0], 'ResId'].iloc[0]
+        c4_num = df.loc[(df['ResId']==res_id) & (df['Name']=="C4"), 'Number'].iloc[0]
+        external.append([c4_num, l[0], neighbor, node])
+
+def _process_normal_nodes(df: pd.DataFrame, G: nx.Graph, node: int, j: int, k: int,
+                        cycle: List[int], external: List[List[int]], internal: List[List[int]]) -> None:
+    """Process torsions for nodes with normal neighbors."""
+    for neighbor, other in [(j,k), (k,j)]:
+        if G.degree(neighbor) <= 1:
+            continue
+            
+        neighbors = [x for x in G.neighbors(neighbor) if x != node]
+        
+        if any(n in cycle for n in neighbors) and other in cycle:
+            name = df.loc[df['Number']==neighbor, 'Name'].iloc[0]
+            
+            if name == "C1":
+                n0_name = df.loc[df['Number']==neighbors[0], 'Name'].iloc[0]
+                external.append([neighbors[0] if n0_name=="O5" else neighbors[1], 
+                               neighbor, node, other])
+            elif G.degree(neighbor) == 4:
+                res_id = df.loc[df['Number']==neighbor, 'ResId'].iloc[0]
+                c1_num = df.loc[(df['ResId']==res_id) & (df['Name']=="C1"), 'Number'].iloc[0]
+                external.append([c1_num, neighbor, node, other])
+            else:
+                next_c = int(name.strip("C")) + 1
+                res_id = df.loc[df['Number']==neighbor, 'ResId'].iloc[0]
+                next_num = df.loc[(df['ResId']==res_id) & 
+                                (df['Name']==f"C{next_c}"), 'Number'].iloc[0]
+                external.append([other, node, neighbor, next_num])
+        else:
+            internal.append([neighbors[0], neighbor, node, other])
+
+def _save_torsion_parts(pdbdata: Any, name: str, pairs: List[List[int]], 
+                       connect: List[Tuple[int, int]]) -> None:
+    """Save torsion parts data."""
+    anotherlist = []
+    for pair in pairs:
+        G = nx.Graph()
+        G.add_edges_from(connect)
+        node1, node2 = pair[1], pair[2]
+        G.remove_edge(node1, node2)
+        
+        arr = np.ones(len(pdbdata[0]), dtype=bool)
+        for node in nx.node_connected_component(G, node1):
+            arr[node-1] = False
+        anotherlist.append(arr)
+        
+    output_path = Path(config.data_dir) / name / "output" / "torparts"
+    np.savez_compressed(output_path, a=pairs, b=anotherlist, allow_pickle=True)
+    logger.info(f"Saved torsion parts to {output_path}")
+
+def plot_network_graph(G: nx.Graph, color_map: List[str], name: str) -> None:
+    """Plot molecular network graph.
+    
+    Args:
+        G: NetworkX graph
+        color_map: Node colors
+        name: Molecule name
+    """
+    try:
         plt.figure(figsize=(10, 10))
-        ax = plt.gca()
-        ax.set_facecolor(bg_color)
-
-        # Draw the graph with modified properties
         nx.draw(
             G,
             pos=nx.kamada_kawai_layout(G),
-            node_size=node_size,
-            node_color=node_color_map,
-            alpha=node_alpha,
+            node_size=800,
+            node_color=color_map,
+            alpha=0.8,
             with_labels=True,
-            width=edge_width,
+            width=2,
             edge_color='grey',
-            font_size=font_size,
+            font_size=18
         )
-        plt.savefig(config.data_dir+name+'/output/graph.png',dpi=450)
-        # Show the plot
-        # plt.show()
-
-    anotherlist=[]
-
-
-    for i in pairs:
-        G = nx.Graph()
-        G.add_edges_from(connect)
-        nx.draw(G)
-        node1 = i[1]
-        node2 = i[2]
-        G.remove_edge(node1, node2)
-        arr = np.ones(len(pdbdata[0]),dtype=bool) 
-        for i in nx.node_connected_component(G, node1):
-            arr[i-1]=False
-        anotherlist.append(arr)
-    np.savez_compressed(config.data_dir+name+"/"+name+"_torparts", a = pairs,b = anotherlist, allow_pickle=True)
-    return pairs
-
-import numpy as np
-from lib import pdb,graph,dihedral
-import matplotlib.pyplot as plt
-import networkx as nx
-
-
-
-def torsionspairs(pdbdata,name):
-    f2 = config.data_dir+name+"/"+name+".mol2"
-
-    df = pdb.to_DF(pdbdata)
-    connect = parse_mol2_bonds(f2)
-    G = nx.Graph()
-    G.add_edges_from(connect)
-    H_list = df.loc[(df['Element']=="H"),['Number']].iloc[:]['Number']
-    for i in H_list:
-        G.remove_node(i)
-    cycle=[]
-    for i in nx.cycle_basis(G):
-        for j in i:
-            cycle.append(j)
-    color_map = []
-    external=[]
-    red=[]
-    internal=[]
-    for node in G:
-        if G.degree(node) ==2 and node not in cycle:
-            color_map.append('red')
-            red.append(node)
-        # elif df.loc[(df['Number']==node),['Element']].iloc[0]['Element']=="O":
-        #     color_map.append('green')
-        else: 
-            color_map.append('blue') 
-    for node in red:
-        j = list(G.neighbors(node))[0]
-        k = list(G.neighbors(node))[1]
-        if (j in red) or (k in red):
-            if  df.loc[(df['Number']==node),['Name']].iloc[0]['Name']=="O6":
-                if j in red:
-                    l = list(G.neighbors(j))
-                    l = [x for x in l if x != node]
-                    m = list(G.neighbors(k))
-                    m = [x for x in m if x != node]
-                    aa = df.loc[(df['Number']==m[0]),['Name']].iloc[0]['Name']
-                    external.append([l[0],j,node,k])
-                    if (df.loc[(df['Number']==k),['Name']].iloc[0]['Name'] =="C1" ) or (df.loc[(df['Number']==k),['Name']].iloc[0]['Name'] =="C2"):
-                        if aa=="O5" or aa=="C1":
-                            external.append([m[0],k,node,j])
-                        else:
-                            external.append([m[1],k,node,j])
-                    external.append([df.loc[(df['ResId']==df.loc[(df['Number']==l[0]),['ResId']].iloc[0]['ResId']) & (df['Name']== "C4"),['Number']].iloc[0]['Number'],l[0],j,node])
-                    
-                if k in red:
-                    l = list(G.neighbors(k))
-                    l = [x for x in l if x != node]
-                    m = list(G.neighbors(j))
-                    m = [x for x in m if x != node]
-                    aa = df.loc[(df['Number']==m[0]),['Name']].iloc[0]['Name']
-                    external.append([l[0],k,node,j])
-                    if (df.loc[(df['Number']==j),['Name']].iloc[0]['Name'] =="C1") or (df.loc[(df['Number']==j),['Name']].iloc[0]['Name'] =="C2"):
-                        if aa=="O5" or aa=="C1":
-                            external.append([m[0],j,node,k])
-                        else:
-                            external.append([m[1],j,node,k])
-                    external.append([df.loc[(df['ResId']==df.loc[(df['Number']==l[0]),['ResId']].iloc[0]['ResId']) & (df['Name']== "C4"),['Number']].iloc[0]['Number'],l[0],k,node])
-        else:
-            if G.degree(j)>1:
-                l = list(G.neighbors(j))
-                l = [x for x in l if x != node]
-                if (l[1]in cycle or l[0] in cycle) and k in cycle:
-                    if df.loc[(df['Number']==j),['Name']].iloc[0]['Name']=="C1":
-                        if df.loc[(df['Number']==l[0]),['Name']].iloc[0]['Name']=="O5":
-                            external.append([l[0],j,node,k])
-                        else:
-                            external.append([l[1],j,node,k])
-                    elif G.degree(j)==4:
-                        external.append([df.loc[(df['ResId']==df.loc[(df['Number']==j),['ResId']].iloc[0]['ResId']) & (df['Name']== "C1"),['Number']].iloc[0]['Number'],j,node,k])
-                    else:
-                        jj = df.loc[(df['Number']==j),['Name']].iloc[0]['Name']
-                        external.append([k,node,j,df.loc[(df['ResId']==df.loc[(df['Number']==j),['ResId']].iloc[0]['ResId']) & (df['Name']== "C"+str(int(jj.strip("C"))+1)),['Number']].iloc[0]['Number']])    
-                else:
-                    internal.append([l[0],j,node,k])
-            if G.degree(k)>1:
-                m = list(G.neighbors(k))
-                m = [x for x in m if x != node]
-                if (m[1] in cycle or m[0] in cycle) and j in cycle:
-                    if df.loc[(df['Number']==k),['Name']].iloc[0]['Name']=="C1":
-                        if df.loc[(df['Number']==m[0]),['Name']].iloc[0]['Name']=="O5":
-                            external.append([m[0],k,node,j])
-                        else:
-                            external.append([m[1],k,node,j])
-                    elif G.degree(k)==4:
-                        external.append([df.loc[(df['ResId']==df.loc[(df['Number']==k),['ResId']].iloc[0]['ResId']) & (df['Name']== "C1"),['Number']].iloc[0]['Number'],k,node,j])
-                    else:
-                        kk= df.loc[(df['Number']==k),['Name']].iloc[0]['Name']
-                        external.append([j,node,k,df.loc[(df['ResId']==df.loc[(df['Number']==k),['ResId']].iloc[0]['ResId']) & (df['Name']== "C"+str(int(kk.strip("C"))+1)),['Number']].iloc[0]['Number']])    
-                
-                else:
-                    internal.append([m[0],k,node,j])
-    # nx.draw(G, pos=nx.kamada_kawai_layout(G),node_color=color_map, with_labels = True)
-    # plt.show()
-
-    anotherlist=[]
-    pairs = external + internal
-
-    for i in pairs:
-        G = nx.Graph()
-        G.add_edges_from(connect)
-        nx.draw(G)
-        node1 = i[1]
-        node2 = i[2]
-        G.remove_edge(node1, node2)
-        arr = np.ones(len(pdbdata[0]),dtype=bool) 
-        for i in nx.node_connected_component(G, node1):
-            arr[i-1]=False
-        anotherlist.append(arr)
-    np.savez_compressed(config.data_dir+name+"/output/torparts", a = pairs,b = anotherlist, allow_pickle=True)
-
-    
-    return pairs,external,internal
-
-
-
+        
+        output_path = Path(config.data_dir) / name / "output" / "network_graph.png"
+        plt.savefig(output_path, dpi=450, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Network graph saved to {output_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to plot network graph: {str(e)}")

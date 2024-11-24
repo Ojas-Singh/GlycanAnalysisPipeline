@@ -160,9 +160,9 @@ def pairtoname(pairs,df):
 
         t_type=""
         if not (a==b==c==d):
-            if (aa== "O5" and bb=="C1" and cc.startswith('O') and dd.startswith('C')) or (dd== "O5" and cc=="C1" and bb.startswith('O') and aa.startswith('O')):
+            if (aa.startswith('O')  and bb.startswith('C')  and cc.startswith('O') and dd.startswith('C')) or (aa.startswith('O') and bb.startswith('O') and cc=="C1" and  dd== "O5"):
                 t_type ="phi"
-            elif (aa== "C1" and bb.startswith('C2') and cc.startswith('O') and dd.startswith('C')) or (dd== "C1" and cc.startswith('C2') and bb.startswith('O') and aa.startswith('C')):
+            elif (aa.startswith('C') and bb.startswith('C') and cc.startswith('O') and dd.startswith('C')) or (dd== "C1" and cc.startswith('C2') and bb.startswith('O') and aa.startswith('C')):
                 t_type ="phi"
             else:
                 t_type ="psi"
