@@ -65,6 +65,7 @@ def glycam2iupac(glycam):
                     elif default == "L":
                         mod_component = mod_component.replace("L", "")
                         mod_component = mod_component.replace("D", "D-")
+            
             mod_component = mod_component.replace("p", "")
             # mod_component = mod_component.replace("f", "")
             
@@ -125,28 +126,64 @@ def iupac2composition(iupac):
     return sort_dict(composition)
 
 
-# Function to request the WURCS nomeclature and GlyTouCan ID from the condensed IUPAC nomeclature...
-def iupac2wurcs_glytoucan(iupac): 
-    id_list = []
-    for end in ["a","b","?"]:
-        iupac_mod = iupac + f"({end}1-"
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-        }
-        data = {"input": f"{iupac}"}
-        response = requests.post(
-            'https://api.glycosmos.org/glycanformatconverter/2.8.2/iupaccondensed2wurcs',
-            headers=headers,
-            data=str(data),
-        )
-        id_list.append([response.json()["id"] if "id" in response.json() else None, response.json()["wurcs"] if "wurcs" in response.json() else None])
+# # Function to request the WURCS nomeclature and GlyTouCan ID from the condensed IUPAC nomeclature...
+# def iupac2wurcs_glytoucan(iupac): 
+#     id_list = []
+#     for end in ["a","b","?"]:
+#         iupac_mod = iupac + f"({end}1-"
+#         headers = {
+#             'Content-Type': 'application/x-www-form-urlencoded',
+#         }
+#         data = {"input": f"{iupac}"}
+#         response = requests.post(
+#             'https://api.glycosmos.org/glycanformatconverter/2.8.2/iupaccondensed2wurcs',
+#             headers=headers,
+#             data=str(data),
+#         )
+#         id_list.append([response.json()["id"] if "id" in response.json() else None, response.json()["wurcs"] if "wurcs" in response.json() else None])
 
-    ids = [id_list[n][0] for n in range(len(id_list))]
-    ids = list(dict.fromkeys(ids))
-    wurcs = [id_list[n][1] for n in range(len(id_list))]
-    wurcs = list(dict.fromkeys(wurcs))
-    return ids, wurcs
+#     ids = [id_list[n][0] for n in range(len(id_list))]
+#     ids = list(dict.fromkeys(ids))
+#     wurcs = [id_list[n][1] for n in range(len(id_list))]
+#     wurcs = list(dict.fromkeys(wurcs))
+#     return ids, wurcs
 
+
+def iupac2wurcs_glytoucan(iupac_condensed):
+    """
+    Converts IUPAC condensed format to WURCS format and retrieves the GlyTouCan accession number.
+
+    Parameters:
+        iupac_condensed (str): The IUPAC Condensed format string.
+
+    Returns:
+        dict: A dictionary containing the GlyTouCan accession number and WURCS format, 
+              or an error message if the request fails.
+    """
+    # Base URL for the API endpoint
+    url = f"https://api.glycosmos.org/glycanformatconverter/2.10.0/iupaccondensed2wurcs/{iupac_condensed}"
+    
+    try:
+        # Make the API request
+        response = requests.get(url)
+        # Raise an exception if the request failed
+        response.raise_for_status()
+        
+        # Parse the JSON response
+        data = response.json()
+        
+        # Extract and return the id and WURCS format
+        # return {
+        #     "id": data.get("id"),
+        #     "wurcs": data.get("wurcs")
+        # }
+        return data.get("id"),data.get("wurcs")
+    except requests.exceptions.RequestException as e:
+        # Handle any request exceptions
+        return {"error": str(e)}
+    except KeyError:
+        # Handle unexpected response structure
+        return {"error": "Unexpected response structure"}
 
 # Function to look up a GlycoCT name from IUPAC using GlyConnect...
 def iupac2glycoct(iupac):
@@ -198,8 +235,8 @@ def get_clusters_alpha(glycam):
                 except:
                     pdb_file = glob.glob(f'*_{file:.1f}.pdb')[0]
                 # shutil.copyfile(pdb_file, os.path.join(config.output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
-                shutil.copyfile(pdb_file, os.path.join(config.output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb"))
-                pdb_remark_adder(os.path.join(config.output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb"))
+                shutil.copyfile(pdb_file, os.path.join(config.output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
+                pdb_remark_adder(os.path.join(config.output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
                 cluster_ids.append(f"Cluster {n}")
                 cluster_occupancies.append(file)
         cluster_dict = {}
@@ -228,8 +265,8 @@ def get_clusters_beta(glycam):
                 except:
                     pdb_file = glob.glob(f'*_{file:.1f}.pdb')[0]
                 # shutil.copyfile(pdb_file, os.path.join(config.output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
-                shutil.copyfile(pdb_file, os.path.join(config.output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb"))
-                pdb_remark_adder(os.path.join(config.output_path,f"{iupac}/{iupac}_cluster{n}_{conf}.pdb"))
+                shutil.copyfile(pdb_file, os.path.join(config.output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
+                pdb_remark_adder(os.path.join(config.output_path,f"{iupac}/cluster{n}_{conf}.pdb"))
                 cluster_ids.append(f"Cluster {n}")
                 cluster_occupancies.append(file)
         cluster_dict = {}
@@ -388,8 +425,8 @@ for glycam, i in zip(glycoshape_list,tqdm(range(len(glycoshape_list)))):
 
     composition = iupac2composition(iupac)
     glytoucan, wurcs = iupac2wurcs_glytoucan(iupac)
-    glytoucan = glytoucan[0]
-    wurcs = wurcs[0]
+    # glytoucan = glytoucan[0]
+    # wurcs = wurcs[0]
     glycoct = iupac2glycoct(iupac)
     if glytoucan == None:
         no_glytoucan_iupac.append(iupac)
