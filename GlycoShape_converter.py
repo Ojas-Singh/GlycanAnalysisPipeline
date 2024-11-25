@@ -6,82 +6,192 @@ import glob
 import shutil
 from config import output_path
 
-def create_directories(base_path):
-    formats = ['GLYCAM', 'PDB', 'CHARMM']
-    types = ['ATOM', 'HETATM']
-    for format in formats:
-        for type in types:
-            dir_path = os.path.join(base_path, f"{format}_format_{type}")
-            if os.path.exists(dir_path):
-                shutil.rmtree(dir_path)
-            os.mkdir(dir_path)
-
-def process_file(input_file, output_dir, conversion_type):
-    with open(input_file, 'r') as file:
-        filedata = file.read()
+directories = glob.glob(f"{output_path}/*/")
+for directory in directories:
+    print(f"Converting for {directory.split('/')[-2]}")
     
-    if conversion_type == 'GLYCAM_HETATM':
+    os.chdir(directory)
+    if os.path.exists("GLYCAM_format_ATOM"):
+        shutil.rmtree("GLYCAM_format_ATOM")
+        shutil.rmtree("PDB_format_ATOM")
+        shutil.rmtree("CHARMM_format_ATOM")
+        shutil.rmtree("GLYCAM_format_HETATM")
+        shutil.rmtree("PDB_format_HETATM")
+        shutil.rmtree("CHARMM_format_HETATM")
+    os.mkdir("GLYCAM_format_ATOM")
+    os.mkdir("PDB_format_ATOM")
+    os.mkdir("CHARMM_format_ATOM")
+    os.mkdir("GLYCAM_format_HETATM")
+    os.mkdir("PDB_format_HETATM")
+    os.mkdir("CHARMM_format_HETATM")
+
+    pdb_files = glob.glob("*pdb")
+    for pdb in pdb_files:
+
+        # Tidied GLYCAM name..
+        try:
+            with open(pdb, 'r') as file:
+                filedata = file.read()
+            filedata = filedata.replace("ATOM  ", "HETATM")
+            with open(f"GLYCAM_format_HETATM/{pdb.split('.')[0]}.pdb", 'w') as file:
+                file.write(filedata)
+        except OSError:
+            print(OSError)
+            pass
+
+        # Tidied PDB name..
+        with open(pdb, 'r') as file:
+            filedata = file.read()
         filedata = filedata.replace("ATOM  ", "HETATM")
-    elif conversion_type in ['PDB', 'CHARMM']:
-        filedata = apply_conversions(filedata, conversion_type)
-    
-    output_file = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(input_file))[0]}.{conversion_type}.pdb")
-    with open(output_file, 'w') as file:
-        file.write(filedata)
+        filedata = re.sub("\s\wYA", " NDG", filedata) # GlcNAc alpha
+        filedata = re.sub("\s\wYB", " NAG", filedata) # GlcNAc beta
+        filedata = re.sub("\s\wVA", " A2G", filedata) # GalNAc alpha
+        filedata = re.sub("\s\wVB", " NGA", filedata) # GalNAc beta
+        filedata = re.sub("\s\wGA", " GLC", filedata) # Glc alpha
+        filedata = re.sub("\s\wGB", " BGC", filedata) # Glc beta
+        filedata = re.sub("\s\wGL", " NGC", filedata) # Neu5Gc alpha
+        filedata = re.sub("\s\wLA", " GLA", filedata) # Gal alpha
+        filedata = re.sub("\s\wLB", " GAL", filedata) # Gal beta
+        filedata = re.sub("\s\wfA", " FUC", filedata) # L-Fuc alpha
+        filedata = re.sub("\s\wfB", " FUL", filedata) # L-Fuc beta
+        filedata = re.sub("\s\wMB", " BMA", filedata) # Man beta
+        filedata = re.sub("\s\wMA", " MAN", filedata) # Man alpha
+        filedata = re.sub("\s\wSA", " SIA", filedata) # Neu5Ac alpha
+        filedata = re.sub("\s\wSA", " SLB", filedata) # Neu5Ac beta
+        filedata = re.sub("\s\wZA", " GCU", filedata) # GlcA alpha
+        filedata = re.sub("\s\wZB", " BDP", filedata) # GlcA beta
+        filedata = re.sub("\s\wXA", " XYS", filedata) # Xyl alpha
+        filedata = re.sub("\s\wXB", " XYP", filedata) # Xyl beta
+        filedata = re.sub("\s\wuA", " IDR", filedata) # IdoA alpha
+        filedata = re.sub("\s\whA", " RAM", filedata) # Rha alpha
+        filedata = re.sub("\s\whB", " RHM", filedata) # Rha beta
+        filedata = re.sub("\s\wRA", " RIB", filedata) # Rib alpha
+        filedata = re.sub("\s\wRB", " BDR", filedata) # Rib beta
+        filedata = re.sub("\s\wAA", " ARA", filedata) # Ara alpha
+        filedata = re.sub("\s\wAB", " ARB", filedata) # Ara beta
+        try:
+            with open(f"PDB_format_HETATM/{pdb.split('.')[0]}.PDB.pdb", 'w') as file:
+                file.write(filedata)
+        except OSError:
+            print(OSError)
+            pass
 
-def apply_conversions(filedata, conversion_type):
-    conversions = {
-        'PDB': {
-            "\s\wYA": " NDG", "\s\wYB": " NAG", "\s\wVA": " A2G", "\s\wVB": " NGA",
-            "\s\wGA": " GLC", "\s\wGB": " BGC", "\s\wGL": " NGC", "\s\wLA": " GLA",
-            "\s\wLB": " GAL", "\s\wfA": " FUC", "\s\wfB": " FUL", "\s\wMB": " BMA",
-            "\s\wMA": " MAN", "\s\wSA": " SIA", "\s\wZA": " GCU", "\s\wZB": " BDP",
-            "\s\wXA": " XYS", "\s\wXB": " XYP", "\s\wuA": " IDR", "\s\whA": " RAM",
-            "\s\whB": " RHM", "\s\wRA": " RIB", "\s\wRB": " BDR", "\s\wAA": " ARA",
-            "\s\wAB": " ARB"
-        },
-        'CHARMM': {
-            "\s\wYA ": " AGLC", "\s\wYB ": " BGLC", "\s\wVA ": " AGAL", "\s\wVB ": " BGAL",
-            "\s\wGA ": " AGLC", "\s\wGB ": " BGLC", "\s\wLA ": " AGAL", "\s\wLB ": " BGAL",
-            "\s\wf[A|B]": " FUC", "\s\wMA ": " AMAN", "\s\wMB ": " BMAN", "\s\wSA ": " ANE5",
-            "\s\wGL ": " ANE5", "\s\wXA ": " AXYL", "\s\wXB ": " BXYL", "\s\wuA ": " AIDO",
-            "\s\wZA ": " AGLC", "\s\wZB ": " BGLC", "\s\whA ": " ARHM", "\s\whB ": " BRHM",
-            "\s\wAA ": " AARB", "\s\wAB ": " BARB", "\s\wRA ": " ARIB", "\s\wRB ": " BRIB"
-        }
-    }
-    
-    for pattern, replacement in conversions[conversion_type].items():
-        filedata = re.sub(pattern, replacement, filedata)
-    
-    if conversion_type == 'PDB':
+        # Tidied CHARMM name..
+        with open(pdb, 'r') as file:
+            filedata = file.read()
         filedata = filedata.replace("ATOM  ", "HETATM")
-    
-    return filedata
+        filedata = re.sub("\s\wYA ", " AGLC", filedata) # GlcNAc alpha
+        filedata = re.sub("\s\wYB ", " BGLC", filedata) # GlcNAc beta
+        filedata = re.sub("\s\wVA ", " AGAL", filedata) # GalNAc alpha
+        filedata = re.sub("\s\wVB ", " BGAL", filedata) # GalNAc beta
+        filedata = re.sub("\s\wGA ", " AGLC", filedata) # Glc alpha
+        filedata = re.sub("\s\wGB ", " BGLC", filedata) # Glc beta
+        filedata = re.sub("\s\wLA ", " AGAL", filedata) # Gal alpha
+        filedata = re.sub("\s\wLB ", " BGAL", filedata) # Gal beta
+        filedata = re.sub("\s\wf[A|B]", " FUC", filedata) # Fuc alpha and beta
+        filedata = re.sub("\s\wMA ", " AMAN", filedata) # Man alpha
+        filedata = re.sub("\s\wMB ", " BMAN", filedata) # Man beta
+        filedata = re.sub("\s\wSA ", " ANE5", filedata) # Neu5Ac alpha
+        filedata = re.sub("\s\wGL ", " ANE5", filedata) # Neu5Gc 
+        filedata = re.sub("\s\wXA ", " AXYL", filedata) # Xyl alpha
+        filedata = re.sub("\s\wXB ", " BXYL", filedata) # Xyl beta
+        filedata = re.sub("\s\wuA ", " AIDO", filedata) # IdoA alpha
+        filedata = re.sub("\s\wZA ", " AGLC", filedata) # GlcA alpha
+        filedata = re.sub("\s\wZB ", " BGLC", filedata) # GlcA beta
+        filedata = re.sub("\s\whA ", " ARHM", filedata) # Rha alpha
+        filedata = re.sub("\s\whB ", " BRHM", filedata) # Rha beta
+        filedata = re.sub("\s\wAA ", " AARB", filedata) # Ara alpha
+        filedata = re.sub("\s\wAB ", " BARB", filedata) # Ara beta
+        filedata = re.sub("\s\wRA ", " ARIB", filedata) # Rib alpha
+        filedata = re.sub("\s\wRB ", " BRIB", filedata) # Rib beta
+        try:
+            with open(f"CHARMM_format_HETATM/{pdb.split('.')[0]}.CHARMM.pdb", 'w') as file:
+                file.write(filedata)
+        except OSError:
+            print(OSError)
+            pass
 
-def write_charmm_readme(directory):
-    readme_path = os.path.join(directory, "README.txt")
-    with open(readme_path, "w") as file:
-        file.write("Warning:\n\nSome Glycan residues in the CHARMM naming format have residue names longer than the maximum four characters that are permitted in the PDB format. Therefore, it can be difficult to differentiate between similar residues (i.e. Glc and GlcNAc) on their residue name alone.")
+        with open("CHARMM_format_HETATM/README.txt", "w") as file:
+            file.write("Warning:\n\nSome Glycan residues in the CHARMM naming format have residue names longer than the maximum four characters that are permitted in the PDB format. Therefore, it can be difficult to differentiate between similar residues (i.e. Glc and GlcNAc) on their residue name alone.")
 
-def main():
-    directories = glob.glob(f"{output_path}/*/")
-    for directory in directories:
-        print(f"Converting for {os.path.basename(os.path.dirname(directory))}")
-        
-        create_directories(directory)
-        
-        pdb_files = glob.glob(os.path.join(directory, "*pdb"))
-        for pdb in pdb_files:
-            for format in ['GLYCAM', 'PDB', 'CHARMM']:
-                for type in ['ATOM', 'HETATM']:
-                    output_dir = os.path.join(directory, f"{format}_format_{type}")
-                    conversion_type = f"{format}_{type}" if format == 'GLYCAM' else format
-                    process_file(pdb, output_dir, conversion_type)
-            
-            os.remove(pdb)
-        
-        write_charmm_readme(os.path.join(directory, "CHARMM_format_ATOM"))
-        write_charmm_readme(os.path.join(directory, "CHARMM_format_HETATM"))
+        # Tidied GLYCAM name..
+        with open(pdb, 'r') as file:
+            filedata = file.read()
+        with open(f"GLYCAM_format_ATOM/{pdb.split('.')[0]}.pdb", 'w') as file:
+            file.write(filedata)
 
-if __name__ == "__main__":
-    main()
+        # Tidied PDB name..
+        with open(pdb, 'r') as file:
+            filedata = file.read()
+        filedata = re.sub("\s\wYA", " NDG", filedata) # GlcNAc alpha
+        filedata = re.sub("\s\wYB", " NAG", filedata) # GlcNAc beta
+        filedata = re.sub("\s\wVA", " A2G", filedata) # GalNAc alpha
+        filedata = re.sub("\s\wVB", " NGA", filedata) # GalNAc beta
+        filedata = re.sub("\s\wGA", " GLC", filedata) # Glc alpha
+        filedata = re.sub("\s\wGB", " BGC", filedata) # Glc beta
+        filedata = re.sub("\s\wGL", " NGC", filedata) # Neu5Gc alpha
+        filedata = re.sub("\s\wLA", " GLA", filedata) # Gal alpha
+        filedata = re.sub("\s\wLB", " GAL", filedata) # Gal beta
+        filedata = re.sub("\s\wfA", " FUC", filedata) # L-Fuc alpha
+        filedata = re.sub("\s\wfB", " FUL", filedata) # L-Fuc beta
+        filedata = re.sub("\s\wMB", " BMA", filedata) # Man beta
+        filedata = re.sub("\s\wMA", " MAN", filedata) # Man alpha
+        filedata = re.sub("\s\wSA", " SIA", filedata) # Neu5Ac alpha
+        filedata = re.sub("\s\wSA", " SLB", filedata) # Neu5Ac beta
+        filedata = re.sub("\s\wZA", " GCU", filedata) # GlcA alpha
+        filedata = re.sub("\s\wZB", " BDP", filedata) # GlcA beta
+        filedata = re.sub("\s\wXA", " XYS", filedata) # Xyl alpha
+        filedata = re.sub("\s\wXB", " XYP", filedata) # Xyl beta
+        filedata = re.sub("\s\wuA", " IDR", filedata) # IdoA alpha
+        filedata = re.sub("\s\whA", " RAM", filedata) # Rha alpha
+        filedata = re.sub("\s\whB", " RHM", filedata) # Rha beta
+        filedata = re.sub("\s\wRA", " RIB", filedata) # Rib alpha
+        filedata = re.sub("\s\wRB", " BDR", filedata) # Rib beta
+        filedata = re.sub("\s\wAA", " ARA", filedata) # Ara alpha
+        filedata = re.sub("\s\wAB", " ARB", filedata) # Ara beta
+        try:
+            with open(f"PDB_format_ATOM/{pdb.split('.')[0]}.PDB.pdb", 'w') as file:
+                file.write(filedata)
+        except OSError:
+            print(OSError)
+            pass
+
+        # Tidied CHARMM name..
+        with open(pdb, 'r') as file:
+            filedata = file.read()
+        filedata = re.sub("\s\wYA ", " AGLC", filedata) # GlcNAc alpha
+        filedata = re.sub("\s\wYB ", " BGLC", filedata) # GlcNAc beta
+        filedata = re.sub("\s\wVA ", " AGAL", filedata) # GalNAc alpha
+        filedata = re.sub("\s\wVB ", " BGAL", filedata) # GalNAc beta
+        filedata = re.sub("\s\wGA ", " AGLC", filedata) # Glc alpha
+        filedata = re.sub("\s\wGB ", " BGLC", filedata) # Glc beta
+        filedata = re.sub("\s\wLA ", " AGAL", filedata) # Gal alpha
+        filedata = re.sub("\s\wLB ", " BGAL", filedata) # Gal beta
+        filedata = re.sub("\s\wf[A|B]", " FUC", filedata) # Fuc alpha and beta
+        filedata = re.sub("\s\wMA ", " AMAN", filedata) # Man alpha
+        filedata = re.sub("\s\wMB ", " BMAN", filedata) # Man beta
+        filedata = re.sub("\s\wSA ", " ANE5", filedata) # Neu5Ac alpha
+        filedata = re.sub("\s\wGL ", " ANE5", filedata) # Neu5Gc 
+        filedata = re.sub("\s\wXA ", " AXYL", filedata) # Xyl alpha
+        filedata = re.sub("\s\wXB ", " BXYL", filedata) # Xyl beta
+        filedata = re.sub("\s\wuA ", " AIDO", filedata) # IdoA alpha
+        filedata = re.sub("\s\wZA ", " AGLC", filedata) # GlcA alpha
+        filedata = re.sub("\s\wZB ", " BGLC", filedata) # GlcA beta
+        filedata = re.sub("\s\whA ", " ARHM", filedata) # Rha alpha
+        filedata = re.sub("\s\whB ", " BRHM", filedata) # Rha beta
+        filedata = re.sub("\s\wAA ", " AARB", filedata) # Ara alpha
+        filedata = re.sub("\s\wAB ", " BARB", filedata) # Ara beta
+        filedata = re.sub("\s\wRA ", " ARIB", filedata) # Rib alpha
+        filedata = re.sub("\s\wRB ", " BRIB", filedata) # Rib beta
+        try:
+            with open(f"CHARMM_format_ATOM/{pdb.split('.')[0]}.CHARMM.pdb", 'w') as file:
+                file.write(filedata)
+        except:
+            pass
+
+        with open("CHARMM_format_ATOM/README.txt", "w") as file:
+            file.write("Warning:\n\nSome Glycan residues in the CHARMM naming format have residue names longer than the maximum four characters that are permitted in the PDB format. Therefore, it can be difficult to differentiate between similar residues (i.e. Glc and GlcNAc) on their residue name alone.")
+
+
+        os.remove(pdb)
+        

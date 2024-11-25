@@ -750,5 +750,5 @@ df = pd.DataFrame(data=d)
 df.to_csv(os.path.join(config.output_path,"missing_glytoucan.csv"), index=False)
 
 
-# Run the zipping script...
-os.system("bash /mnt/database/DB_scripts/GlycoShape_zip.sh")
+# # Run the zipping script...
+# os.system("bash /mnt/database/DB_scripts/GlycoShape_zip.sh")
