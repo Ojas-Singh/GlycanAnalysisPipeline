@@ -12,6 +12,7 @@ Pyarrow
 seaborn
 glycowork
 glycowork[draw]
+glycowork[chem]
 glypy
 rdkit
 xxhash
