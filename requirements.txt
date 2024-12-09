@@ -13,3 +13,5 @@ seaborn
 glycowork
 glycowork[draw]
 glypy
+rdkit
+xxhash

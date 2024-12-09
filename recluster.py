@@ -66,6 +66,10 @@ def process_molecule(directory: Path) -> None:
             for line in f:
                 exec(line, None, config_vars)
 
+        # Copy files
+        for file in ["torparts.npz", "PCA_variance.png", "Silhouette_Score.png"]:
+            shutil.copy(directory / f"output/{file}", clusters_dir / f"pack/{file}")
+            
         # Determine molecule type and set paths
         is_alpha = flip.is_alpha(directory.name)
         temp_dir = clusters_dir / ("alpha_temp" if is_alpha else "beta_temp")
@@ -73,9 +77,7 @@ def process_molecule(directory: Path) -> None:
         flip_dir = clusters_dir / ("beta" if is_alpha else "alpha")
         temp_dir.mkdir(exist_ok=True)
 
-        # Copy files
-        for file in ["torparts.npz", "PCA_variance.png", "Silhouette_Score.png"]:
-            shutil.copy(directory / f"output/{file}", clusters_dir / f"pack/{file}")
+        
 
         # Process PCA and clustering
         pca_df, popp = process_pca_clustering(

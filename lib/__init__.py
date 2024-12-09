@@ -1,1 +1,1 @@
-__all__ = ["pdb","dihedral","graph","tfindr","clustering","flip","align"]
+__all__ = ["pdb","dihedral","graph","tfindr","clustering","flip","align","name"]

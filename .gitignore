@@ -17,3 +17,4 @@ dummy_data_dir/DManpa1-2DManpa1-OH/output
 dummy_data_dir/*
 dummy_database/*
 Duplicate_Entries.txt
+backup/*
