@@ -558,8 +558,8 @@ def glytoucan2glycosmos(glytoucan_id):
     
 
 def smiles2wurcs(smiles):
-    jar_path = "lib/MolWURCS.jar"
-    
+    jar_path = Path(__file__).parent / "MolWURCS.jar"
+    print("Using MolWURCS at :",jar_path)
     try:
         result = subprocess.run(
             ["java", "-jar", str(jar_path), "--in", "smi", "--out", "wurcs", smiles],
@@ -570,4 +570,167 @@ def smiles2wurcs(smiles):
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to convert SMILES to WURCS: {e.stderr}")
+        return None
+
+
+def glytoucan2motif(glytoucan_id):
+    """Get glycan motif data from GlyCosmos API for a GlyTouCan ID.
+    
+    Args:
+        glytoucan_id (str): GlyTouCan accession number
+        
+    Returns:
+        dict: Motif data or None if request fails
+    """
+    url = f"https://api.alpha.glycosmos.org/sparqlist/get_glycan_motif?id={glytoucan_id}"
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to get glycan motif data: {str(e)}")
+        return None
+
+# not perfect     
+def get_wurcs_variants(input_wurcs: str):
+    """
+    Given an input WURCS string (archetype, alpha, beta, or neutral),
+    return a dictionary containing all three forms: archetype, alpha, beta.
+    Returns None if the input WURCS does not match expected patterns.
+    """
+    # Define the WURCS pattern
+    pattern = re.compile(
+        r'^WURCS=2\.0/(\d+),(\d+),(\d+)/(\[.*?\]+)/([^/]+)/([^/]+)$'
+    )
+    match = pattern.match(input_wurcs)
+    if not match:
+        print(f"Invalid WURCS format: {input_wurcs}")
+        return None
+
+    S, D, B, residues_str, linkage, annotation = match.groups()
+
+    # Extract residues
+    residues = re.findall(r'\[([^\]]+)\]', residues_str)
+    if not residues:
+        print(f"No residues found in the WURCS string: {input_wurcs}")
+        return None
+
+    first_residue = residues[0]
+
+    # Identify the type based on the first residue
+    if first_residue.startswith('u') or first_residue.startswith('U'):
+        wtype = 'archetype'
+    elif '-1a_' in first_residue:
+        wtype = 'alpha'
+    elif '-1b_' in first_residue:
+        wtype = 'beta'
+    elif '-1x_' in first_residue:
+        wtype = 'neutral'
+    else:
+        print(f"Could not determine the type of the WURCS string: {input_wurcs}")
+        return None
+
+    # Create copies for each form
+    arch_residues = residues.copy()
+    alpha_residues = residues.copy()
+    beta_residues = residues.copy()
+
+    if wtype == 'archetype':
+        # Archetype is input; generate alpha and beta
+        match_alpha = re.match(r'u(\w+)(.*)', arch_residues[0], re.IGNORECASE)
+        if match_alpha:
+            # Replace [uXXXX...] with [aXXXX-1a_1-5...]
+            alpha_residues[0] = f'a{match_alpha.group(1)}-1a_1-5{match_alpha.group(2)}'
+            # Replace [uXXXX...] with [aXXXX-1b_1-5...]
+            beta_residues[0] = f'a{match_alpha.group(1)}-1b_1-5{match_alpha.group(2)}'
+        else:
+            print(f"Archetype first residue does not match expected pattern: {first_residue}")
+            return None
+
+    elif wtype == 'alpha':
+        # Alpha is input; generate archetype and beta
+        match_arch = re.match(r'a(\w+)-1a_(\d+-\d+)(.*)', alpha_residues[0])
+        if match_arch:
+            # Replace [aXXXX-1a_Y-Z...] with [uXXXX...]
+            arch_residues[0] = f'u{match_arch.group(1)}{match_arch.group(3)}'
+            # Replace [aXXXX-1a_Y-Z...] with [aXXXX-1b_Y-Z...]
+            beta_residues[0] = f'a{match_arch.group(1)}-1b_{match_arch.group(2)}{match_arch.group(3)}'
+        else:
+            print(f"Alpha first residue does not match expected pattern: {first_residue}")
+            return None
+
+    elif wtype == 'beta':
+        # Beta is input; generate archetype and alpha
+        match_arch = re.match(r'a(\w+)-1b_(\d+-\d+)(.*)', beta_residues[0])
+        if match_arch:
+            # Replace [aXXXX-1b_Y-Z...] with [uXXXX...]
+            arch_residues[0] = f'u{match_arch.group(1)}{match_arch.group(3)}'
+            # Replace [aXXXX-1b_Y-Z...] with [aXXXX-1a_Y-Z...]
+            alpha_residues[0] = f'a{match_arch.group(1)}-1a_{match_arch.group(2)}{match_arch.group(3)}'
+        else:
+            print(f"Beta first residue does not match expected pattern: {first_residue}")
+            return None
+
+    elif wtype == 'neutral':
+        # Neutral is input; generate archetype, alpha, beta
+        match_neutral = re.match(r'a(\w+)-1x_(\d+-\d+)(.*)', first_residue)
+        if match_neutral:
+            # Archetype: replace 'a' with 'u' and remove suffix
+            arch_residues[0] = f'u{match_neutral.group(1)}{match_neutral.group(3)}'
+            # Alpha: replace '-1x_' with '-1a_'
+            alpha_residues[0] = f'a{match_neutral.group(1)}-1a_{match_neutral.group(2)}{match_neutral.group(3)}'
+            # Beta: replace '-1x_' with '-1b_'
+            beta_residues[0] = f'a{match_neutral.group(1)}-1b_{match_neutral.group(2)}{match_neutral.group(3)}'
+        else:
+            print(f"Neutral first residue does not match expected pattern: {first_residue}")
+            return None
+
+    # Reconstruct residues strings
+    arch_residues_str = ''.join([f'[{r}]' for r in arch_residues])
+    alpha_residues_str = ''.join([f'[{r}]' for r in alpha_residues])
+    beta_residues_str = ''.join([f'[{r}]' for r in beta_residues])
+
+    # Reconstruct WURCS strings
+    archetype_wurcs = f'WURCS=2.0/{S},{D},{B}/{arch_residues_str}/{linkage}/{annotation}'
+    alpha_wurcs = f'WURCS=2.0/{S},{D},{B}/{alpha_residues_str}/{linkage}/{annotation}'
+    beta_wurcs = f'WURCS=2.0/{S},{D},{B}/{beta_residues_str}/{linkage}/{annotation}'
+
+
+    return validate_wurcs(archetype_wurcs), validate_wurcs(alpha_wurcs), validate_wurcs(beta_wurcs)
+
+def validate_wurcs(wurcs):
+    """
+    Validates WURCS string using GlyCosmos API.
+    Returns the WURCS string if valid, None if invalid.
+
+    Args:
+        wurcs (str): WURCS format string to validate
+
+    Returns:
+        str: Original WURCS string if valid, None if invalid 
+    """
+    url = "https://api.glycosmos.org/wurcsframework/1.3.1/wurcsvalidator"
+    
+    try:
+        # Make POST request with WURCS string
+        response = requests.post(url, json=[wurcs])
+        response.raise_for_status()
+        
+        # Parse response
+        data = response.json()
+        
+        # Check if response contains validation data
+        if data and isinstance(data, list) and len(data) > 0:
+            # Get error reports
+            error_reports = data[0].get("m_mapTypeToReports", {}).get("ERROR", [])
+            
+            # If no errors, return original WURCS
+            if not error_reports:
+                return wurcs
+                
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to validate WURCS: {str(e)}")
         return None

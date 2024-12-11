@@ -142,7 +142,7 @@ def create_glycoshape_json(dir: Path, output_file: str = "GLYCOSHAPE.json") -> N
         # Write consolidated JSON
         logger.info(f"Writing consolidated JSON to {output_file}")
         with open(output_path, 'w') as f:
-            json.dump(consolidated_data, f, indent=2, ensure_ascii=False, sort_keys=True)
+            json.dump(dict(sorted(consolidated_data.items())), f, indent=2, ensure_ascii=False)
             
         logger.info("Successfully created consolidated JSON file")
         
@@ -182,16 +182,14 @@ def wurcs_registration(dir: Path, file: str = "GLYCOSHAPE.json", output_file: st
     output_lines = []
 
     # Iterate through the data to extract relevant information
-    for key, glycan in data.items():
+    for key, type in data.items():
+        glycan  = type.get("archetype", {})
+        print(glycan.get("wurcs"))
         wurcs_values = {
-            "wurcs": glycan.get("wurcs"),
-            "wurcs_alpha": glycan.get("wurcs_alpha"),
-            "wurcs_beta": glycan.get("wurcs_beta")
+            "wurcs": glycan.get("wurcs")
         }
         glytoucan_values = {
-            "glytoucan": glycan.get("glytoucan"),
-            "glytoucan_alpha": glycan.get("glytoucan_alpha"),
-            "glytoucan_beta": glycan.get("glytoucan_beta")
+            "glytoucan": glycan.get("glytoucan")
         }
 
         # Write non-null wurcs if corresponding glytoucan is null
@@ -236,7 +234,7 @@ def submit_wurcs(contributor_id: str, api_key: str, file_path: Path) -> None:
         raise
 
 def total_simulation_length(file_path: Path) -> float:
-    """Sum the 'length' values in a JSON file.
+    """Sum the 'length' values from archtype entries in a JSON file.
     
     Args:
         file_path: Path to the JSON file
@@ -250,10 +248,12 @@ def total_simulation_length(file_path: Path) -> float:
         
         total_length = 0.0
         for entry in data.values():
-            length = entry.get("length")
+            archtype = entry.get("archetype", {})
+            length = archtype.get("length")
             if length is not None:
                 total_length += float(length)
         
+        logger.info(f"Total simulation length: {total_length}")
         return total_length
     
     except Exception as e:

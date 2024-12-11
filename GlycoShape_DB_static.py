@@ -94,6 +94,8 @@ def main():
             iupac = name.glycam2iupac(glycam_tidy)
             iupac_alpha = f"{iupac}(a{end_pos}-"
             iupac_beta = f"{iupac}(b{end_pos}-"
+            glycam_alpha = f"{glycam_tidy}a{end_pos}-OH"
+            glycam_beta = f"{glycam_tidy}b{end_pos}-OH"
             
             try:
                 mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name.iupac2properties(iupac)
@@ -101,18 +103,9 @@ def main():
                 logger.warning(f"Could not retrieve properties for {iupac}: {e}")
                 mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
 
-            try:
-                motifs = name.iupac2motif(iupac)
-            except Exception as e:
-                logger.warning(f"Could not retrieve motifs for {iupac}: {e}")
-                motifs = None
+            
 
-            results = name.iupac2sugarbase(iupac)
-            if results:
-                Species, Genus, Family, Order, Class, Phylum, Kingdom, Domain, glycan_type, disease_association, tissue_sample, Composition = results
-            else:
-                Species, Genus, Family, Order, Class, Phylum, Kingdom, Domain, glycan_type, disease_association, tissue_sample, Composition = (None,) * 12
-
+           
             try:
                 Composition = ast.literal_eval(Composition)
             except Exception:
@@ -176,60 +169,46 @@ def main():
 
             # if wurcs is None get it from Mol2WURCS using smiles
             if wurcs == None:
+                print("WURCS is None, will try to get it from Mol2WURCS")
                 wurcs = name.smiles2wurcs(smiles)
-                # wurcs_alpha = name.smiles2wurcs(name.iupac2smiles(iupac_alpha))
-                # wurcs_beta = name.smiles2wurcs(name.iupac2smiles(iupac_beta))
+                wurcs, wurcs_alpha, wurcs_beta = name.get_wurcs_variants(wurcs)
 
-                
+            try: 
+                if glytoucan != None:
+                    motifs = name.glytoucan2motif(glytoucan)
+                else:
+                    motifs = None
+            except Exception as e:
+                logger.warning(f"Could not retrieve motifs for {iupac}: {e}")
+                motifs = None
 
             glycan_data = {
+                "archetype" :{
 
                 # General info
                 "ID": ID,
                 "name": glycan,
                 "glycam": glycam_tidy,
                 "iupac": iupac,
-                "iupac_alpha": iupac_alpha,
-                "iupac_beta": iupac_beta,
                 "iupac_extended": name.wurcs2extendediupac(wurcs),
                 "glytoucan": glytoucan,
-                "glytoucan_alpha": glytoucan_alpha,
-                "glytoucan_beta": glytoucan_beta,
                 "wurcs": wurcs,
-                "wurcs_alpha": wurcs_alpha,
-                "wurcs_beta": wurcs_beta,
                 "glycoct": glycoct,
                 "smiles": smiles,
                 "oxford": oxford,
 
                 # Chemical properties
-                # "mass": np.float64(name.wurcs2mass(wurcs)).round(1),
                 "mass": round(Descriptors.ExactMolWt(Chem.MolFromSmiles(smiles)), 2),
-                "motifs": remove_underscores_list(motifs),
+                "motifs": motifs,
                 "termini": termini,
-                "components":str(composition)[1:-1].replace("'",'').replace(",",", "),
-                "composition":str(Composition)[1:-1].replace("'",'').replace(",",", "),
+                "components":composition,
+                "composition":Composition,
 
                 "components_search":composition,
                 "composition_search":Composition,
                 "rot_bonds":rot_bonds, 
                 "hbond_donor":hbond_donor, 
                 "hbond_acceptor":hbond_acceptor, 
-                "glycan_type":glycan_type,
-                
-                
-                
-                "disease":", ".join(remove_underscores_eval(disease_association)) if remove_underscores_eval(disease_association) != None else remove_underscores_eval(disease_association),
-                "tissue":", ".join(remove_underscores_eval(tissue_sample)) if remove_underscores_eval(tissue_sample) != None else remove_underscores_eval(tissue_sample),
-                "species":", ".join(remove_underscores_eval(Species)) if remove_underscores_eval(Species) != None else remove_underscores_eval(Species),
-                "genus":", ".join(remove_underscores_eval(Genus)) if remove_underscores_eval(Genus) != None else remove_underscores_eval(Genus),
-                "family":", ".join(remove_underscores_eval(Family)) if remove_underscores_eval(Family) != None else remove_underscores_eval(Family),
-                "order":", ".join(remove_underscores_eval(Order)) if remove_underscores_eval(Order) != None else remove_underscores_eval(Order),
-                "class":", ".join(remove_underscores_eval(Class)) if remove_underscores_eval(Class) != None else remove_underscores_eval(Class),
-                "phylum":", ".join(remove_underscores_eval(Phylum)) if remove_underscores_eval(Phylum) != None else remove_underscores_eval(Phylum),
-                "kingdom":", ".join(remove_underscores_eval(Kingdom)) if remove_underscores_eval(Kingdom) != None else remove_underscores_eval(Kingdom),
-                "domain":", ".join(remove_underscores_eval(Domain)) if remove_underscores_eval(Domain) != None else remove_underscores_eval(Domain),
-
                 
 
                 # Molecular Dynamics info
@@ -240,6 +219,88 @@ def main():
                 "temperature": temp,
                 "pressure": pressure,
                 "salt": salt,
+            },
+
+            "alpha":{
+                
+
+                # General info
+                "ID": ID,
+                "name": glycan,
+                "glycam": glycam_alpha,
+                "iupac": iupac_alpha,
+                "iupac_extended": name.wurcs2extendediupac(wurcs_alpha),
+                "glytoucan": glytoucan_alpha,
+                "wurcs": wurcs_alpha,
+                "glycoct": glycoct,
+                "smiles": smiles,
+                "oxford": oxford,
+
+                # Chemical properties
+                "mass": round(Descriptors.ExactMolWt(Chem.MolFromSmiles(smiles)), 2),
+                "motifs": motifs,
+                "termini": termini,
+                "components":composition,
+                "composition":Composition,
+
+                "components_search":composition,
+                "composition_search":Composition,
+                "rot_bonds":rot_bonds, 
+                "hbond_donor":hbond_donor, 
+                "hbond_acceptor":hbond_acceptor, 
+                
+                
+
+
+                # Molecular Dynamics info
+                "clusters": cluster_dict,
+                "length": length,
+                "package": package,
+                "forcefield": FF,
+                "temperature": temp,
+                "pressure": pressure,
+                "salt": salt,
+            },
+            
+            "beta":{
+                
+
+                # General info
+                "ID": ID,
+                "name": glycan,
+                "glycam": glycam_beta,
+                "iupac": iupac_beta,
+                "iupac_extended": name.wurcs2extendediupac(wurcs_beta),
+                "glytoucan": glytoucan_beta,
+                "wurcs": wurcs_beta,
+                "glycoct": glycoct,
+                "smiles": smiles,
+                "oxford": oxford,
+
+                # Chemical properties
+                "mass": round(Descriptors.ExactMolWt(Chem.MolFromSmiles(smiles)), 2),
+                "motifs": motifs,
+                "termini": termini,
+                "components":composition,
+                "composition":Composition,
+
+                "components_search":composition,
+                "composition_search":Composition,
+                "rot_bonds":rot_bonds, 
+                "hbond_donor":hbond_donor, 
+                "hbond_acceptor":hbond_acceptor, 
+                
+
+                # Molecular Dynamics info
+                "clusters": cluster_dict,
+                "length": length,
+                "package": package,
+                "forcefield": FF,
+                "temperature": temp,
+                "pressure": pressure,
+                "salt": salt,
+            }
+            
             }
 
             # Save data
