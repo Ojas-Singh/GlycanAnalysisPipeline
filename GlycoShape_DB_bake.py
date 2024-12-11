@@ -142,7 +142,7 @@ def create_glycoshape_json(dir: Path, output_file: str = "GLYCOSHAPE.json") -> N
         # Write consolidated JSON
         logger.info(f"Writing consolidated JSON to {output_file}")
         with open(output_path, 'w') as f:
-            json.dump(consolidated_data, f, indent=2)
+            json.dump(consolidated_data, f, indent=2, ensure_ascii=False, sort_keys=True)
             
         logger.info("Successfully created consolidated JSON file")
         
@@ -235,6 +235,31 @@ def submit_wurcs(contributor_id: str, api_key: str, file_path: Path) -> None:
         logger.error(f"Error during WURCS submission: {str(e)}")
         raise
 
+def total_simulation_length(file_path: Path) -> float:
+    """Sum the 'length' values in a JSON file.
+    
+    Args:
+        file_path: Path to the JSON file
+    
+    Returns:
+        The sum of all 'length' values as a float
+    """
+    try:
+        with open(file_path, 'r') as file:
+            data = json.load(file)
+        
+        total_length = 0.0
+        for entry in data.values():
+            length = entry.get("length")
+            if length is not None:
+                total_length += float(length)
+        
+        return total_length
+    
+    except Exception as e:
+        logger.error(f"Failed to sum lengths in JSON: {str(e)}")
+        raise
+
 if __name__ == "__main__":
     save_faq_json(
         dir=config.output_path,
@@ -242,14 +267,15 @@ if __name__ == "__main__":
     )
     create_glycoshape_json(
         dir=config.output_path,)
-    # create_glycoshape_archive(
-    #     dir=config.output_path,
-    # )
+    total_simulation_length(file_path=config.output_path / "GLYCOSHAPE.json")
+    create_glycoshape_archive(
+        dir=config.output_path,
+    )
     wurcs_registration(
         dir=config.output_path,
         file="GLYCOSHAPE.json",
-        output_file="extracted_wurcs.txt"
+        output_file="missing_glytoucan.txt"
     )
-    submit_wurcs(
-        contributor_id=config.contributor_id,
-        api_key=config.api_key, file_path=config.output_path / "missing_glytoucan.txt")
+    # submit_wurcs(
+    #     contributor_id=config.contributor_id,
+    #     api_key=config.api_key, file_path=config.output_path / "missing_glytoucan.txt")

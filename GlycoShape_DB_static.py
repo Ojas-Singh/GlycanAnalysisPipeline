@@ -94,10 +94,7 @@ def main():
             iupac = name.glycam2iupac(glycam_tidy)
             iupac_alpha = f"{iupac}(a{end_pos}-"
             iupac_beta = f"{iupac}(b{end_pos}-"
-            glytoucan, wurcs = name.iupac2wurcs_glytoucan(iupac)
-            glytoucan_alpha, wurcs_alpha = name.iupac2wurcs_glytoucan(iupac_alpha)
-            glytoucan_beta, wurcs_beta = name.iupac2wurcs_glytoucan(iupac_beta)
-
+            
             try:
                 mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name.iupac2properties(iupac)
             except Exception as e:
@@ -172,6 +169,18 @@ def main():
                     oxford = "M7"
                 else:
                     oxford = None
+            
+            glytoucan, wurcs = name.iupac2wurcs_glytoucan(iupac)
+            glytoucan_alpha, wurcs_alpha = name.iupac2wurcs_glytoucan(iupac_alpha)
+            glytoucan_beta, wurcs_beta = name.iupac2wurcs_glytoucan(iupac_beta)
+
+            # if wurcs is None get it from Mol2WURCS using smiles
+            if wurcs == None:
+                wurcs = name.smiles2wurcs(smiles)
+                # wurcs_alpha = name.smiles2wurcs(name.iupac2smiles(iupac_alpha))
+                # wurcs_beta = name.smiles2wurcs(name.iupac2smiles(iupac_beta))
+
+                
 
             glycan_data = {
 

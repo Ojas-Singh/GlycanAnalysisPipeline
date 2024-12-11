@@ -4,17 +4,21 @@ import sys
 import shutil
 import requests
 import collections
-import numpy as np
 import pandas as pd
 from pathlib import Path
 from glypy.io import iupac as glypy_iupac
 
+# Import glycowork functions (thankyou daniel for this amazing package!)
 from glycowork.motif.draw import GlycoDraw
 from glycowork.motif.processing import canonicalize_iupac
 from glycowork.motif.annotate import annotate_glycan
 from glycowork.motif.annotate import get_molecular_properties
+from glycowork.motif.processing import IUPAC_to_SMILES
+from glycowork.motif.annotate import get_terminal_structures
+
 import config
 import logging
+import subprocess
 
 from lib import pdb
 
@@ -224,7 +228,6 @@ def iupac2glycoct(iupac):
 
 
 def iupac2smiles(iupac):
-    from glycowork.motif.processing import IUPAC_to_SMILES
     smiles = IUPAC_to_SMILES([iupac])[0]
     return smiles
 
@@ -233,6 +236,7 @@ def iupac2snfg(iupac, ID):
     output_path = Path(config.output_path) / str(ID) / 'snfg.svg'
     snfg = GlycoDraw(iupac, filepath=str(output_path), show_linkage=True)
     return str(output_path)
+
 
 def canonicalize_iupac(iupac):
     
@@ -273,7 +277,6 @@ def iupac2properties(iupac):
         mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
 
 def iupac2termini(iupac):
-    from glycowork.motif.annotate import get_terminal_structures
     termini = get_terminal_structures(iupac)
     if termini != []:
         termini_mod = list(set(termini))
@@ -551,4 +554,20 @@ def glytoucan2glycosmos(glytoucan_id):
         return response.json()
     except Exception as e:
         logger.error(f"Failed to get GlyCosmos taxonomy data: {str(e)}")
+        return None
+    
+
+def smiles2wurcs(smiles):
+    jar_path = "lib/MolWURCS.jar"
+    
+    try:
+        result = subprocess.run(
+            ["java", "-jar", str(jar_path), "--in", "smi", "--out", "wurcs", smiles],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to convert SMILES to WURCS: {e.stderr}")
         return None
