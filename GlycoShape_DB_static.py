@@ -203,9 +203,6 @@ def main():
                 "termini": termini,
                 "components":composition,
                 "composition":Composition,
-
-                "components_search":composition,
-                "composition_search":Composition,
                 "rot_bonds":rot_bonds, 
                 "hbond_donor":hbond_donor, 
                 "hbond_acceptor":hbond_acceptor, 
@@ -242,9 +239,6 @@ def main():
                 "termini": termini,
                 "components":composition,
                 "composition":Composition,
-
-                "components_search":composition,
-                "composition_search":Composition,
                 "rot_bonds":rot_bonds, 
                 "hbond_donor":hbond_donor, 
                 "hbond_acceptor":hbond_acceptor, 
@@ -283,9 +277,6 @@ def main():
                 "termini": termini,
                 "components":composition,
                 "composition":Composition,
-
-                "components_search":composition,
-                "composition_search":Composition,
                 "rot_bonds":rot_bonds, 
                 "hbond_donor":hbond_donor, 
                 "hbond_acceptor":hbond_acceptor, 
