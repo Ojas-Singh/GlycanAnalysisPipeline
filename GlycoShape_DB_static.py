@@ -172,6 +172,9 @@ def main():
                 print("WURCS is None, will try to get it from Mol2WURCS")
                 wurcs = name.smiles2wurcs(smiles)
                 wurcs, wurcs_alpha, wurcs_beta = name.get_wurcs_variants(wurcs)
+                glytoucan = name.wurcs2glytoucan(wurcs)
+                glytoucan_alpha = name.wurcs2glytoucan(wurcs_alpha)
+                glytoucan_beta = name.wurcs2glytoucan(wurcs_beta)
 
             try: 
                 if glytoucan != None:

@@ -734,3 +734,32 @@ def validate_wurcs(wurcs):
     except Exception as e:
         logger.error(f"Failed to validate WURCS: {str(e)}")
         return None
+    
+def wurcs2glytoucan(wurcs):
+    """Convert WURCS to GlyTouCan ID using GlyCosmos API.
+    
+    Args:
+        wurcs (str): WURCS format string
+        
+    Returns:
+        str: GlyTouCan ID or None if request fails
+    """
+    try:
+        # URL encode the WURCS string
+        encoded_wurcs = requests.utils.quote(wurcs)
+        url = f"https://api.glycosmos.org/sparqlist/wurcs2gtcids?wurcs={encoded_wurcs}"
+        
+        # Make the request
+        response = requests.get(url)
+        response.raise_for_status()
+        
+        # Parse response
+        data = response.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0].get("id")
+            
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to convert WURCS to GlyTouCan ID: {str(e)}")
+        return None
