@@ -300,10 +300,10 @@ def convert_pdbs(ID):
             filedata = file.read()
         filedata = re.sub("\s\wYA", " NDG", filedata) # GlcNAc alpha
         filedata = re.sub("\s\wYB", " NAG", filedata) # GlcNAc beta
-        filedata = re.sub("\s\wVA", " A2G", filedata) # GalNAc alpha
-        filedata = re.sub("\s\wVB", " NGA", filedata) # GalNAc beta
         filedata = re.sub("\s\wGA", " GLC", filedata) # Glc alpha
         filedata = re.sub("\s\wGB", " BGC", filedata) # Glc beta
+        filedata = re.sub("\s\wVA", " A2G", filedata) # GalNAc alpha
+        filedata = re.sub("\s\wVB", " NGA", filedata) # GalNAc beta
         filedata = re.sub("\s\wGL", " NGC", filedata) # Neu5Gc alpha
         filedata = re.sub("\s\wLA", " GLA", filedata) # Gal alpha
         filedata = re.sub("\s\wLB", " GAL", filedata) # Gal beta
