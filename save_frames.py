@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Optional
 import logging
 import shutil
+import json
 
 import numpy as np
 from lib import flip, pdb
@@ -50,7 +51,14 @@ def process_molecule(folder_path: Path) -> None:
         pack_dir.mkdir(parents=True, exist_ok=True)
 
         # Determine molecule type and output paths
-        is_alpha = flip.is_alpha(molecule_name)
+        if len(folder_path.name) == 8:
+            json_file = folder_path / f"{folder_path.name}.json"
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+            glycam = data.get("indexOrderedSequence", "output")
+            is_alpha = flip.is_alpha(glycam)
+        else:
+            is_alpha = flip.is_alpha(molecule_name)
         output_pdb = folder_path / "output" / ("beta.pdb" if is_alpha else "alpha.pdb")
         
         # Generate flipped structure

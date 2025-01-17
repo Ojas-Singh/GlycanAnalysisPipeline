@@ -78,18 +78,34 @@ def main():
             
             # Create output directory
             output_dir = Path(config.output_path) / str(ID)
-            if output_dir.exists() and not config.update:
+            
+            glytoucan_exists = False
+            if output_dir.exists():
+                data_json = Path(config.output_path) / str(ID) / "data.json"
+                glytoucan_exists =  json.load(open(data_json)).get("archetype").get("glytoucan") != None
+                logger.info(f"glytoucan_exists: {glytoucan_exists}")
+            if output_dir.exists() and not config.update and glytoucan_exists:
                 logger.info(f"Skipping {glycan} - output exists")
                 continue
                 
             if output_dir.exists() and config.update:
                 shutil.rmtree(output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
+            if output_dir.exists() and not glytoucan_exists:
+                shutil.rmtree(output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
             else:
                 output_dir.mkdir(parents=True, exist_ok=True)
             
+            if len(glycan) == 8:
+                json_file = data_dir / f"{glycan}/{glycan}.json"
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                    glycam = data.get("indexOrderedSequence", "output")
+            else:
+                glycam = glycan
             # Process glycan data
-            glycam_tidy, end_pos, end_link = name.glycam_info(glycan)
+            glycam_tidy, end_pos, end_link = name.glycam_info(glycam)
 
             iupac = name.glycam2iupac(glycam_tidy)
             iupac_alpha = f"{iupac}(a{end_pos}-"

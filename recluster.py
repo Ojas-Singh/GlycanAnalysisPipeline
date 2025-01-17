@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 import logging
 import json
 import shutil
+import os
 
 import pandas as pd
 
@@ -26,6 +27,10 @@ def save_cluster_info(output_path: Path, data: Dict[str, Any]) -> None:
     """Save cluster information to JSON."""
     with open(output_path, "w") as json_file:
         json.dump(data, json_file, indent=4)
+
+def save_mol2_files(directory: Path, mol2_file: Path) -> None:
+    """Save mol2 files to directory."""
+    shutil.copy(mol2_file, directory / f"structure.mol2")
 
 def process_torsions(input_file: Path, clustering_labels: List[int], output_file: Path) -> None:
     """Process and save torsion data."""
@@ -71,7 +76,14 @@ def process_molecule(directory: Path) -> None:
             shutil.copy(directory / f"output/{file}", clusters_dir / f"pack/{file}")
             
         # Determine molecule type and set paths
-        is_alpha = flip.is_alpha(directory.name)
+        if len(directory.name) == 8:
+            json_file = directory / f"{directory.name}.json"
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+            glycam = data.get("indexOrderedSequence", "output")
+            is_alpha = flip.is_alpha(glycam)
+        else:
+            is_alpha = flip.is_alpha(directory.name)
         temp_dir = clusters_dir / ("alpha_temp" if is_alpha else "beta_temp")
         final_dir = clusters_dir / ("alpha" if is_alpha else "beta")
         flip_dir = clusters_dir / ("beta" if is_alpha else "alpha")
@@ -99,6 +111,7 @@ def process_molecule(directory: Path) -> None:
             "flexibility": int(config_vars["flexibility"])
         }
         save_cluster_info(clusters_dir / "pack/info.json", data)
+        save_mol2_files(clusters_dir / "pack", directory / f"{directory.name}.mol2")
 
         # Process torsions
         process_torsions(

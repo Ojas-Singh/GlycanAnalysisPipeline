@@ -1,36 +1,102 @@
 #!/bin/bash
 
-# Define the logfile
-LOGFILE="/mnt/database/test_data/pipeline_output.log"
+# Script configuration
+PIPELINE_DIR="/mnt/database/GlycanAnalysisPipeline"
+CONDA_PATH="/home/ubuntu/miniconda3"
+ENV_NAME="GAP"
+TARGET_DIR="/mnt/database/glycoshape_data/"
 
-# Step 1: Run the move script and log output
-./move.sh >> "$LOGFILE" 2>&1
-export PATH="/home/ubuntu/miniconda3/bin:$PATH"
-source ~/miniconda3/etc/profile.d/conda.sh >> "$LOGFILE" 2>&1
+# Function to log messages with timestamps
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOGFILE"
+}
 
-# Step 2: Navigate to the GlycanAnalysisPipeline directory
-cd ~/GlycanAnalysisPipeline/ || { echo "Failed to navigate to GlycanAnalysisPipeline directory" >> "$LOGFILE"; exit 1; }
+# Function to check if directory exists
+check_dir() {
+    if [ ! -d "$1" ]; then
+        echo "Error: Directory $1 does not exist"
+        exit 1
+    fi
+}
 
-# Activate the GAP conda environment and log output
-conda activate GAP >> "$LOGFILE" 2>&1
+# Function to move processed directories
+move_directories() {
+    local input_dir="$1"
+    log "Moving processed directories to $TARGET_DIR"
+    
+    cd "$input_dir" || {
+        log "Failed to change to input directory"
+        return 1
+    }
+    
+    for dir in */; do
+        dir_name="${dir%/}"
+        if [ -d "$TARGET_DIR$dir_name" ]; then
+            log "Directory '$dir_name' already exists in target location. Skipping."
+        else
+            mv "$dir" "$TARGET_DIR"
+            log "Moved directory '$dir_name' to '$TARGET_DIR'"
+        fi
+    done
+}
 
-# Run the Python scripts in sequence and log output
-python main.py >> "$LOGFILE" 2>&1
-python recluster.py >> "$LOGFILE" 2>&1
-python plot_dist.py >> "$LOGFILE" 2>&1
-python save_frames.py >> "$LOGFILE" 2>&1
+# Show usage if no arguments provided
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <input_directory>"
+    echo "Example: $0 /path/to/input/data"
+    exit 1
+fi
 
-# Step 3: Navigate to the DB_scripts directory
-cd /mnt/database/DB_scripts/ || { echo "Failed to navigate to DB_scripts directory" >> "$LOGFILE"; exit 1; }
+# Setup variables
+INPUT_DIR="$1"
+LOGFILE="${INPUT_DIR}/pipeline_output.log"
 
-# Deactivate GAP environment
-conda deactivate >> "$LOGFILE" 2>&1
+# Validate directories
+check_dir "$INPUT_DIR"
+check_dir "$PIPELINE_DIR"
+check_dir "$TARGET_DIR"
 
-# Activate the GS3D conda environment and log output
-conda activate GS3D >> "$LOGFILE" 2>&1
+# Initialize log file
+> "$LOGFILE"
+log "Starting GlycanAnalysis Pipeline"
+log "Input directory: $INPUT_DIR"
 
-# Run the GlycoShape_DB_beta.py script and log output
-python GlycoShape_DB_beta.py >> "$LOGFILE" 2>&1
-python iupac_glytoucan.py >> "$LOGFILE" 2>&1
+# Setup conda environment
+log "Setting up conda environment"
+export PATH="${CONDA_PATH}/bin:$PATH"
+source "${CONDA_PATH}/etc/profile.d/conda.sh" >> "$LOGFILE" 2>&1
+conda activate $ENV_NAME >> "$LOGFILE" 2>&1
 
+# Navigate to pipeline directory
+log "Changing to pipeline directory"
+cd "$PIPELINE_DIR" || {
+    log "Failed to navigate to pipeline directory"
+    exit 1
+}
 
+# Run pipeline scripts
+log "Running analysis pipeline"
+
+# Analysis phase
+log "Phase 1: Initial Analysis"
+python main.py "$INPUT_DIR" >> "$LOGFILE" 2>&1
+python recluster.py "$INPUT_DIR" >> "$LOGFILE" 2>&1
+python plot_dist.py "$INPUT_DIR" >> "$LOGFILE" 2>&1
+python save_frames.py "$INPUT_DIR" >> "$LOGFILE" 2>&1
+
+# Database phase
+log "Phase 2: Database Processing"
+python GlycoShape_DB_static.py "$INPUT_DIR" >> "$LOGFILE" 2>&1
+python GlycoShape_DB_bake.py "$INPUT_DIR" >> "$LOGFILE" 2>&1
+
+# Move processed directories
+log "Phase 3: Moving Results"
+move_directories "$INPUT_DIR"
+
+# Check for any errors in log
+if grep -q "Error\|Exception\|failed" "$LOGFILE"; then
+    log "WARNING: Errors detected in pipeline execution"
+    exit 1
+else
+    log "Pipeline executed successfully"
+fi
