@@ -18,3 +18,4 @@ dummy_data_dir/*
 dummy_database/*
 Duplicate_Entries.txt
 backup/*
+logs

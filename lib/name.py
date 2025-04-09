@@ -697,43 +697,57 @@ def get_wurcs_variants(input_wurcs: str):
     beta_wurcs = f'WURCS=2.0/{S},{D},{B}/{beta_residues_str}/{linkage}/{annotation}'
 
 
-    return validate_wurcs(archetype_wurcs), validate_wurcs(alpha_wurcs), validate_wurcs(beta_wurcs)
+    return normalize_wurcs(archetype_wurcs), normalize_wurcs(alpha_wurcs), normalize_wurcs(beta_wurcs)
 
 def validate_wurcs(wurcs):
     """
-    Validates WURCS string using GlyCosmos API.
-    Returns the WURCS string if valid, None if invalid.
+    Validates a WURCS string using the GlyCosmos API.
+    Returns the standardized WURCS string if valid, the original WURCS string if a server error (HTTP 500) occurs,
+    or None if validation errors are found.
 
     Args:
         wurcs (str): WURCS format string to validate
 
     Returns:
-        str: Original WURCS string if valid, None if invalid 
+        str or None: Validated WURCS string, original string on server error, or None if invalid.
     """
     url = "https://api.glycosmos.org/wurcsframework/1.3.1/wurcsvalidator"
     
     try:
-        # Make POST request with WURCS string
         response = requests.post(url, json=[wurcs])
+        if response.status_code == 500:
+            logger.warning("Server error during WURCS validation (status 500), returning original WURCS.")
+            return wurcs
         response.raise_for_status()
         
-        # Parse response
         data = response.json()
-        
-        # Check if response contains validation data
-        if data and isinstance(data, list) and len(data) > 0:
-            # Get error reports
-            error_reports = data[0].get("m_mapTypeToReports", {}).get("ERROR", [])
+        if isinstance(data, list) and len(data) > 0:
+            validation_result = data[0]
+            error_reports = validation_result.get("m_mapTypeToReports", {}).get("ERROR", [])
             
-            # If no errors, return original WURCS
+            # If no errors, return the standardized WURCS string if available; otherwise, return the original.
             if not error_reports:
-                return wurcs
-                
+                return validation_result.get("m_sStandardString", wurcs)
+        
         return None
         
     except Exception as e:
         logger.error(f"Failed to validate WURCS: {str(e)}")
         return None
+
+def normalize_wurcs(wurcs):
+    url = "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs"
+    try:
+        response = requests.post(url, json=[wurcs])
+        response.raise_for_status()
+        data = response.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            # Return the normalized WURCS string from the response.
+            return data[0].get("WURCS")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to normalize WURCS: {str(e)}")
+        return None  
     
 def wurcs2glytoucan(wurcs):
     """Convert WURCS to GlyTouCan ID using GlyCosmos API.
@@ -755,6 +769,7 @@ def wurcs2glytoucan(wurcs):
         
         # Parse response
         data = response.json()
+        print(data)
         if data and isinstance(data, list) and len(data) > 0:
             return data[0].get("id")
             

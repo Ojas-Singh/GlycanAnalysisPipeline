@@ -208,7 +208,7 @@ def convert_pdbs(ID):
             with open(pdb, 'r') as file:
                 filedata = file.read()
             filedata = filedata.replace("ATOM  ", "HETATM")
-            with open(f"GLYCAM_format_HETATM/{pdb.split('.')[0]}.pdb", 'w') as file:
+            with open(f"GLYCAM_format_HETATM/{pdb.split('.')[0]}.GLYCAM.pdb", 'w') as file:
                 file.write(filedata)
         except OSError:
             print(OSError)
@@ -292,7 +292,7 @@ def convert_pdbs(ID):
         # Tidied GLYCAM name..
         with open(pdb, 'r') as file:
             filedata = file.read()
-        with open(f"GLYCAM_format_ATOM/{pdb.split('.')[0]}.pdb", 'w') as file:
+        with open(f"GLYCAM_format_ATOM/{pdb.split('.')[0]}.GLYCAM.pdb", 'w') as file:
             file.write(filedata)
 
         # Tidied PDB name..
