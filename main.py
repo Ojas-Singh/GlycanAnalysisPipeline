@@ -46,12 +46,12 @@ def main():
     """Main function to run the entire pipeline."""
     # List of modules to run in order
     modules = [
-        # "cluster_first",
-        # "recluster",
+        "cluster_first",
+        "recluster",
         "plot_dist",
-        # "GlycoShape_DB_static",
-        # "GlycoShape_DB_bake",
-        # "json2rdf",
+        "GlycoShape_DB_static",
+        "GlycoShape_DB_bake",
+        "json2rdf",
     ]
     
     # Run each module in sequence
