@@ -46,29 +46,48 @@ def plot_distribution(input_csv: Path, output_filepath: Path, popp_list: List[in
         
         line_positions, legend_elements, line_colors, torsions = create_plot_elements(data, popp_list)
         
+        num_torsions = len(torsions)
+        # Adjust height based on the number of torsion angles
+        # Increase height for fewer rows, with a minimum height of 1
+        facet_height = max(1, 3 - num_torsions * 0.25) 
+        
+        # Adjust aspect ratio for fewer rows to make the plot less wide
+        if num_torsions <= 5:
+            facet_aspect = 10 # Lower aspect ratio for 1-3 rows
+        else:
+            facet_aspect = 20 # Default aspect ratio
+
         def label(x, color, label):
             ax = plt.gca()
             ax.text(0, .06, label, fontweight="bold", fontsize=32, color=color,
                    ha="left", va="center", transform=ax.transAxes)
 
         def add_colored_lines(x, label, **kwargs):
-            for pos, col in zip(line_positions[label], line_colors):
-                plt.axvline(pos, color=col, linestyle="-", linewidth=4, ymax=0.25)
+            # Ensure line_positions[label] has enough values for line_colors
+            positions = line_positions.get(label, [])
+            for i, pos in enumerate(positions):
+                if i < len(line_colors): # Avoid index error if more positions than colors
+                    plt.axvline(pos, color=line_colors[i], linestyle="-", linewidth=4, ymax=0.25)
 
         df = pd.concat([
             pd.DataFrame({'Value': data[i], 'Dataset': i}) for i in torsions
         ])
         
         g = sns.FacetGrid(df, row="Dataset", hue="Dataset", 
-                         aspect=20, height=1, 
+                         aspect=facet_aspect, height=facet_height, # Use calculated aspect and height
                          palette=sns.cubehelix_palette(len(torsions), rot=-.25, light=.7),
                          xlim=(-240, 200))
         
-        g.map(add_colored_lines, "Value")
+        # Pass only "Value" to map. 'label' will be passed as a keyword argument 
+        # by FacetGrid based on the 'row' mapping.
+        g.map(add_colored_lines, "Value") 
         g.map_dataframe(sns.kdeplot, "Value", bw_adjust=1, clip_on=False,
                        fill=True, alpha=1, linewidth=4, multiple='stack')
         g.refline(y=0, linewidth=4, linestyle="-", color=None, clip_on=False)
-        g.map(label, "Value")
+        
+        # The 'label' function expects 'label' as the third argument, 
+        # which FacetGrid provides as a keyword argument based on 'row'.
+        g.map(label, "Value") 
         
         g.figure.subplots_adjust(hspace=-.75)
         g.set_titles("")
@@ -81,7 +100,7 @@ def plot_distribution(input_csv: Path, output_filepath: Path, popp_list: List[in
         g.despine(bottom=True, left=True)
         
         plt.savefig(output_filepath, transparent=True, dpi=450)
-        plt.close(g)
+        plt.close(g.figure) # Pass the figure associated with the FacetGrid
         logger.info(f"Plot saved to {output_filepath}")
         
     except Exception as e:

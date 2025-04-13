@@ -82,24 +82,43 @@ def main():
             # Create output directory
             output_dir = Path(config.output_path) / str(ID)
             
-            glytoucan_exists = False
+            # Determine if processing is needed
+            process_glycan = True # Assume processing is needed by default
             if output_dir.exists():
-                data_json = Path(config.output_path) / str(ID) / "data.json"
-                glytoucan_exists =  json.load(open(data_json)).get("archetype").get("glytoucan") != None
-                logger.info(f"glytoucan_exists: {glytoucan_exists}")
-            if output_dir.exists() and not config.update and glytoucan_exists:
-                logger.info(f"Skipping {glycan} - output exists")
-                continue
-                
-            if output_dir.exists() and config.update:
-                shutil.rmtree(output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
-            if output_dir.exists() and not glytoucan_exists:
-                shutil.rmtree(output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
+                if not config.update:
+                    data_json_path = output_dir / "data.json"
+                    if data_json_path.is_file():
+                        try:
+                            with open(data_json_path, 'r') as f:
+                                existing_data = json.load(f)
+                            # Check if archetype.glytoucan exists and is not None
+                            if existing_data.get("archetype", {}).get("glytoucan") is not None:
+                                logger.info(f"Skipping {glycan} - output exists and GlyTouCan is present.")
+                                process_glycan = False
+                            else:
+                                logger.info(f"Processing {glycan} - output exists but GlyTouCan is missing.")
+                        except (json.JSONDecodeError, KeyError) as e:
+                            logger.warning(f"Error reading existing data.json for {ID}, reprocessing: {e}")
+                            process_glycan = True # Reprocess if file is corrupted or structure is wrong
+                    else:
+                         logger.info(f"Processing {glycan} - output directory exists but data.json is missing.")
+                         process_glycan = True # Reprocess if data.json is missing
+                else:
+                    logger.info(f"Processing {glycan} - update flag is set.")
+                    process_glycan = True # Reprocess if update flag is True
             else:
-                output_dir.mkdir(parents=True, exist_ok=True)
+                 logger.info(f"Processing {glycan} - output directory does not exist.")
+                 process_glycan = True # Process if output directory doesn't exist
+
+            if not process_glycan:
+                continue # Skip to the next glycan
+
+            # Clean up existing directory if needed before processing
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
             
+            # --- Start of Glycan Processing Logic ---
             if len(glycan) == 8:
                 json_file = data_dir / f"{glycan}/{glycan}.json"
                 with open(json_file, 'r') as f:
@@ -107,6 +126,7 @@ def main():
                     glycam = data.get("indexOrderedSequence", "output")
             else:
                 glycam = glycan
+
             # Process glycan data
             glycam_tidy, end_pos, end_link = name.glycam_info(glycam)
 
@@ -122,9 +142,6 @@ def main():
                 logger.warning(f"Could not retrieve properties for {iupac}: {e}")
                 mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
 
-            
-
-           
             try:
                 Composition = ast.literal_eval(Composition)
             except Exception:

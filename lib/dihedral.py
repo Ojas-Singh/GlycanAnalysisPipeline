@@ -1,5 +1,4 @@
 import numpy as np
-from numba import njit
 import pandas as pd
 import scipy.stats as st
 import matplotlib.pyplot as plt
@@ -7,13 +6,11 @@ import pdb
 
 
 
-@njit(fastmath=True)
 def fastest_angle(p0,p1,p2):
     cosine_angle = np.dot(np.subtract(p0,p1),np.subtract(p2,p1)) / (np.linalg.norm(np.subtract(p0,p1)) * np.linalg.norm(np.subtract(p2,p1)))
     angle = np.arccos(cosine_angle)
     return np.degrees(angle)
 
-@njit(fastmath=True)
 def fastest_dihedral(p0,p1,p2,p3):
     b1 = p2 - p1
     b0, b1, b2 = -(p1 - p0), b1 / np.sqrt((b1 * b1).sum()), p3 - p2
