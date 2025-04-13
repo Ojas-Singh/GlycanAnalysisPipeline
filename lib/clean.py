@@ -1,6 +1,6 @@
 import os
 import shutil
-import config
+import lib.config as config
 
 def delete_output_folders(directory):
     for root, dirs, files in os.walk(directory):

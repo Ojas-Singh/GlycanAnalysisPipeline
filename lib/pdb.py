@@ -5,7 +5,7 @@ import os
 import shutil
 import re
 import glob
-import config
+import lib.config as config
 
 def to_DF(pdbddata):
     df = pd.DataFrame(data=pdbddata)

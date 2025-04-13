@@ -1,4 +1,4 @@
-import config
+import lib.config as config
 from pathlib import Path
 import shutil
 import logging
@@ -184,7 +184,6 @@ def wurcs_registration(dir: Path, file: str = "GLYCOSHAPE.json", output_file: st
     # Iterate through the data to extract relevant information
     for key, type in data.items():
         glycan  = type.get("archetype", {})
-        print(glycan.get("wurcs"))
         wurcs_values = {
             "wurcs": glycan.get("wurcs")
         }
@@ -198,13 +197,14 @@ def wurcs_registration(dir: Path, file: str = "GLYCOSHAPE.json", output_file: st
             
             if wurcs_value and not glytoucan_values.get(glytoucan_key):
                 output_lines.append(f"{wurcs_value}")
+                print(f"Needs to be registered {wurcs_value}")
 
     # Write the output to a text file
     output_file_path = dir / output_file
     with open(output_file_path, 'w') as output_file:
         output_file.write("\n".join(output_lines))
 
-    output_file_path
+
 
 def submit_wurcs(contributor_id: str, api_key: str, file_path: Path) -> None:
     """Submit WURCS data to GlyTouCan API.
@@ -260,7 +260,7 @@ def total_simulation_length(file_path: Path) -> float:
         logger.error(f"Failed to sum lengths in JSON: {str(e)}")
         raise
 
-if __name__ == "__main__":
+def main():
     save_faq_json(
         dir=config.output_path,
         faq_data=faq_dict,
@@ -279,3 +279,6 @@ if __name__ == "__main__":
     # submit_wurcs(
     #     contributor_id=config.contributor_id,
     #     api_key=config.api_key, file_path=config.output_path / "missing_glytoucan.txt")
+
+if __name__ == "__main__":
+    main()

@@ -14,7 +14,7 @@ from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 
 from lib import graph
-import config
+import lib.config as config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

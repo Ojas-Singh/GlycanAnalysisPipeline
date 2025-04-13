@@ -9,7 +9,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-import config
+import lib.config as config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

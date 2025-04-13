@@ -8,13 +8,16 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 import logging
-import config
+import lib.config as config
 from lib import name, pdb
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+# Suppress only the specific InsecureRequestWarning
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 # Function for replacing "_" with " " in evaluated strings
 def remove_underscores_eval(input):
@@ -321,7 +324,7 @@ def main():
             
             
             pdb.convert_pdbs(ID)
-            shutil.copytree(Path(config.input_path) / f"{glycan}/clusters/pack", Path(config.output_path) / f"{ID}/output", dirs_exist_ok=True)
+            shutil.copytree(Path(config.data_dir) / f"{glycan}/clusters/pack", Path(config.output_path) / f"{ID}/output", dirs_exist_ok=True)
 
             
         except Exception as e:

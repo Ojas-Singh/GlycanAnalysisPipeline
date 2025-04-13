@@ -16,7 +16,7 @@ from glycowork.motif.annotate import get_molecular_properties
 from glycowork.motif.processing import IUPAC_to_SMILES
 from glycowork.motif.annotate import get_terminal_structures
 
-import config
+import lib.config as config
 import logging
 import subprocess
 
@@ -402,7 +402,7 @@ def get_clusters_alpha(glycan: str, ID: str) -> dict:
     
     try:
         # Setup paths
-        cluster_path = Path(config.input_path) / glycan / "clusters" / conf
+        cluster_path = Path(config.data_dir) / glycan / "clusters" / conf
         output_path = Path(config.output_path) / str(ID)
         
         # Create output directory if it doesn't exist
@@ -465,7 +465,7 @@ def get_clusters_beta(glycan: str, ID: str) -> dict:
     
     try:
         # Setup paths
-        cluster_path = Path(config.input_path) / glycan / "clusters" / conf
+        cluster_path = Path(config.data_dir) / glycan / "clusters" / conf
         output_path = Path(config.output_path) / str(ID)
         
         # Create output directory if it doesn't exist
@@ -769,7 +769,6 @@ def wurcs2glytoucan(wurcs):
         
         # Parse response
         data = response.json()
-        print(data)
         if data and isinstance(data, list) and len(data) > 0:
             return data[0].get("id")
             

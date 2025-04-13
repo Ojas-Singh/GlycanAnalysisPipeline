@@ -15,4 +15,5 @@ glycowork[draw]
 glycowork[chem]
 glypy
 rdkit
+rdflib
 xxhash

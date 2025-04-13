@@ -6,7 +6,7 @@ from datetime import datetime
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 import xxhash  # Faster hashing algorithm
-import config
+import lib.config as config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ def create_incremental_backup(input_dir: Path, backup_dir: Path, dir_type: str) 
 def backup_all_directories():
     """Backup both input and output directories."""
     for dir_type, dir_path in [
-        ("input", config.input_path),
+        ("input", config.data_dir),
         ("output", config.output_path)
     ]:
         try:

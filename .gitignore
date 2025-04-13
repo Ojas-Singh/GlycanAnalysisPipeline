@@ -19,3 +19,4 @@ dummy_database/*
 Duplicate_Entries.txt
 backup/*
 logs
+GlycoShape_Inventory.csv

@@ -8,7 +8,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 
 from lib import pdb, graph, dihedral
-import config
+import lib.config as config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
