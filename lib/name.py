@@ -59,7 +59,7 @@ def glycam2iupac(glycam):
         "Gal": "D", "GalA": "D", "GalN": "D", "GalNAc": "D", "Glc": "D",
         "GlcA": "D", "GlcN": "D", "GlcNAc": "D", "Gul": "D", "GulA": "D",
         "GulN": "D", "GulNAc": "D", "Ido": "L", "IdoA": "L", "IdoN": "L",
-        "IdoNAc": "L", "KDN": "D", "KDO": "D", "Leg": "D", "LDmanHep": "L",
+        "IdoNAc": "L", "Kdn": "D", "Kdo": "D", "Leg": "D", "LDmanHep": "L",
         "Lyx": "D", "Man": "D", "ManA": "D", "ManN": "D", "ManNAc": "D",
         "Mur": "D", "MurNAc": "D", "MurNGc": "D", "Neu": "D", "Neu5Ac": "D",
         "Neu5Gc": "D", "Oli": "D", "Par": "D", "Pse": "L", "Psi": "D",
@@ -120,8 +120,10 @@ def glycam2iupac(glycam):
             mod_component = mod_component.replace("[4A]", "4Ac")
             mod_component = mod_component.replace("[9A]", "9Ac")
             mod_component = mod_component.replace("[6PC]", "6Pc")
-            mod_component = mod_component.replace("KDN", "Kdn")
-            mod_component = mod_component.replace("KDO", "Kdo")
+            mod_component = mod_component.replace("DKDN", "Kdn")
+            mod_component = mod_component.replace("DKDO", "Kdo")
+            mod_component = mod_component.replace("LKDN", "LKdn")
+            mod_component = mod_component.replace("LKDO", "LKdo")
             
             mod_component_list.append(mod_component)
         
