@@ -205,12 +205,22 @@ def main():
 
             # if wurcs is None get it from Mol2WURCS using smiles
             if wurcs == None:
-                print("WURCS is None, will try to get it from Mol2WURCS")
-                wurcs = name.smiles2wurcs(smiles)
-                wurcs, wurcs_alpha, wurcs_beta = name.get_wurcs_variants(wurcs)
-                glytoucan = name.wurcs2glytoucan(wurcs)
-                glytoucan_alpha = name.wurcs2glytoucan(wurcs_alpha)
-                glytoucan_beta = name.wurcs2glytoucan(wurcs_beta)
+                try:
+                    print("WURCS is None, will try to get it from Mol2WURCS")
+                    wurcs = name.smiles2wurcs(smiles)
+                    wurcs, wurcs_alpha, wurcs_beta = name.get_wurcs_variants(wurcs)
+                    glytoucan = name.wurcs2glytoucan(wurcs)
+                    glytoucan_alpha = name.wurcs2glytoucan(wurcs_alpha)
+                    glytoucan_beta = name.wurcs2glytoucan(wurcs_beta)
+                except Exception as e:
+                    logger.warning(f"Could not retrieve WURCS from Mol2WURCS for {iupac}: {e}")
+                    wurcs = None
+                    wurcs_alpha = None
+                    wurcs_beta = None
+                    glytoucan = None
+                    glytoucan_alpha = None
+                    glytoucan_beta = None
+
 
             try: 
                 if glytoucan != None:
@@ -220,7 +230,6 @@ def main():
             except Exception as e:
                 logger.warning(f"Could not retrieve motifs for {iupac}: {e}")
                 motifs = None
-
             glycan_data = {
                 "archetype" :{
 
