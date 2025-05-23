@@ -9,7 +9,7 @@ from rdkit.Chem import Descriptors
 
 import logging
 import lib.config as config
-from lib import name, pdb
+from lib import name, pdb, tfindr
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -348,8 +348,8 @@ def main():
             save_glycan_data(name.glytoucan2glycosmos(glytoucan), ID, "glycosmos")
 
             
-            
-            pdb.convert_pdbs(ID)
+            bonded_atoms = tfindr.parse_mol2_bonds(Path(config.data_dir) / f"{glycan}/clusters/pack" / f"structure.mol2")
+            pdb.convert_pdbs(ID, bonded_atoms)
             shutil.copytree(Path(config.data_dir) / f"{glycan}/clusters/pack", Path(config.output_path) / f"{ID}/output", dirs_exist_ok=True)
 
             

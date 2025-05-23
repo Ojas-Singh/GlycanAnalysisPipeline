@@ -5,7 +5,9 @@ import os
 import shutil
 import re
 import glob
+from collections import defaultdict
 import lib.config as config
+
 
 def to_DF(pdbddata):
     df = pd.DataFrame(data=pdbddata)
@@ -172,11 +174,13 @@ def pdb_remark_adder(filename):
         f.write("REMARK   Nat Methods 21, 2117–2127 (2024).  https://doi.org/10.1038/s41592-024-02464-7 \n")
         f.write("REMARK   Callum M. Ives* and Ojas Singh*, Silvia D’Andrea, Carl A. Fogarty, \n")
         f.write("REMARK   Aoife M. Harbison, Akash Satheesan, Beatrice Tropea, Elisa Fadda\n")
+        f.write("REMARK   Data available under CC BY-NC-ND 4.0 for academic use only.\n")
+        f.write("REMARK   Contact elisa.fadda@soton.ac.uk for commercial licence.\n")
         f.write(content)
 
 
 
-def convert_pdbs(ID):
+def convert_pdbs(ID, bonded_atoms):
     """
     Converts the PDB files in the output directory to the following formats:
     - GLYCAM format (ATOM and HETATM)
@@ -202,6 +206,8 @@ def convert_pdbs(ID):
 
     pdb_files = glob.glob("*pdb")
     for pdb in pdb_files:
+
+        add_conect_cards(pdb, bonded_atoms)  
 
         # Tidied GLYCAM name..
         try:
@@ -370,3 +376,42 @@ def convert_pdbs(ID):
 
         os.remove(pdb)
         
+def add_conect_cards(pdb_file, bonded_atoms):
+    """
+    Adds CONECT records to a PDB file according to bonded_atoms.
+    - pdb_file: path to the pdb file to update (in-place)
+    - bonded_atoms: list of tuples/lists, each with atom indices (1-based) that are bonded, e.g. [(1,2), (2,3,4)]
+    """
+    with open(pdb_file, 'r') as f:
+        lines = f.readlines()
+
+    # Find where to insert CONECT cards (before END/ENDMDL if present)
+    insert_idx = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith('END') or line.startswith('ENDMDL'):
+            insert_idx = i
+            break
+
+    # Build CONECT lines, avoid duplicates
+    conect_set = set()
+    for bond in bonded_atoms:
+        for i, atom1 in enumerate(bond):
+            for atom2 in bond[i+1:]:
+                key = tuple(sorted((atom1, atom2)))
+                if key not in conect_set:
+                    conect_set.add(key)
+
+    conect_lines = []
+    atom_bonds = defaultdict(list)
+    for a1, a2 in conect_set:
+        atom_bonds[a1].append(a2)
+        atom_bonds[a2].append(a1)
+    for atom, bonded in sorted(atom_bonds.items()):
+        line = f"CONECT{atom:5d}" + ''.join(f"{b:5d}" for b in bonded)
+        conect_lines.append(line + '\n')
+
+    # Insert CONECT lines
+    new_lines = lines[:insert_idx] + conect_lines + lines[insert_idx:]
+
+    with open(pdb_file, 'w') as f:
+        f.writelines(new_lines)
