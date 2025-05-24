@@ -375,6 +375,82 @@ def convert_pdbs(ID, bonded_atoms):
 
 
         os.remove(pdb)
+
+        # Convert PDB files to CIF format
+        convert_to_cif_format(pdb.split('.')[0])
+
+def convert_to_cif_format(base_filename):
+    """
+    Converts PDB files to CIF format for all format directories.
+    """
+    format_dirs = [
+        "GLYCAM_format_ATOM", "PDB_format_ATOM", "CHARMM_format_ATOM",
+        "GLYCAM_format_HETATM", "PDB_format_HETATM", "CHARMM_format_HETATM"
+    ]
+    
+    for format_dir in format_dirs:
+        # Find the PDB file in this directory
+        pdb_files = glob.glob(f"{format_dir}/{base_filename}.*")
+        for pdb_file in pdb_files:
+            if pdb_file.endswith('.pdb'):
+                # Create CIF filename
+                cif_file = pdb_file.replace('.pdb', '.cif')
+                
+                # Convert PDB to CIF
+                try:
+                    pdb_to_cif(pdb_file, cif_file)
+                except Exception as e:
+                    print(f"Error converting {pdb_file} to CIF: {e}")
+
+def pdb_to_cif(pdb_file, cif_file):
+    """
+    Simple PDB to CIF conversion with REMARK preservation.
+    """
+    with open(pdb_file, 'r') as f:
+        lines = f.readlines()
+    
+    with open(cif_file, 'w') as f:
+        # Write CIF header
+        f.write("data_structure\n")
+        f.write("_entry.id structure\n\n")
+        
+        # Write remarks as comments
+        remark_lines = [line for line in lines if line.startswith('REMARK')]
+        if remark_lines:
+            for remark in remark_lines:
+                # Convert REMARK to comment, preserving spaces (for ASCII artwork)
+                comment_text = remark[6:] if len(remark) > 6 else ""
+                f.write(f"# {comment_text}")
+            f.write("\n")
+        
+        # Write atom_site loop
+        f.write("loop_\n")
+        f.write("_atom_site.group_PDB\n")
+        f.write("_atom_site.id\n")
+        f.write("_atom_site.type_symbol\n")
+        f.write("_atom_site.label_atom_id\n")
+        f.write("_atom_site.label_comp_id\n")
+        f.write("_atom_site.label_asym_id\n")
+        f.write("_atom_site.label_seq_id\n")
+        f.write("_atom_site.Cartn_x\n")
+        f.write("_atom_site.Cartn_y\n")
+        f.write("_atom_site.Cartn_z\n")
+        
+        # Convert ATOM/HETATM lines
+        for line in lines:
+            if line.startswith(('ATOM', 'HETATM')):
+                record_type = line[0:6].strip()
+                atom_id = line[6:11].strip()
+                atom_name = line[12:16].strip()
+                res_name = line[17:20].strip()
+                chain_id = line[21:22].strip() or 'A'
+                res_id = line[22:26].strip()
+                x = line[30:38].strip()
+                y = line[38:46].strip()
+                z = line[46:54].strip()
+                element = line[76:78].strip() if len(line) > 76 else atom_name[0]
+                
+                f.write(f"{record_type} {atom_id} {element} {atom_name} {res_name} {chain_id} {res_id} {x} {y} {z}\n")
         
 def add_conect_cards(pdb_file, bonded_atoms):
     """

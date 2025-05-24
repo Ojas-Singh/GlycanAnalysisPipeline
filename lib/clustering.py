@@ -33,10 +33,21 @@ def pcawithG(frames: np.ndarray, idx_noH: List[int], dim: int, name: str) -> Tup
     """
     logger.info(f"Starting PCA analysis for {name}")
     try:
+        # Filter non-hydrogen atoms
+        idx_noH_array = np.asarray(idx_noH, dtype=int)
+        
+        # Sample atoms if more than 300
+        if len(idx_noH_array) > 200:
+            logger.warning(f"Large system detected ({len(idx_noH_array)} atoms). Randomly sampling 200 atoms.")
+            np.random.seed(42)  # For reproducibility
+            sampled_indices = np.random.choice(idx_noH_array, size=200, replace=False)
+            idx_noH_array = sampled_indices
+            logger.info(f"Sampled {len(idx_noH_array)} atoms for PCA")
+        
         # Calculate distance matrix
-        G = np.zeros((len(frames), int(len(frames[0][np.asarray(idx_noH,dtype=int)])*(len(frames[0][np.asarray(idx_noH,dtype=int)])-1)/2)))
+        G = np.zeros((len(frames), int(len(idx_noH_array)*(len(idx_noH_array)-1)/2)))
         for i in range(len(frames)):
-            G[i] = graph.G_flatten(frames[i][np.asarray(idx_noH,dtype=int)])
+            G[i] = graph.G_flatten(frames[i][idx_noH_array])
 
         # Perform PCA
         pca = PCA(n_components=dim)
