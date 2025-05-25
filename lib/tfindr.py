@@ -14,18 +14,44 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
-    """Parse bond information from MOL2 file.
+    """Parse bond information from MOL2 file and ensure graph connectivity.
     
     Args:
         file_path: Path to MOL2 file
         
     Returns:
-        List of tuples containing bonded atom pairs
+        List of tuples containing bonded atom pairs with missing connections added
     """
     try:
         with open(file_path, 'r') as file:
             lines = file.readlines()
 
+        # Parse atom coordinates
+        atom_start = -1
+        atom_end = -1
+        for i, line in enumerate(lines):
+            if line.strip() == "@<TRIPOS>ATOM":
+                atom_start = i + 1
+            elif atom_start != -1 and line.strip().startswith("@<TRIPOS>"):
+                atom_end = i
+                break
+
+        atom_coords = {}
+        if atom_start != -1:
+            if atom_end == -1:
+                atom_end = len(lines)
+            
+            for line in lines[atom_start:atom_end]:
+                try:
+                    parts = line.strip().split()
+                    if len(parts) >= 4:
+                        atom_id = int(parts[0])
+                        x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+                        atom_coords[atom_id] = (x, y, z)
+                except (ValueError, IndexError):
+                    continue
+
+        # Parse bonds
         bond_start = -1
         bond_end = -1
         for i, line in enumerate(lines):
@@ -46,9 +72,53 @@ def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
             try:
                 _, atom1, atom2, _ = line.strip().split()
                 bonded_atoms.append((int(atom1), int(atom2)))
+                
             except ValueError:
                 logger.warning(f"Skipping invalid bond line: {line.strip()}")
                 continue
+        
+        # Check connectivity and add missing bonds if needed
+        G = nx.Graph()
+        G.add_edges_from(bonded_atoms)
+        
+        # Find all connected components
+        components = list(nx.connected_components(G))
+        
+        if len(components) > 1:
+            logger.warning(f"Graph not fully connected. Found {len(components)} components. Adding missing bonds.")
+            
+            # Connect components by adding bonds between closest atoms by coordinate distance
+            while len(components) > 1:
+                min_distance = float('inf')
+                best_connection = None
+                
+                for i in range(len(components)):
+                    for j in range(i + 1, len(components)):
+                        comp1_nodes = list(components[i])
+                        comp2_nodes = list(components[j])
+                        
+                        # Find closest atoms between components by 3D distance
+                        for node1 in comp1_nodes:
+                            for node2 in comp2_nodes:
+                                if node1 in atom_coords and node2 in atom_coords:
+                                    coord1 = atom_coords[node1]
+                                    coord2 = atom_coords[node2]
+                                    distance = np.sqrt(sum((c1 - c2)**2 for c1, c2 in zip(coord1, coord2)))
+                                    if distance < min_distance:
+                                        min_distance = distance
+                                        best_connection = (node1, node2)
+                
+                if best_connection:
+                    node1, node2 = best_connection
+                    bonded_atoms.append((node1, node2))
+                    logger.info(f"Added missing bond: {node1} - {node2} (distance: {min_distance:.3f})")
+                    
+                    # Update the graph with the new bond and recalculate components
+                    G.add_edge(node1, node2)
+                    components = list(nx.connected_components(G))
+                else:
+                    logger.warning("Could not find atoms with coordinates to connect components")
+                    break
 
         return bonded_atoms
     except Exception as e:
