@@ -9,7 +9,7 @@ bio==1.7.1
 tqdm==4.67.1
 pyarrow==19.0.1
 seaborn==0.13.2
-glycowork==1.5.0
+glycowork==1.6.0
 glycowork[draw]
 glycowork[chem]
 glypy==1.0.14

@@ -7,6 +7,8 @@ from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
+from glycowork.motif.processing import canonicalize_iupac
+
 import logging
 import lib.config as config
 from lib import name, pdb, tfindr
@@ -129,13 +131,15 @@ def main():
 
             # Process glycan data
             glycam_tidy, end_pos, end_link = name.glycam_info(glycam)
-
-            iupac = name.glycam2iupac(glycam_tidy)
+            
+            # iupac = name.glycam2iupac(glycam_tidy)
+            iupac = canonicalize_iupac(glycam)
+            
             iupac_alpha = f"{iupac}(a{end_pos}-"
             iupac_beta = f"{iupac}(b{end_pos}-"
             glycam_alpha = f"{glycam_tidy}a{end_pos}-OH"
             glycam_beta = f"{glycam_tidy}b{end_pos}-OH"
-            
+            logger.info(f"Processing glycan: {glycan}, IUPAC: {iupac}, GlyCAM: {glycam}")
             try:
                 mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name.iupac2properties(iupac)
             except Exception as e:
@@ -264,6 +268,7 @@ def main():
                 "temperature": temp,
                 "pressure": pressure,
                 "salt": salt,
+
             },
 
             "alpha":{
@@ -338,6 +343,12 @@ def main():
                 "temperature": temp,
                 "pressure": pressure,
                 "salt": salt,
+            },
+
+            "search_meta" : {
+                "common_names" : [],
+                "discription" : "",
+                "keywords" : [],
             }
             
             }
