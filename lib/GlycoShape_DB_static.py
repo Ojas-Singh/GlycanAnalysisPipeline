@@ -99,6 +99,9 @@ def main():
                                 process_glycan = False
                             else:
                                 logger.info(f"Processing {glycan} - output exists but GlyTouCan is missing.")
+                            if existing_data.get("search_meta", {}).get("common_names"):
+                                logger.info(f"Skipping {glycan} - output exists and search_meta ID is present.")
+                                process_glycan = False
                         except (json.JSONDecodeError, KeyError) as e:
                             logger.warning(f"Error reading existing data.json for {ID}, reprocessing: {e}")
                             process_glycan = True # Reprocess if file is corrupted or structure is wrong
