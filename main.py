@@ -50,6 +50,7 @@ def main():
         "recluster",
         "plot_dist",
         "GlycoShape_DB_static",
+        "GlycoShape_DB_search_meta",
         "GlycoShape_DB_bake",
         "json2rdf",
     ]
