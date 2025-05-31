@@ -24,6 +24,28 @@ from lib import pdb
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+import json
+from glycowork.motif.graph import compare_glycans
+
+
+
+def get_oxford(iupac, oxford_dict='oxford.json'):
+    with open(oxford_dict, 'r') as f:
+        oxford_data = json.load(f)
+    
+    input_length = len(iupac)
+    
+    for oxford_name, iupac_list in oxford_data.items():
+        for iupac_from_json in iupac_list:
+            if len(iupac_from_json) == input_length:
+                if compare_glycans(iupac_from_json, iupac):
+                    return oxford_name
+    
+    return None
+
+
 # Function to sort a dictionary by value...
 def sort_dict(d, reverse = True):
   return dict(sorted(d.items(), key = lambda x: x[1], reverse = reverse))
@@ -245,7 +267,7 @@ def iupac2snfg(iupac, ID):
 
 
 def canonicalize_iupac(iupac):
-    
+    # return canonicalize_iupac(iupac)
     return canonicalize_iupac([iupac])
 
     

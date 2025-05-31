@@ -8,6 +8,8 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 from glycowork.motif.processing import canonicalize_iupac
+from glycowork.motif.tokenization import glycan_to_composition
+
 
 import logging
 import lib.config as config
@@ -150,7 +152,7 @@ def main():
                 mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
 
             try:
-                Composition = ast.literal_eval(Composition)
+                Composition = glycan_to_composition(iupac)
             except Exception:
                 Composition = None
 
@@ -169,42 +171,7 @@ def main():
 
             cluster_dict = cluster_dict_alpha if cluster_dict_alpha.get("None") != "None" else cluster_dict_beta
 
-            # Define oxford nomenclature mapping
-            oxford_mapping = {
-                "DManpa1-3[DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "M3",
-                "DManpa1-3[DManpa1-6]DManpa1-6[DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "M5",
-                "DGlcpNAcb1-2DManpa1-3[DGlcpNAcb1-2DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "A2",
-                "DGalpb1-4DGlcpNAcb1-2DManpa1-3[DGalpb1-4DGlcpNAcb1-2DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "A2G2",
-                "DGlcpNAcb1-2DManpa1-3[DGlcpNAcb1-2DManpa1-6]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAc": "FA2",
-                "DGalpb1-4DGlcpNAcb1-2DManpa1-3[DGalpb1-4DGlcpNAcb1-2DManpa1-6]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAc": "FA2G2",
-                "DGlcpNAcb1-6[DGlcpNAcb1-2]DManpa1-6[DGlcpNAcb1-2DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "A3",
-                "DGalpb1-4DGlcpNAcb1-6[DGalpb1-4DGlcpNAcb1-2]DManpa1-6[DGlcpNAcb1-4[DGlcpNAcb1-2]DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "A4G4",
-                "DGlcpNAcb1-6[DGlcpNAcb1-2]DManpa1-6[DGlcpNAcb1-4[DGlcpNAcb1-2]DManpa1-3]DManpb1-4DGlcpNAcb1-4DGlcpNAc": "A4"
-            }
-
-            # Pattern-based matching for more complex cases
-            m6_patterns = [
-                "DManpa1-3[DManpa1-3[DManpa1-2DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc",
-                "DManpa1-2DManpa1-3[DManpa1-3[DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc",
-                "DManpa1-3[DManpa1-2DManpa1-3[DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc"
-            ]
-
-            m7_patterns = [
-                "DManpa1-3[DManpa1-2DManpa1-3[DManpa1-2DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc",
-                "DManpa1-2DManpa1-2DManpa1-3[DManpa1-3[DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc",
-                "DManpa1-2DManpa1-3[DManpa1-2DManpa1-3[DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc",
-                "DManpa1-2DManpa1-3[DManpa1-3[DManpa1-2DManpa1-6]DManpa1-6]DManpb1-4DGlcpNAcb1-4DGlcpNAc"
-            ]
-
-            # Get oxford nomenclature
-            oxford = oxford_mapping.get(glycam_tidy)
-            if not oxford:
-                if glycam_tidy in m6_patterns:
-                    oxford = "M6"
-                elif glycam_tidy in m7_patterns:
-                    oxford = "M7"
-                else:
-                    oxford = None
+            oxford = name.get_oxford(iupac)
             
             glytoucan, wurcs = name.iupac2wurcs_glytoucan(iupac)
             glytoucan_alpha, wurcs_alpha = name.iupac2wurcs_glytoucan(iupac_alpha)
