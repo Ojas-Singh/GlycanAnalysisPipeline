@@ -31,7 +31,7 @@ from glycowork.motif.graph import compare_glycans
 
 
 
-def get_oxford(iupac, oxford_dict='oxford.json'):
+def get_oxford(iupac, oxford_dict='lib/oxford.json'):
     with open(oxford_dict, 'r') as f:
         oxford_data = json.load(f)
     
