@@ -31,7 +31,11 @@ from glycowork.motif.graph import compare_glycans
 
 
 
-def get_oxford(iupac, oxford_dict='lib/oxford.json'):
+def get_oxford(iupac, oxford_dict='oxford.json'):
+    # Convert to absolute path relative to this file's location
+    if not Path(oxford_dict).is_absolute():
+        oxford_dict = Path(__file__).parent / oxford_dict
+    
     with open(oxford_dict, 'r') as f:
         oxford_data = json.load(f)
     
