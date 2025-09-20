@@ -539,12 +539,16 @@ def create_cluster_info(labels: np.ndarray, pca_df: pl.DataFrame, n_clusters: in
 	
 	return reps
 
+import multiprocessing  # For cpu_count if not already imported
+from functools import partial  # For optional timing
+
 def create_cluster_info_fast(
     labels: np.ndarray,
     pca_df: pl.DataFrame,
     n_clusters: int,
-    n_jobs: int = -1,
-    min_cluster_size_for_kde: int = 2,
+    n_jobs: Optional[int] = None,  # Changed: None defaults to min(4, cpu_count())
+    min_cluster_size_for_kde: int = 5,  # Raised default for more fallbacks on slow CPUs
+    enable_profiling: bool = False,  # New: Optional timing for bottlenecks
 ) -> list:
     """
     Fast version of create_cluster_info using parallel processing for cluster representative computation.
@@ -557,6 +561,9 @@ def create_cluster_info_fast(
     Clusters are sorted by decreasing size, with cluster ID 0 being the largest cluster,
     cluster ID 1 being the second largest, and so on.
 
+    Optimized for low-core environments (e.g., 4 vCPUs): reduced CV grids, lighter optimization,
+    and explicit job limits to minimize multiprocessing overhead.
+
     Parameters
     ----------
     labels : np.ndarray
@@ -565,10 +572,12 @@ def create_cluster_info_fast(
         Polars DataFrame with PCA coordinates and 'frame' column.
     n_clusters : int
         Number of clusters.
-    n_jobs : int, default -1
-        Number of parallel jobs for processing clusters (-1 uses all available cores).
-    min_cluster_size_for_kde : int, default 2
+    n_jobs : int or None, default None
+        Number of parallel jobs (-1 uses all cores, but defaults to min(4, cpu_count()) for low-core setups).
+    min_cluster_size_for_kde : int, default 5
         Minimum cluster size to perform full KDE; smaller clusters use first frame as rep.
+    enable_profiling : bool, default False
+        If True, logs timing for KDE steps (GridSearchCV, fit, minimize) per cluster.
 
     Returns
     -------
@@ -579,9 +588,14 @@ def create_cluster_info_fast(
         logger.warning("Clustering dependencies not available; falling back to simple representatives.")
         return create_cluster_info(labels, pca_df, n_clusters)  # Fallback to original
 
+    # Set n_jobs intelligently for low-core (AMD OCI)
+    if n_jobs is None:
+        n_jobs = min(4, multiprocessing.cpu_count())
+    logger.info(f"Using n_jobs={n_jobs} for parallel cluster processing (detected {multiprocessing.cpu_count()} cores)")
+
     reps = []
 
-    # Collect cluster sizes and sort by decreasing size
+    # Collect cluster sizes and sort by decreasing size (unchanged)
     cluster_sizes = []
     for cluster_id in range(n_clusters):
         indices = np.where(labels == cluster_id)[0]
@@ -590,11 +604,11 @@ def create_cluster_info_fast(
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
     old_to_new_id = {old_id: new_id for new_id, (old_id, _) in enumerate(cluster_sizes)}
 
-    # Extract PCA component columns
+    # Extract PCA component columns (unchanged)
     pc_cols = [col for col in pca_df.columns if col.startswith('PC') and col[2:].isdigit()]
     if not pc_cols:
         logger.warning("No PC columns found; using simple fallback.")
-        # Fallback to original simple approach
+        # Fallback to original simple approach (unchanged)
         for new_cluster_id, (old_cluster_id, _) in enumerate(cluster_sizes):
             indices = np.where(labels == old_cluster_id)[0]
             if len(indices) > 0:
@@ -611,15 +625,18 @@ def create_cluster_info_fast(
                 })
         return reps
 
-    # Extract and pre-standardize PCA data once (global scaling for consistency)
+    # Extract and pre-standardize PCA data once (global scaling for consistency, unchanged)
     pca_data = pca_df.select(pc_cols).to_numpy().astype(float)
     scaler = StandardScaler()
     pca_data_scaled = scaler.fit_transform(pca_data)
     n_total = len(labels)
     logger.info(f"Pre-standardized PCA data: shape {pca_data_scaled.shape}")
 
-    def process_cluster(args):
-        """Process a single cluster: compute KDE rep if applicable, else fallback."""
+    def process_cluster(args, enable_profiling_local=False):
+        """Process a single cluster: compute KDE rep if applicable, else fallback.
+        
+        Optimized: Lighter CV for small clusters, faster minimize.
+        """
         new_cluster_id, (old_cluster_id, size) = args
         indices = np.where(labels == old_cluster_id)[0]
         if len(indices) == 0:
@@ -632,58 +649,74 @@ def create_cluster_info_fast(
             # Fallback: first frame (exact for size=1, fast for tiny)
             rep_idx = int(indices[0])
             has_kde = False
-            logger.debug(f"Cluster {new_cluster_id} (size {size}): using fallback rep {rep_idx}")
+            if enable_profiling_local:
+                logger.debug(f"Cluster {new_cluster_id} (size {size}): fallback in {0:.3f}s")
         else:
+            start_time = time.time() if enable_profiling_local else None
             try:
-                # Full KDE for accuracy: GridSearchCV for bandwidth
+                # Tuned GridSearchCV: Smaller grid/folds for speed, especially small clusters
                 if size < 10:
-                    # For very small clusters, reduce CV folds and grid for speed without accuracy loss
-                    cv_folds = min(3, size)
-                    bandwidth_grid = np.linspace(0.1, 1.0, 10)  # Smaller grid
+                    cv_folds = 2  # Minimal CV for tiny clusters
+                    bandwidth_grid = np.linspace(0.1, 1.0, 5)  # Tiny grid: fast, still accurate
+                elif size < 20:
+                    cv_folds = 3
+                    bandwidth_grid = np.linspace(0.1, 1.0, 10)
                 else:
-                    cv_folds = min(5, size)
-                    bandwidth_grid = np.linspace(0.1, 1.0, 30)
+                    cv_folds = min(5, size // 5)  # Adaptive: fewer folds for medium
+                    bandwidth_grid = np.linspace(0.1, 1.0, 20)  # Reduced from 30
 
+                grid_start = time.time() if enable_profiling_local else None
                 grid = GridSearchCV(
                     KernelDensity(kernel='gaussian'),
                     {'bandwidth': bandwidth_grid},
                     cv=cv_folds,
-                    n_jobs=-1  # Parallel CV within cluster
+                    n_jobs=1  # Sequential CV per cluster to avoid nested parallelism overhead on low cores
                 )
                 grid.fit(cluster_data_scaled)
                 bandwidth = float(grid.best_params_['bandwidth'])
-                logger.debug(f"Cluster {new_cluster_id} (size {size}): selected bandwidth {bandwidth:.3f}")
+                grid_time = time.time() - grid_start if enable_profiling_local else 0
 
-                # Fit KDE
+                # Fit KDE (fast)
+                kde_start = time.time() if enable_profiling_local else None
                 kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(cluster_data_scaled)
+                kde_time = time.time() - kde_start if enable_profiling_local else 0
 
-                # Find KDE maximum with minimize (full accuracy)
+                # Optimized minimize: Better start, fewer iters, pre-compute bounds globally if possible
                 d = cluster_data_scaled.shape[1]
-                bounds = [(float(cluster_data_scaled[:, dim].min()), float(cluster_data_scaled[:, dim].max()))
-                          for dim in range(d)]
+                bounds = [(float(np.min(cluster_data_scaled[:, dim])), float(np.max(cluster_data_scaled[:, dim])))
+                          for dim in range(d)]  # Per-cluster bounds (fast)
 
+                opt_start = time.time() if enable_profiling_local else None
                 result = minimize(
                     lambda x: -kde_model.score_samples([x])[0],
-                    cluster_data_scaled.mean(axis=0),  # Start from centroid
+                    np.mean(cluster_data_scaled, axis=0),  # Centroid start: converges faster
                     bounds=bounds,
-                    method='L-BFGS-B'
+                    method='L-BFGS-B',
+                    options={'maxiter': 50, 'ftol': 1e-6}  # Reduced iters/tol for speed
                 )
                 if not result.success:
                     raise RuntimeError(f"Optimization failed: {result.message}")
+                opt_time = time.time() - opt_start if enable_profiling_local else 0
 
                 kde_center_scaled = result.x
 
-                # Find closest data point to KDE center
+                # Find closest data point to KDE center (fast)
                 distances = np.linalg.norm(cluster_data_scaled - kde_center_scaled, axis=1)
                 closest_local_idx = int(np.argmin(distances))
                 rep_idx = int(indices[closest_local_idx])
                 has_kde = True
-                logger.debug(f"Cluster {new_cluster_id} (size {size}): KDE rep {rep_idx} (dist {distances[closest_local_idx]:.4f})")
+
+                if enable_profiling_local:
+                    total_time = time.time() - start_time
+                    logger.debug(f"Cluster {new_cluster_id} (size {size}): KDE rep {rep_idx} "
+                                 f"(grid: {grid_time:.3f}s, fit: {kde_time:.3f}s, opt: {opt_time:.3f}s, total: {total_time:.3f}s)")
 
             except Exception as e:
                 logger.warning(f"KDE failed for cluster {new_cluster_id} (size {size}): {e}; using fallback")
                 rep_idx = int(indices[0])
                 has_kde = False
+                if enable_profiling_local:
+                    logger.debug(f"Cluster {new_cluster_id} (size {size}): fallback after error in {time.time() - start_time:.3f}s")
 
         return {
             'cluster_id': int(new_cluster_id),
@@ -695,20 +728,21 @@ def create_cluster_info_fast(
             'has_kde_center': has_kde
         }
 
-    # Parallel processing of clusters
+    # Parallel processing: Use backend='threading' if multiprocessing overhead is high on AMD OCI
+    cluster_args = [(new_id, entry) for new_id, entry in enumerate(cluster_sizes)]
     if n_jobs == 1:
         # Sequential for debugging
-        cluster_args = [(new_id, entry) for new_id, entry in enumerate(cluster_sizes)]
-        reps_list = [process_cluster(arg) for arg in cluster_args]
+        reps_list = [process_cluster((arg, enable_profiling), enable_profiling) for arg in cluster_args]
     else:
-        cluster_args = [(new_id, entry) for new_id, entry in enumerate(cluster_sizes)]
-        reps_list = Parallel(n_jobs=n_jobs, verbose=0)(
-            delayed(process_cluster)(arg) for arg in cluster_args
+        # Partial for profiling flag
+        process_with_profile = partial(process_cluster, enable_profiling_local=enable_profiling)
+        reps_list = Parallel(n_jobs=n_jobs, backend='loky', verbose=0 if not enable_profiling else 1)(
+            delayed(process_with_profile)(arg) for arg in cluster_args
         )
 
     # Filter None and sort (though already ordered)
     reps = [r for r in reps_list if r is not None]
-    logger.info(f"Processed {len(reps)} clusters in parallel (n_jobs={n_jobs})")
+    logger.info(f"Processed {len(reps)} clusters in parallel (n_jobs={n_jobs}, profiling={enable_profiling})")
     return reps
 
 

@@ -192,6 +192,8 @@ class GlycanPipelineRunner:
             True if glystatic processing is complete, False otherwise
         """
         try:
+            validation_errors = []
+            
             # Check for final database output from glystatic
             # The glystatic processor writes final output under an ID directory
             # (for example: output_dir/GS00449). We need to search all
@@ -205,74 +207,80 @@ class GlycanPipelineRunner:
 
                 data_json = candidate / "data.json"
                 if not data_json.exists():
+                    validation_errors.append(f"{candidate.name}: missing data.json")
                     continue
 
                 # Try to read the data.json and validate its structure
                 try:
                     with open(data_json, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                except Exception:
-                    # skip unreadable JSON
-                    logger.debug(f"Unreadable data.json in {candidate}: skipping")
+                except Exception as e:
+                    validation_errors.append(f"{candidate.name}: unreadable data.json ({e})")
                     continue
 
                 # Validate JSON structure - must be a dict with 'archetype' section
                 if not isinstance(data, dict):
-                    logger.debug(f"data.json in {candidate} is not a dict: skipping")
+                    validation_errors.append(f"{candidate.name}: data.json is not a dictionary")
                     continue
                     
                 archetype = data.get('archetype', {})
                 if not isinstance(archetype, dict):
-                    logger.debug(f"Missing or invalid archetype in {candidate}/data.json: skipping")
+                    validation_errors.append(f"{candidate.name}: missing or invalid archetype section")
                     continue
 
                 # Check for required archetype fields
                 required_fields = ["ID", "name", "iupac", "glytoucan"]
                 missing_fields = [field for field in required_fields if field not in archetype or not archetype[field]]
                 if missing_fields:
-                    logger.debug(f"Missing required archetype fields in {candidate}: {missing_fields}")
+                    validation_errors.append(f"{candidate.name}: missing required archetype fields: {missing_fields}")
                     continue
                 
                 # Specifically validate glytoucan ID - must not be null, empty, or "null"
                 glytoucan_id = archetype.get("glytoucan", "").strip()
                 if not glytoucan_id or glytoucan_id.lower() == "null" or glytoucan_id == "":
-                    logger.debug(f"Invalid glytoucan ID '{glytoucan_id}' in {candidate}: skipping")
+                    validation_errors.append(f"{candidate.name}: invalid glytoucan ID '{glytoucan_id}'")
                     continue
 
                 # Match the glycam name in archetype
                 name_field = archetype.get('name') or archetype.get('glycam', '')
                 if not name_field:
-                    logger.debug(f"No name field in archetype for {candidate}: skipping")
+                    validation_errors.append(f"{candidate.name}: no name field in archetype")
                     continue
 
                 # Case-insensitive partial match for glycan_name
                 if glycan_name.lower() not in str(name_field).lower():
-                    logger.debug(f"Name field '{name_field}' does not match {glycan_name}: skipping {candidate}")
+                    validation_errors.append(f"{candidate.name}: name field '{name_field}' does not match {glycan_name}")
                     continue
 
                 # Validate output structure - must have output/ folder with required files
                 out_folder = candidate / 'output'
                 if not out_folder.exists():
-                    logger.debug(f"Found valid data.json in {candidate} but missing output/ folder")
+                    validation_errors.append(f"{candidate.name}: missing output/ folder")
                     continue
 
                 expected_files = [out_folder / 'pca.csv', out_folder / 'torsion_glycosidic.csv']
-                missing_files = [f for f in expected_files if not f.exists()]
+                missing_files = [str(f.relative_to(candidate)) for f in expected_files if not f.exists()]
                 if missing_files:
-                    logger.debug(f"Missing output files in {candidate}: {missing_files}")
+                    validation_errors.append(f"{candidate.name}: missing output files: {missing_files}")
                     continue
 
                 # Ensure at least level_1 exists for representative structures
                 if not (out_folder / 'level_1').exists():
-                    logger.debug(f"Missing level_1 structures in {candidate}")
+                    validation_errors.append(f"{candidate.name}: missing level_1 structures")
                     continue
 
                 # All validation passed!
                 logger.debug(f"Glystatic completion fully validated in {candidate} for {glycan_name} (GlyTouCan: {glytoucan_id})")
                 return True
 
-            # No valid processed folder found
-            logger.debug(f"No valid processed static folder found for {glycan_name} in {self.output_dir}")
+            # No valid processed folder found - log all validation errors
+            if validation_errors:
+                logger.warning(f"Glystatic validation failed for {glycan_name}. Issues found:")
+                for error in validation_errors:
+                    logger.warning(f"  - {error}")
+            else:
+                logger.warning(f"No glystatic output directories found in {self.output_dir} for {glycan_name}")
+            
             return False
 
         except Exception as e:
