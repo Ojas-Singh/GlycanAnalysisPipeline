@@ -12,6 +12,8 @@ from typing import Optional
 
 import numpy as np
 import polars as pl
+import joblib  # type: ignore
+from joblib import Parallel, delayed
 
 try:
 	from lib.torsion import circular_stats
@@ -536,6 +538,179 @@ def create_cluster_info(labels: np.ndarray, pca_df: pl.DataFrame, n_clusters: in
 			})
 	
 	return reps
+
+def create_cluster_info_fast(
+    labels: np.ndarray,
+    pca_df: pl.DataFrame,
+    n_clusters: int,
+    n_jobs: int = -1,
+    min_cluster_size_for_kde: int = 2,
+) -> list:
+    """
+    Fast version of create_cluster_info using parallel processing for cluster representative computation.
+
+    This function parallelizes the per-cluster KDE fitting and optimization using joblib,
+    while preserving the full accuracy of the original KDE-based representative selection.
+    For clusters with size < min_cluster_size_for_kde, falls back to the first frame index
+    (exact for size=1, reasonable approximation for tiny clusters to avoid unstable KDE).
+
+    Clusters are sorted by decreasing size, with cluster ID 0 being the largest cluster,
+    cluster ID 1 being the second largest, and so on.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Cluster labels for each data point.
+    pca_df : pl.DataFrame
+        Polars DataFrame with PCA coordinates and 'frame' column.
+    n_clusters : int
+        Number of clusters.
+    n_jobs : int, default -1
+        Number of parallel jobs for processing clusters (-1 uses all available cores).
+    min_cluster_size_for_kde : int, default 2
+        Minimum cluster size to perform full KDE; smaller clusters use first frame as rep.
+
+    Returns
+    -------
+    list
+        List of dicts with cluster info, including 'representative_idx', 'cluster_size_pct', etc.
+    """
+    if not _HAS_CLUSTERING:
+        logger.warning("Clustering dependencies not available; falling back to simple representatives.")
+        return create_cluster_info(labels, pca_df, n_clusters)  # Fallback to original
+
+    reps = []
+
+    # Collect cluster sizes and sort by decreasing size
+    cluster_sizes = []
+    for cluster_id in range(n_clusters):
+        indices = np.where(labels == cluster_id)[0]
+        cluster_sizes.append((cluster_id, len(indices)))
+
+    cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+    old_to_new_id = {old_id: new_id for new_id, (old_id, _) in enumerate(cluster_sizes)}
+
+    # Extract PCA component columns
+    pc_cols = [col for col in pca_df.columns if col.startswith('PC') and col[2:].isdigit()]
+    if not pc_cols:
+        logger.warning("No PC columns found; using simple fallback.")
+        # Fallback to original simple approach
+        for new_cluster_id, (old_cluster_id, _) in enumerate(cluster_sizes):
+            indices = np.where(labels == old_cluster_id)[0]
+            if len(indices) > 0:
+                cluster_size_pct = 100.0 * len(indices) / len(labels)
+                rep_idx = int(indices[0])  # Assume frame == index for speed
+                reps.append({
+                    'cluster_id': int(new_cluster_id),
+                    'representative_idx': rep_idx,
+                    'cluster_size_pct': float(cluster_size_pct),
+                    'n_points': len(indices),
+                    'n_clusters': int(n_clusters),
+                    'members': indices.tolist(),
+                    'has_kde_center': False
+                })
+        return reps
+
+    # Extract and pre-standardize PCA data once (global scaling for consistency)
+    pca_data = pca_df.select(pc_cols).to_numpy().astype(float)
+    scaler = StandardScaler()
+    pca_data_scaled = scaler.fit_transform(pca_data)
+    n_total = len(labels)
+    logger.info(f"Pre-standardized PCA data: shape {pca_data_scaled.shape}")
+
+    def process_cluster(args):
+        """Process a single cluster: compute KDE rep if applicable, else fallback."""
+        new_cluster_id, (old_cluster_id, size) = args
+        indices = np.where(labels == old_cluster_id)[0]
+        if len(indices) == 0:
+            return None
+
+        cluster_size_pct = 100.0 * size / n_total
+        cluster_data_scaled = pca_data_scaled[indices]
+
+        if size < min_cluster_size_for_kde:
+            # Fallback: first frame (exact for size=1, fast for tiny)
+            rep_idx = int(indices[0])
+            has_kde = False
+            logger.debug(f"Cluster {new_cluster_id} (size {size}): using fallback rep {rep_idx}")
+        else:
+            try:
+                # Full KDE for accuracy: GridSearchCV for bandwidth
+                if size < 10:
+                    # For very small clusters, reduce CV folds and grid for speed without accuracy loss
+                    cv_folds = min(3, size)
+                    bandwidth_grid = np.linspace(0.1, 1.0, 10)  # Smaller grid
+                else:
+                    cv_folds = min(5, size)
+                    bandwidth_grid = np.linspace(0.1, 1.0, 30)
+
+                grid = GridSearchCV(
+                    KernelDensity(kernel='gaussian'),
+                    {'bandwidth': bandwidth_grid},
+                    cv=cv_folds,
+                    n_jobs=-1  # Parallel CV within cluster
+                )
+                grid.fit(cluster_data_scaled)
+                bandwidth = float(grid.best_params_['bandwidth'])
+                logger.debug(f"Cluster {new_cluster_id} (size {size}): selected bandwidth {bandwidth:.3f}")
+
+                # Fit KDE
+                kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(cluster_data_scaled)
+
+                # Find KDE maximum with minimize (full accuracy)
+                d = cluster_data_scaled.shape[1]
+                bounds = [(float(cluster_data_scaled[:, dim].min()), float(cluster_data_scaled[:, dim].max()))
+                          for dim in range(d)]
+
+                result = minimize(
+                    lambda x: -kde_model.score_samples([x])[0],
+                    cluster_data_scaled.mean(axis=0),  # Start from centroid
+                    bounds=bounds,
+                    method='L-BFGS-B'
+                )
+                if not result.success:
+                    raise RuntimeError(f"Optimization failed: {result.message}")
+
+                kde_center_scaled = result.x
+
+                # Find closest data point to KDE center
+                distances = np.linalg.norm(cluster_data_scaled - kde_center_scaled, axis=1)
+                closest_local_idx = int(np.argmin(distances))
+                rep_idx = int(indices[closest_local_idx])
+                has_kde = True
+                logger.debug(f"Cluster {new_cluster_id} (size {size}): KDE rep {rep_idx} (dist {distances[closest_local_idx]:.4f})")
+
+            except Exception as e:
+                logger.warning(f"KDE failed for cluster {new_cluster_id} (size {size}): {e}; using fallback")
+                rep_idx = int(indices[0])
+                has_kde = False
+
+        return {
+            'cluster_id': int(new_cluster_id),
+            'representative_idx': rep_idx,
+            'cluster_size_pct': float(cluster_size_pct),
+            'n_points': size,
+            'n_clusters': int(n_clusters),
+            'members': indices.tolist(),
+            'has_kde_center': has_kde
+        }
+
+    # Parallel processing of clusters
+    if n_jobs == 1:
+        # Sequential for debugging
+        cluster_args = [(new_id, entry) for new_id, entry in enumerate(cluster_sizes)]
+        reps_list = [process_cluster(arg) for arg in cluster_args]
+    else:
+        cluster_args = [(new_id, entry) for new_id, entry in enumerate(cluster_sizes)]
+        reps_list = Parallel(n_jobs=n_jobs, verbose=0)(
+            delayed(process_cluster)(arg) for arg in cluster_args
+        )
+
+    # Filter None and sort (though already ordered)
+    reps = [r for r in reps_list if r is not None]
+    logger.info(f"Processed {len(reps)} clusters in parallel (n_jobs={n_jobs})")
+    return reps
+
 
 def save_clustering_results(all_levels: Dict[int, List[Dict[str, Any]]], output_path: str = "clustering_results.json") -> None:
 	import json

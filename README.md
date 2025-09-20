@@ -74,7 +74,7 @@ Run using install.sh as it will save log in last_run.log
 export GLYCOSHAPE_RDF_DIR="${GLYCOSHAPE_RDF_DIR:-${GLYCOSHAPE_OUTPUT_PATH}/GLYCOSHAPE_RDF}"
 
 # Load and serve the RDF dataset
-oxigraph load --location "$GLYCOSHAPE_RDF_DIR" --file "$GLYCOSHAPE_RDF_DIR/GLYCOSHAPE_RDF.ttl"
+oxigraph load --location "$GLYCOSHAPE_RDF_DIR" --file "$GLYCOSHAPE_OUTPUT_PATH/GLYCOSHAPE_RDF.ttl"
 oxigraph serve --location "$GLYCOSHAPE_RDF_DIR"
 ```
 
