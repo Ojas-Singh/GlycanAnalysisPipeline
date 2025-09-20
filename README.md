@@ -61,6 +61,7 @@ python main.py
 ```
 or
 
+Run using install.sh as it will save log in last_run.log
 ```bash
 ./install.sh --run
 ```

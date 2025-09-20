@@ -1,5 +1,7 @@
 #!/bin/bash
 
+exec > >(tee last_run.log) 2>&1
+
 # GlycanAnalysisPipeline Installation Script
 # Uses Python 3.10 and uv for dependency management
 
