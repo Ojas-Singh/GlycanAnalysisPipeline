@@ -1,5 +1,4 @@
-# GlycanAnalysisPipeline
- # GlycanAnalysisPipeline 🧬
+# GlycanAnalysisPipeline 🧬
 
 Glycan conformations analysis pipeline for [GlycoShape Database](https://glycoshape.org).
 
