@@ -2,7 +2,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 .vscode
-output
+.venv/
+tests/
+env/
+dummy_database_process/
+dummy_database_static/
 data/*
 .ipynb_checkpoints
 ignore
@@ -18,5 +22,7 @@ dummy_database/*
 Duplicate_Entries.txt
 backup/*
 logs
-GlycoShape_Inventory.csv
+AGENTS.md
 /dummy_database/Man(a1-2)Man
+query_tool/*
+query_tool

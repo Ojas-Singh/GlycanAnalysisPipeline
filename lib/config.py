@@ -1,7 +1,3 @@
-number_of_dimensions = 20  # Number of dimensions for PCA
-explained_variance = 0.8  # Explained variance cut-off
-hard_dim = 3  # Hard cut-off
-
 import os
 from pathlib import Path
 
@@ -10,14 +6,18 @@ base_dir = Path(__file__).resolve().parent.parent
 
 # Get paths from environment variables or use defaults
 
-data_dir = Path(os.environ.get("GLYCAN_DATA_DIR", base_dir / "dummy_data_dir"))
-output_path = Path(os.environ.get("DATABASE_PATH", base_dir / "dummy_database"))
-inventory_path = Path(os.environ.get("GLYCAN_INVENTORY_PATH", base_dir / "GlycoShape_Inventory.csv"))
+# data_dir: Read-only directory containing input glycan data (PDB, MOL2 files)
+data_dir = Path(os.environ.get("GLYCOSHAPE_DATA_DIR", base_dir / "dummy_database_data"))
 
-update = os.environ.get("GLYCAN_DB_UPDATE", "True").lower() in ("true", "1", "yes")
+# process_dir: Working directory for storing all processing outputs (data, embedding, output folders)
+process_dir = Path(os.environ.get("GLYCOSHAPE_PROCESS_DIR", base_dir / "dummy_database_process"))
 
+# output_path: Final database output directory (separate from processing)
+output_path = Path(os.environ.get("GLYCOSHAPE_OUTPUT_PATH", base_dir / "dummy_database_static"))
 
-backup_dir = Path(os.environ.get("GLYCAN_BACKUP_DIR", base_dir / "backup"))
+inventory_path = Path(os.environ.get("GLYCOSHAPE_INVENTORY_PATH", base_dir / "GlycoShape_Inventory.csv"))
 
-contributor_id = os.environ.get("GLYTOUCAN_CONTRIBUTOR_ID", "dummy_contributor")
-api_key = os.environ.get("GLYTOUCAN_API_KEY", "dummy_api")
+update = os.environ.get("GLYCOSHAPE_DB_UPDATE", "True").lower() in ("true", "1", "yes")
+
+contributor_id = os.environ.get("GLYTOUCAN_CONTRIBUTOR_ID", "dummy_contributor_id")
+api_key = os.environ.get("GLYTOUCAN_API_KEY", "dummy_glytoucan_api")

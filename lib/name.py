@@ -4,7 +4,9 @@ import sys
 import shutil
 import requests
 import collections
-import pandas as pd
+import polars as pl
+import pyarrow.csv as pacsv
+import math
 from pathlib import Path
 from glypy.io import iupac as glypy_iupac
 
@@ -19,8 +21,6 @@ from glycowork.motif.annotate import get_terminal_structures
 import lib.config as config
 import logging
 import subprocess
-
-from lib import pdb
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -316,49 +316,6 @@ def iupac2termini(iupac):
     else:
         return None
 
-
-
-# Function to fetch data from SugarBase for the glycan of interest...
-def iupac2sugarbase(iupac: str) -> tuple:
-    """Fetch data from SugarBase for glycan.
-    
-    Args:
-        iupac: IUPAC name of glycan
-        
-    Returns:
-        Tuple of glycan properties or tuple of None values if not found
-    """
-    try:
-        if not hasattr(iupac2sugarbase, '_sugarbase_df'):
-            df = pd.read_csv(config.sugarbase_path)
-            df = df.where(pd.notnull(df), None)
-            iupac2sugarbase._sugarbase_df = df
-            logger.info(f"Loaded sugarbase from {config.sugarbase_path}")
-            
-        sugarbase = iupac2sugarbase._sugarbase_df
-        df = sugarbase.loc[sugarbase["glycan"] == iupac]
-        if df.shape[0] != 0:
-            value_list = []
-            for parameter in ['Species', 'Genus', 'Family', 'Order', 'Class', 'Phylum',
-                            'Kingdom', 'Domain','glycan_type',
-                            'disease_association','tissue_sample','Composition']:
-                values = df[parameter].values.tolist()[0]
-                if values == "[]":
-                    value_list.append(None)
-                else:
-                    value_list.append(values)
-        else:
-            print(f"{iupac} not found in SugarBase")
-            value_list = [None for n in range(12)]
-        return value_list
-            
-    except Exception as e:
-        logger.error(f"Failed to process sugarbase data: {str(e)}")
-        return tuple([None] * 13)
-    
-
-
-
 # Function to get MD simulation info for a glycan submission...
 def get_md_info(glycan: str) -> tuple:
     """Get MD simulation info for a glycan submission.
@@ -376,9 +333,19 @@ def get_md_info(glycan: str) -> tuple:
             if not latest_inventory.exists():
                 logger.error(f"Inventory file not found: {latest_inventory}")
                 return 0, 0, 0, 0, 0, 0, 0, "0"
-                
-            df = pd.read_csv(latest_inventory)
-            df = df[df['Timestamp'].notna()]
+
+            # Read CSV using pyarrow for performance and compatibility, then convert to Polars
+            try:
+                table = pacsv.read_csv(str(latest_inventory))
+                df = pl.from_arrow(table)
+            except Exception:
+                # Fall back to Polars CSV reader if pyarrow fails for any reason
+                df = pl.read_csv(str(latest_inventory))
+
+            # Keep only rows with a non-null Timestamp
+            if 'Timestamp' in df.columns:
+                df = df.filter(pl.col('Timestamp').is_not_null())
+
             get_md_info._inventory_df = df
             logger.info(f"Loaded inventory from {latest_inventory}")
         except Exception as e:
@@ -387,163 +354,64 @@ def get_md_info(glycan: str) -> tuple:
     
     try:
         df = get_md_info._inventory_df
-        glycan_data = df.loc[df[df.columns[3]] == glycan]
-        
-        if glycan_data.empty:
+
+        # Use positional column access similar to the original implementation
+        cols = list(df.columns)
+        if len(cols) < 11:
+            logger.error("Inventory CSV does not have the expected number of columns")
+            return 0, 0, 0, 0, 0, 0, 0, "0"
+
+        glycan_col = cols[3]
+        glycan_data = df.filter(pl.col(glycan_col) == glycan)
+
+        if glycan_data.height == 0:
             logger.warning(f"No inventory data found for {glycan}")
             return 0, 0, 0, 0, 0, 0, 0, "0"
-            
-        length = str(glycan_data[df.columns[5]].iloc[0])
-        package = glycan_data[df.columns[6]].iloc[0]
-        FF = glycan_data[df.columns[7]].iloc[0]
-        temp = str(glycan_data[df.columns[8]].iloc[0])
-        pressure = str(glycan_data[df.columns[9]].iloc[0])
-        salt = glycan_data[df.columns[10]].iloc[0]
-        contributor = glycan_data[df.columns[2]].iloc[0]
-        ID = glycan_data[df.columns[0]].iloc[0]
-        
-        # Replace NaN values with None
-        ID = None if pd.isna(ID) else str(ID)
-        length = None if pd.isna(length) else str(length)
-        package = None if pd.isna(package) else package
-        FF = None if pd.isna(FF) else FF
-        temp = None if pd.isna(temp) else str(temp)
-        pressure = None if pd.isna(pressure) else str(pressure)
-        salt = None if pd.isna(salt) else salt
-        contributor = None if pd.isna(contributor) else contributor
+
+        # Get first matching row values
+        def _get_val(df_row, col_name):
+            try:
+                val = df_row[0][col_name]
+            except Exception:
+                val = None
+            # Convert Polars nulls and NaNs to None
+            if val is None:
+                return None
+            try:
+                if isinstance(val, float) and math.isnan(val):
+                    return None
+            except Exception:
+                pass
+            return val
+
+        row0 = glycan_data.head(1)
+
+        ID = _get_val(row0, cols[0])
+        length = _get_val(row0, cols[5])
+        package = _get_val(row0, cols[6])
+        FF = _get_val(row0, cols[7])
+        temp = _get_val(row0, cols[8])
+        pressure = _get_val(row0, cols[9])
+        salt = _get_val(row0, cols[10])
+        contributor = _get_val(row0, cols[2])
+
+        # Normalize to expected return types (strings or None)
+        ID = None if ID is None else str(ID)
+        length = None if length is None else str(length)
+        package = None if package is None else package
+        FF = None if FF is None else FF
+        temp = None if temp is None else str(temp)
+        pressure = None if pressure is None else str(pressure)
+        salt = None if salt is None else salt
+        contributor = None if contributor is None else contributor
 
         return ID, length, package, FF, temp, pressure, salt, contributor
-        
+
     except Exception as e:
         logger.error(f"Error processing inventory data for {glycan}: {str(e)}")
         return 0, 0, 0, 0, 0, 0, 0, "0"
 
-# Function to get the cluster information for the glycan of interest...
-def get_clusters_alpha(glycan: str, ID: str) -> dict:
-    """Get cluster information for alpha conformer.
-    
-    Args:
-        glycan: Glycan name
-        ID: Glycan ID
-        
-    Returns:
-        Dictionary of cluster information
-    """
-    cluster_dict = {}
-    conf = "alpha"
-    
-    try:
-        # Setup paths
-        cluster_path = Path(config.data_dir) / glycan / "clusters" / conf
-        output_path = Path(config.output_path) / str(ID)
-        
-        # Create output directory if it doesn't exist
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize cluster lists
-        cluster_ids = []
-        cluster_occupancies = []
-        
-        # Check for PDB files
-        files = list(cluster_path.glob("*.pdb"))
-        if not files:
-            logger.warning(f"No cluster files found for {glycan} {conf}")
-            cluster_ids.append("None")
-            cluster_occupancies.append("None")
-        else:
-            # Sort files by occupancy
-            files_mod = sorted([float(f.stem.split("_")[1]) for f in files], reverse=True)
-            
-            # Process each file
-            for file_num, occupancy in enumerate(files_mod):
-                try:
-                    # Find matching PDB file
-                    pdb_file = next(cluster_path.glob(f'*_{occupancy:.2f}.pdb'))
-                except StopIteration:
-                    pdb_file = next(cluster_path.glob(f'*_{occupancy:.1f}.pdb'))
-                
-                # Copy and process file
-                output_file = output_path / f"cluster{file_num}_{conf}.pdb"
-                shutil.copyfile(pdb_file, output_file)
-                pdb.pdb_remark_adder(output_file)
-                
-                # Store cluster info
-                cluster_ids.append(f"Cluster {file_num}")
-                cluster_occupancies.append(occupancy)
-        
-        # Create cluster dictionary
-        for n in range(len(cluster_ids)):
-            cluster_dict[cluster_ids[n]] = cluster_occupancies[n]
-            
-        return cluster_dict
-        
-    except Exception as e:
-        logger.error(f"Failed to process {conf} clusters for {glycan}: {str(e)}")
-        return {"None": "None"}
-    
-    # Function to get the cluster information for the glycan of interest...
-def get_clusters_beta(glycan: str, ID: str) -> dict:
-    """Get cluster information for beta conformer.
-    
-    Args:
-        glycan: Glycan name
-        ID: Glycan ID
-        
-    Returns:
-        Dictionary of cluster information
-    """
-    cluster_dict = {}
-    conf = "beta"
-    
-    try:
-        # Setup paths
-        cluster_path = Path(config.data_dir) / glycan / "clusters" / conf
-        output_path = Path(config.output_path) / str(ID)
-        
-        # Create output directory if it doesn't exist
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize cluster lists
-        cluster_ids = []
-        cluster_occupancies = []
-        
-        # Check for PDB files
-        files = list(cluster_path.glob("*.pdb"))
-        if not files:
-            logger.warning(f"No cluster files found for {glycan} {conf}")
-            cluster_ids.append("None")
-            cluster_occupancies.append("None")
-        else:
-            # Sort files by occupancy
-            files_mod = sorted([float(f.stem.split("_")[1]) for f in files], reverse=True)
-            
-            # Process each file
-            for file_num, occupancy in enumerate(files_mod):
-                try:
-                    # Find matching PDB file
-                    pdb_file = next(cluster_path.glob(f'*_{occupancy:.2f}.pdb'))
-                except StopIteration:
-                    pdb_file = next(cluster_path.glob(f'*_{occupancy:.1f}.pdb'))
-                
-                # Copy and process file
-                output_file = output_path / f"cluster{file_num}_{conf}.pdb"
-                shutil.copyfile(pdb_file, output_file)
-                pdb.pdb_remark_adder(output_file)
-                
-                # Store cluster info
-                cluster_ids.append(f"Cluster {file_num}")
-                cluster_occupancies.append(occupancy)
-        
-        # Create cluster dictionary
-        for n in range(len(cluster_ids)):
-            cluster_dict[cluster_ids[n]] = cluster_occupancies[n]
-            
-        return cluster_dict
-        
-    except Exception as e:
-        # logger.error(f"Failed to process {conf} clusters for {glycan}: {str(e)}")
-        return {"None": "None"}
-    
+
 
 def glytoucan2glygen(glytoucan_ac):
     """Get Glygen data for a GlyTouCan accession number.
