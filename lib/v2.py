@@ -44,7 +44,8 @@ from lib.embedding import (
     gmm_optimize_glycosidic_deviation,
     kcenter_coverage_clustering,
     create_cluster_info,
-    create_cluster_info_fast
+    create_cluster_info_fast,
+    create_cluster_info_fast_big
 )
 from lib import glypdbio
 from lib.torsion import get_glycan_torsions_enhanced, get_torsion_values, get_torsion_values_batch, classify_glycosidic_from_name, circular_stats, save_torparts_npz, plot_torsion_distribution
@@ -158,8 +159,8 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
     
     # Format results and save
     all_levels = {
-        1: create_cluster_info(labels_level1, pca_df, 1),
-        2: create_cluster_info(labels_level2, pca_df, n_clusters_level2),
+        1: create_cluster_info_fast_big(labels_level1, pca_df, 1),
+        2: create_cluster_info_fast_big(labels_level2, pca_df, n_clusters_level2),
         3: create_cluster_info_fast(labels_level3, pca_df, n_clusters_level3)
     }
     

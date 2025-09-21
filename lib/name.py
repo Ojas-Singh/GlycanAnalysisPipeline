@@ -499,9 +499,9 @@ def get_wurcs_variants(input_wurcs: str):
     return a dictionary containing all three forms: archetype, alpha, beta.
     Returns None if the input WURCS does not match expected patterns.
     """
-    # Define the WURCS pattern
+    # Define the WURCS pattern - allow empty annotation section
     pattern = re.compile(
-        r'^WURCS=2\.0/(\d+),(\d+),(\d+)/(\[.*?\]+)/([^/]+)/([^/]+)$'
+        r'^WURCS=2\.0/(\d+),(\d+),(\d+)/(\[.*?\]+)/([^/]*)/([^/]*)$'
     )
     match = pattern.match(input_wurcs)
     if not match:

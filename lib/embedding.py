@@ -72,6 +72,7 @@ except Exception:  # pragma: no cover
 import math
 import os
 import json
+import time
 
 
 def _read_parquet_robust(path: str):
@@ -541,6 +542,212 @@ def create_cluster_info(labels: np.ndarray, pca_df: pl.DataFrame, n_clusters: in
 
 import multiprocessing  # For cpu_count if not already imported
 from functools import partial  # For optional timing
+
+def create_cluster_info_fast_big(
+    labels: np.ndarray,
+    pca_df: pl.DataFrame,
+    n_clusters: int,
+    max_sample_size: int = 5000,  # Sample large clusters to this size for KDE
+    kde_subsample_ratio: float = 0.1,  # For clusters > max_sample_size, use this fraction
+    min_kde_subsample: int = 1000,  # Minimum subsample size for reliable KDE
+    max_kde_subsample: int = 10000,  # Maximum subsample size to keep KDE fast
+    enable_profiling: bool = False,
+    seed: int = 42,
+) -> list:
+    """
+    Ultra-fast version of create_cluster_info optimized for scenarios with very large clusters
+    but relatively few cluster numbers (1 or 3-8). Uses intelligent subsampling strategies
+    to maintain accuracy while dramatically reducing computation time.
+    
+    Key optimizations for big data:
+    1. Stratified subsampling of large clusters for KDE computation
+    2. Simplified bandwidth selection (analytical estimate instead of grid search)
+    3. Fast centroid-based initialization for optimization
+    4. Early stopping criteria for optimization
+    5. Vectorized distance computations
+    
+    Parameters
+    ----------
+    labels : np.ndarray
+        Cluster labels for each data point.
+    pca_df : pl.DataFrame
+        Polars DataFrame with PCA coordinates and 'frame' column.
+    n_clusters : int
+        Number of clusters.
+    max_sample_size : int, default 5000
+        For clusters larger than this, subsample for KDE computation.
+    kde_subsample_ratio : float, default 0.1
+        Fraction of points to use for KDE when cluster > max_sample_size.
+    min_kde_subsample : int, default 1000
+        Minimum number of points to use for KDE (ensures reliability).
+    max_kde_subsample : int, default 10000
+        Maximum number of points to use for KDE (keeps computation tractable).
+    enable_profiling : bool, default False
+        Log detailed timing information for performance analysis.
+    seed : int, default 42
+        Random seed for reproducible subsampling.
+        
+    Returns
+    -------
+    list
+        List of cluster info dicts, sorted by decreasing cluster size.
+    """
+    if not _HAS_CLUSTERING:
+        logger.warning("Clustering dependencies not available; falling back to simple representatives.")
+        return create_cluster_info(labels, pca_df, n_clusters)
+    
+    np.random.seed(seed)
+    reps = []
+    
+    # Collect cluster sizes and sort by decreasing size
+    cluster_sizes = []
+    for cluster_id in range(n_clusters):
+        indices = np.where(labels == cluster_id)[0]
+        cluster_sizes.append((cluster_id, len(indices)))
+    
+    cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+    
+    # Extract PCA component columns
+    pc_cols = [col for col in pca_df.columns if col.startswith('PC') and col[2:].isdigit()]
+    if not pc_cols:
+        logger.warning("No PC columns found; using simple fallback.")
+        for new_cluster_id, (old_cluster_id, size) in enumerate(cluster_sizes):
+            indices = np.where(labels == old_cluster_id)[0]
+            if len(indices) > 0:
+                cluster_size_pct = 100.0 * size / len(labels)
+                rep_idx = int(indices[0])
+                reps.append({
+                    'cluster_id': int(new_cluster_id),
+                    'representative_idx': rep_idx,
+                    'cluster_size_pct': float(cluster_size_pct),
+                    'n_points': size,
+                    'n_clusters': int(n_clusters),
+                    'members': indices.tolist(),
+                    'has_kde_center': False
+                })
+        return reps
+    
+    # Extract and standardize PCA data once
+    pca_data = pca_df.select(pc_cols).to_numpy().astype(float)
+    scaler = StandardScaler()
+    pca_data_scaled = scaler.fit_transform(pca_data)
+    n_total = len(labels)
+    
+    logger.info(f"Processing {n_clusters} clusters with max cluster size {max([size for _, size in cluster_sizes])}")
+    
+    def scott_bandwidth(data_sample):
+        """Fast bandwidth estimation using Scott's rule: n^(-1/(d+4))"""
+        n, d = data_sample.shape
+        return float(n ** (-1.0 / (d + 4)))
+    
+    def process_large_cluster(new_cluster_id, old_cluster_id, size):
+        """Optimized processing for large clusters using subsampling."""
+        start_time = time.time() if enable_profiling else None
+        
+        indices = np.where(labels == old_cluster_id)[0]
+        cluster_size_pct = 100.0 * size / n_total
+        cluster_data_scaled = pca_data_scaled[indices]
+        
+        # Determine subsample size
+        if size <= max_sample_size:
+            # Use all data for moderate-sized clusters
+            sample_data = cluster_data_scaled
+            sample_indices = indices
+        else:
+            # Intelligent subsampling for very large clusters
+            target_sample_size = max(
+                min_kde_subsample,
+                min(max_kde_subsample, int(size * kde_subsample_ratio))
+            )
+            
+            # Stratified sampling: try to preserve structure
+            if target_sample_size >= size:
+                sample_data = cluster_data_scaled
+                sample_indices = indices
+            else:
+                # Random stratified sampling
+                sample_mask = np.random.choice(size, target_sample_size, replace=False)
+                sample_data = cluster_data_scaled[sample_mask]
+                sample_indices = indices[sample_mask]
+        
+        try:
+            # Fast bandwidth estimation (no grid search)
+            bandwidth = scott_bandwidth(sample_data)
+            
+            kde_start = time.time() if enable_profiling else None
+            kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(sample_data)
+            kde_time = time.time() - kde_start if enable_profiling else 0
+            
+            # Fast optimization with good initial guess
+            d = sample_data.shape[1]
+            bounds = [(float(np.min(sample_data[:, dim])), float(np.max(sample_data[:, dim])))
+                     for dim in range(d)]
+            
+            # Use sample centroid as starting point (often very close to KDE maximum)
+            initial_guess = np.mean(sample_data, axis=0)
+            
+            opt_start = time.time() if enable_profiling else None
+            result = minimize(
+                lambda x: -kde_model.score_samples([x])[0],
+                initial_guess,
+                bounds=bounds,
+                method='L-BFGS-B',
+                options={'maxiter': 20, 'ftol': 1e-4}  # Aggressive early stopping
+            )
+            opt_time = time.time() - opt_start if enable_profiling else 0
+            
+            if not result.success:
+                raise RuntimeError(f"Optimization failed: {result.message}")
+            
+            kde_center_scaled = result.x
+            
+            # Find closest point in FULL cluster (not just sample) to KDE center
+            distances = np.linalg.norm(cluster_data_scaled - kde_center_scaled, axis=1)
+            closest_local_idx = int(np.argmin(distances))
+            rep_idx = int(indices[closest_local_idx])
+            has_kde = True
+            
+            if enable_profiling:
+                total_time = time.time() - start_time
+                sample_ratio = len(sample_data) / size if size > 0 else 1.0
+                logger.info(f"Cluster {new_cluster_id} (size {size}, sampled {len(sample_data)}, ratio {sample_ratio:.3f}): "
+                           f"rep {rep_idx} (kde: {kde_time:.3f}s, opt: {opt_time:.3f}s, total: {total_time:.3f}s)")
+            
+        except Exception as e:
+            logger.warning(f"KDE failed for cluster {new_cluster_id} (size {size}): {e}; using centroid fallback")
+            # Fallback to centroid of full cluster
+            centroid = np.mean(cluster_data_scaled, axis=0)
+            distances = np.linalg.norm(cluster_data_scaled - centroid, axis=1)
+            closest_local_idx = int(np.argmin(distances))
+            rep_idx = int(indices[closest_local_idx])
+            has_kde = False
+            
+            if enable_profiling:
+                total_time = time.time() - start_time
+                logger.info(f"Cluster {new_cluster_id} (size {size}): centroid fallback in {total_time:.3f}s")
+        
+        return {
+            'cluster_id': int(new_cluster_id),
+            'representative_idx': rep_idx,
+            'cluster_size_pct': float(cluster_size_pct),
+            'n_points': size,
+            'n_clusters': int(n_clusters),
+            'members': indices.tolist(),
+            'has_kde_center': has_kde,
+            'was_subsampled': size > max_sample_size
+        }
+    
+    # Process all clusters sequentially (since there are only 1-8 clusters typically)
+    for new_cluster_id, (old_cluster_id, size) in enumerate(cluster_sizes):
+        if size > 0:
+            cluster_info = process_large_cluster(new_cluster_id, old_cluster_id, size)
+            reps.append(cluster_info)
+    
+    total_sampled = sum(1 for r in reps if r.get('was_subsampled', False))
+    logger.info(f"Processed {len(reps)} clusters ({total_sampled} used subsampling) for big data optimization")
+    
+    return reps
+
 
 def create_cluster_info_fast(
     labels: np.ndarray,
@@ -1204,6 +1411,8 @@ __all__ = [
 	"gmm_optimize_glycosidic_deviation",
 	"kcenter_coverage_clustering",
 	"create_cluster_info",
+	"create_cluster_info_fast",
+	"create_cluster_info_fast_big",
 	"save_clustering_results",
 	"save_clustering_results_parquet",
 	"load_clustering_results_parquet",

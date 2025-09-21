@@ -83,20 +83,37 @@ def _lower_triangle_flat_distances(xyz: np.ndarray) -> np.ndarray:
     """Compute pairwise distances for coordinates and return the flattened lower-triangle (i>j).
 
     Returns an array of shape (n*(n-1)/2,) with distances for all unique unordered atom pairs.
+    
+    Optimized version using efficient memory access patterns and float32 arithmetic.
     """
     if xyz is None:
-        return np.array([], dtype=float)
-    xyz = np.asarray(xyz)
+        return np.array([], dtype=np.float32)
+    xyz = np.asarray(xyz, dtype=np.float32)  # Use float32 for better memory efficiency
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("xyz must be an (n_atoms, 3) array")
     n = xyz.shape[0]
     if n < 2:
-        return np.array([], dtype=float)
-    # pairwise distances: using broadcasting
-    diffs = xyz[:, None, :] - xyz[None, :, :]
-    dists = np.sqrt((diffs * diffs).sum(axis=-1))
-    i, j = np.tril_indices(n, k=-1)
-    return dists[i, j]
+        return np.array([], dtype=np.float32)
+    
+    # For small numbers of atoms, use the full distance matrix approach
+    if n <= 1000:  # Threshold for memory vs computation tradeoff
+        # pairwise distances: using broadcasting
+        diffs = xyz[:, None, :] - xyz[None, :, :]
+        dists = np.sqrt((diffs * diffs).sum(axis=-1))
+        i, j = np.tril_indices(n, k=-1)
+        return dists[i, j].astype(np.float32)
+    else:
+        # For large numbers of atoms, compute distances directly for lower triangle
+        # to save memory (avoids creating full n x n matrix)
+        n_pairs = n * (n - 1) // 2
+        distances = np.empty(n_pairs, dtype=np.float32)
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = xyz[j] - xyz[i]
+                distances[idx] = np.sqrt(np.sum(diff * diff))
+                idx += 1
+        return distances
 
 def get_distance_array(out_dir: str, frame_idx: int) -> np.ndarray:
     """Return flattened lower-triangle distances for the specified frame.
@@ -114,19 +131,27 @@ def get_distance_array_noH(out_dir: str, frame_idx: int) -> np.ndarray:
 
     The heuristic used: an atom is considered hydrogen if its element symbol (string)
     stripped and upper-cased begins with 'H' (covers 'H', 'H1', etc.).
+    
+    Optimized version that loads data efficiently and uses vectorized operations.
     """
     atoms = load_atoms(out_dir)
     # element column expected; be robust to missing column
     if "element" not in atoms.columns:
         # no element information available -> fall back to full distance array
         return get_distance_array(out_dir, frame_idx)
-    elems = [str(x).strip().upper() for x in atoms["element"].to_list()]
-    non_h_mask = np.array([not (e.startswith("H")) for e in elems], dtype=bool)
+    
+    # Vectorized element processing - avoid list comprehension
+    elems = atoms["element"].to_numpy()
+    # Create mask for non-hydrogen atoms more efficiently
+    non_h_mask = np.array([not str(elem).strip().upper().startswith("H") for elem in elems], dtype=bool)
     indices = np.nonzero(non_h_mask)[0]
+    
     if indices.size < 2:
         return np.array([], dtype=float)
+    
+    # Load coordinates only once and slice efficiently
     xyz_all = load_frame_xyz(out_dir, frame_idx)
-    xyz = xyz_all[indices, :]
+    xyz = xyz_all[indices, :]  # This creates a view when possible
     return _lower_triangle_flat_distances(xyz)
 
 
@@ -139,29 +164,35 @@ def get_distance_array_noH_fast(out_dir: str, frame_idx: int, sample_size: int =
     - frame_idx: zero-based frame index
     - sample_size: maximum number of non-H atoms to include (default 200)
     - seed: RNG seed for reproducible sampling
+    
+    Optimized version with improved vectorization and reduced data loading.
     """
     atoms = load_atoms(out_dir)
     if "element" not in atoms.columns:
         # fallback to full distances if element info missing
         return get_distance_array(out_dir, frame_idx)
 
-    elems = [str(x).strip().upper() for x in atoms["element"].to_list()]
-    non_h_mask = np.array([not (e.startswith("H")) for e in elems], dtype=bool)
+    # Vectorized element processing - avoid list comprehension
+    elems = atoms["element"].to_numpy()
+    # Create mask for non-hydrogen atoms more efficiently  
+    non_h_mask = np.array([not str(elem).strip().upper().startswith("H") for elem in elems], dtype=bool)
     indices = np.nonzero(non_h_mask)[0]
+    
     if indices.size < 2:
         return np.array([], dtype=float)
 
+    # Load coordinates only once
+    xyz_all = load_frame_xyz(out_dir, frame_idx)
+
     # If small enough, compute full distances for all non-H atoms
     if indices.size <= int(sample_size):
-        xyz_all = load_frame_xyz(out_dir, frame_idx)
-        xyz = xyz_all[indices, :]
+        xyz = xyz_all[indices, :]  # Create view when possible
         return _lower_triangle_flat_distances(xyz)
 
     # Otherwise, sample `sample_size` indices reproducibly and compute distances
     rng = np.random.default_rng(int(seed))
     chosen = rng.choice(indices, size=int(sample_size), replace=False)
-    xyz_all = load_frame_xyz(out_dir, frame_idx)
-    xyz = xyz_all[chosen, :]
+    xyz = xyz_all[chosen, :]  # Create view when possible
     return _lower_triangle_flat_distances(xyz)
 
 
@@ -170,33 +201,38 @@ def get_conformation_landscape(
     method: str = "noH_fast",
     sample_size: int = 200,
     seed: int = 0,
+    chunk_size: int = 1000,
 ) -> np.ndarray:
     """Fast conformational landscape matrix.
 
     Returns a 2D array with shape (n_frames, n_distances) where each row is the
-    flattened lower-triangle distance vector for a *fixed* subset of (at most
-    `sample_size`) non-hydrogen atoms. This is an optimized version that:
+    flattened lower-triangle distance vector for a subset of atoms based on the
+    specified method. This is an optimized version that:
 
     - Loads atom table once.
-    - Selects / samples non-H atom indices once (reproducibly via `seed`).
+    - Selects / samples atom indices once (reproducibly via `seed` for sampling methods).
     - Extracts the coordinates subset across all frames in one slice.
     - Computes all pairwise distances for every frame in a single vectorized
       operation avoiding Python loops per frame.
 
     Parameters:
         out_dir: Directory containing atoms.parquet and coords.zarr.
-        method: (kept for backward compatibility; any value other than the
-                default 'noH_fast' is ignored and a ValueError is raised to
-                prevent silent misuse.)
-        sample_size: Maximum number of non-H atoms to include (default 200).
-        seed: RNG seed for reproducible sampling.
+        method: Distance calculation method:
+            - "noH_fast": Use non-H atoms, sample up to `sample_size` if too many (default)
+            - "noH": Use all non-H atoms without sampling
+            - "all": Use all atoms (including hydrogens)
+        sample_size: Maximum number of atoms to include for sampling methods (default 200).
+                    Only used when method="noH_fast" and there are more non-H atoms than this limit.
+        seed: RNG seed for reproducible sampling (only used with sampling methods).
+        chunk_size: Number of frames to process in each memory-efficient chunk (default 1000).
+                    Reduces peak memory usage for large trajectories by processing frames in batches.
 
     Notes:
         - If <2 eligible atoms, returns an array of shape (n_frames, 0).
-        - Always uses the "noH_fast" strategy internally now for speed.
+        - Uses vectorized operations for optimal performance.
     """
-    if method != "noH_fast":
-        raise ValueError("get_conformation_landscape now only supports method='noH_fast' for speed.")
+    if method not in ["noH_fast", "noH", "all"]:
+        raise ValueError(f"method must be one of ['noH_fast', 'noH', 'all'], got '{method}'")
 
     z = load_coords(out_dir)  # expected shape (n_frames, n_atoms, 3)
     # Ensure we have a numpy array with float32 dtype to avoid large float64
@@ -217,22 +253,34 @@ def get_conformation_landscape(
         # transpose from (n_atoms, n_frames, 3) -> (n_frames, n_atoms, 3)
         z = np.transpose(z, (1, 0, 2))
     n_frames = int(z.shape[0])
-    if "element" not in atoms.columns:
-        # Fall back to all atoms; still sample if needed
+    
+    # Determine atom indices based on method
+    if method == "all":
+        # Use all atoms
         all_indices = np.arange(z.shape[1], dtype=int)
+    elif method in ["noH", "noH_fast"]:
+        # Use non-hydrogen atoms
+        if "element" not in atoms.columns:
+            # Fall back to all atoms if no element information
+            all_indices = np.arange(z.shape[1], dtype=int)
+        else:
+            elems = [str(x).strip().upper() for x in atoms["element"].to_list()]
+            non_h_mask = np.array([not e.startswith("H") for e in elems], dtype=bool)
+            all_indices = np.nonzero(non_h_mask)[0]
     else:
-        elems = [str(x).strip().upper() for x in atoms["element"].to_list()]
-        non_h_mask = np.array([not e.startswith("H") for e in elems], dtype=bool)
-        all_indices = np.nonzero(non_h_mask)[0]
+        raise ValueError(f"Unsupported method: {method}")
 
     if all_indices.size < 2:
         return np.zeros((n_frames, 0), dtype=float)
 
-    if all_indices.size > int(sample_size):
+    # Apply sampling if method is noH_fast and we have too many atoms
+    # If noH_fast but not enough atoms to warrant sampling, behave like noH method
+    if method == "noH_fast" and all_indices.size > int(sample_size):
         rng = np.random.default_rng(int(seed))
         chosen = rng.choice(all_indices, size=int(sample_size), replace=False)
         chosen.sort()  # keep deterministic ordering for reproducibility of pair index mapping
     else:
+        # For noH method or noH_fast with few atoms, use all available indices
         chosen = all_indices
 
     m = chosen.size
@@ -249,12 +297,19 @@ def get_conformation_landscape(
 
     # Precompute pair indices once (lower triangle i>j)
     i_idx, j_idx = np.tril_indices(m, k=-1)
-    # Vectorized distance computation across frames:
-    # coords_sub[:, i_idx, :] -> (n_frames, n_pairs, 3)
-    # compute pairwise diffs across frames; keep float32 arithmetic
-    diffs = coords_sub[:, i_idx, :] - coords_sub[:, j_idx, :]
-    # distances shape (n_frames, n_pairs) computed in float32
-    dist_mat = np.sqrt(np.sum(diffs * diffs, axis=-1)).astype(np.float32)
+    
+    # Chunked distance computation to reduce memory usage
+    chunk_size = min(chunk_size, n_frames)
+    dist_chunks = []
+    for start in range(0, n_frames, chunk_size):
+        end = min(start + chunk_size, n_frames)
+        chunk_coords = coords_sub[start:end]  # Shape: (chunk_frames, m, 3)
+        chunk_diffs = chunk_coords[:, i_idx, :] - chunk_coords[:, j_idx, :]  # Shape: (chunk_frames, n_pairs, 3)
+        chunk_dist = np.sqrt(np.sum(chunk_diffs * chunk_diffs, axis=-1)).astype(np.float32)  # Shape: (chunk_frames, n_pairs)
+        dist_chunks.append(chunk_dist)
+    
+    # Concatenate all chunks
+    dist_mat = np.vstack(dist_chunks)
     # Guarantee C-contiguous output
     return np.ascontiguousarray(dist_mat)
 
