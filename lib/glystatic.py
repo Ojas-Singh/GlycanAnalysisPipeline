@@ -6,13 +6,14 @@ import pandas as pd
 from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Descriptors
+import numpy as np
 
 from glycowork.motif.processing import canonicalize_iupac
 from glycowork.motif.tokenization import glycan_to_composition
 from glycowork.motif.draw import GlycoDraw
 
 import logging
-from lib import name, glypdbio, config
+from lib import glypdbio, config, name_utils
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -296,13 +297,28 @@ def copy_and_convert_pdbs(
                             temp_file.unlink()
 
 
+def make_serializable(obj):
+    """Recursively convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: make_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_serializable(item) for item in obj]
+    else:
+        return obj
+
+
 def save_glycan_data(glycan_data: dict, output_dir: Path, filename: str) -> None:
     """Save glycan data as JSON file."""
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / f"{filename}.json"
+        serializable_data = make_serializable(glycan_data)
         with open(output_file, 'w') as f:
-            json.dump(glycan_data, f, indent=4, ensure_ascii=False)
+            json.dump(serializable_data, f, indent=4, ensure_ascii=False)
         logger.info(f"Saved glycan data to {output_file}")
         
     except Exception as e:
@@ -367,7 +383,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
     final_output_dir.mkdir(parents=True, exist_ok=True)
     
     # Get basic glycan info
-    glycam_tidy, end_pos, end_link = name.glycam_info(glycam_name)
+    glycam_tidy, end_pos, end_link = name_utils.glycam_info(glycam_name)
     iupac = canonicalize_iupac(glycam_name)
     
     # Generate SNFG diagram
@@ -390,7 +406,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         
         # Get chemical properties
         try:
-            mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name.iupac2properties(iupac)
+            mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name_utils.iupac2properties(iupac)
         except Exception as e:
             logger.warning(f"Could not retrieve properties for {iupac}: {e}")
             mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
@@ -401,31 +417,31 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
             composition_glycowork = None
 
         # Get additional data
-        smiles = name.iupac2smiles(iupac)
-        glycoct = name.iupac2glycoct(iupac)
-        composition = name.iupac2composition(iupac)
-        oxford = name.get_oxford(iupac)
+        smiles = name_utils.iupac2smiles(iupac)
+        glycoct = name_utils.iupac2glycoct(iupac)
+        composition = name_utils.iupac2composition(iupac)
+        oxford = name_utils.get_oxford(iupac)
         
         try:
-            termini = name.iupac2termini(iupac)
+            termini = name_utils.iupac2termini(iupac)
         except Exception as e:
             logger.warning(f"Could not retrieve termini for {iupac}: {e}")
             termini = None
         
         # Get WURCS and GlyTouCan IDs
-        glytoucan, wurcs = name.iupac2wurcs_glytoucan(iupac)
-        glytoucan_alpha, wurcs_alpha = name.iupac2wurcs_glytoucan(iupac_alpha)
-        glytoucan_beta, wurcs_beta = name.iupac2wurcs_glytoucan(iupac_beta)
+        glytoucan, wurcs = name_utils.iupac2wurcs_glytoucan(iupac)
+        glytoucan_alpha, wurcs_alpha = name_utils.iupac2wurcs_glytoucan(iupac_alpha)
+        glytoucan_beta, wurcs_beta = name_utils.iupac2wurcs_glytoucan(iupac_beta)
 
         # If wurcs is None, try to get it from Mol2WURCS using smiles
         if wurcs is None:
             try:
                 logger.info("WURCS is None, trying to get it from Mol2WURCS")
-                wurcs = name.smiles2wurcs(smiles)
-                wurcs, wurcs_alpha, wurcs_beta = name.get_wurcs_variants(wurcs)
-                glytoucan = name.wurcs2glytoucan(wurcs)
-                glytoucan_alpha = name.wurcs2glytoucan(wurcs_alpha)
-                glytoucan_beta = name.wurcs2glytoucan(wurcs_beta)
+                wurcs = name_utils.smiles2wurcs(smiles)
+                wurcs, wurcs_alpha, wurcs_beta = name_utils.get_wurcs_variants(wurcs)
+                glytoucan = name_utils.wurcs2glytoucan(wurcs)
+                glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha)
+                glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta)
             except Exception as e:
                 logger.warning(f"Could not retrieve WURCS from Mol2WURCS for {iupac}: {e}")
                 wurcs = wurcs_alpha = wurcs_beta = None
@@ -433,7 +449,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
 
         # Get motifs
         try: 
-            motifs = name.glytoucan2motif(glytoucan) if glytoucan else None
+            motifs = name_utils.glytoucan2motif(glytoucan) if glytoucan else None
         except Exception as e:
             logger.warning(f"Could not retrieve motifs for {iupac}: {e}")
             motifs = None
@@ -470,7 +486,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 "name": glycam_name,
                 "glycam": glycam_tidy,
                 "iupac": iupac,
-                "iupac_extended": name.wurcs2extendediupac(wurcs),
+                "iupac_extended": name_utils.wurcs2extendediupac(wurcs),
                 "glytoucan": glytoucan,
                 "wurcs": wurcs,
                 "glycoct": glycoct,
@@ -507,7 +523,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 "name": glycam_name,
                 "glycam": glycam_alpha,
                 "iupac": iupac_alpha,
-                "iupac_extended": name.wurcs2extendediupac(wurcs_alpha),
+                "iupac_extended": name_utils.wurcs2extendediupac(wurcs_alpha),
                 "glytoucan": glytoucan_alpha,
                 "wurcs": wurcs_alpha,
                 
@@ -519,7 +535,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 "name": glycam_name,
                 "glycam": glycam_beta,
                 "iupac": iupac_beta,
-                "iupac_extended": name.wurcs2extendediupac(wurcs_beta),
+                "iupac_extended": name_utils.wurcs2extendediupac(wurcs_beta),
                 "glytoucan": glytoucan_beta,
                 "wurcs": wurcs_beta,
                 
@@ -535,8 +551,8 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
 
         # Save data files
         save_glycan_data(glycan_data, final_output_dir, "data")
-        save_glycan_data(name.glytoucan2glygen(glytoucan), final_output_dir, "glygen")
-        save_glycan_data(name.glytoucan2glycosmos(glytoucan), final_output_dir, "glycosmos")
+        save_glycan_data(name_utils.glytoucan2glygen(glytoucan), final_output_dir, "glygen")
+        save_glycan_data(name_utils.glytoucan2glycosmos(glytoucan), final_output_dir, "glycosmos")
         
         # Copy and convert PDB files
         copy_and_convert_pdbs(
