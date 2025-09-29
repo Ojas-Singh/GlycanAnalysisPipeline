@@ -466,17 +466,20 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         
         # Extract level 2 cluster data for simplified structure
         level_2_clusters = {}
-        level_2_coverage_clusters = {}
+        level_3_coverage_clusters = {}
         
         if "levels" in cluster_data:
             for level_key, level_data in cluster_data["levels"].items():
-                if level_key == "level_2":  # We want level 2 specifically
+                if level_key == "level_2":  # We want level 2 for general clusters
                     for cluster in level_data.get("clusters", []):
                         cluster_id = cluster["cluster_id"]
                         cluster_name = f"Cluster {cluster_id}"
                         level_2_clusters[cluster_name] = round(cluster["cluster_size_pct"], 2)
-                        level_2_coverage_clusters[cluster_name] = round(cluster["cluster_size_pct"], 2)
-                    break
+                elif level_key == "level_3":  # We want level 3 for coverage clusters
+                    for cluster in level_data.get("clusters", []):
+                        cluster_id = cluster["cluster_id"]
+                        cluster_name = f"Cluster {cluster_id}"
+                        level_3_coverage_clusters[cluster_name] = round(cluster["cluster_size_pct"], 4)
         
         # Build glycan data structure
         glycan_data = {
@@ -506,7 +509,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 # cluster analysis data 
                 "entropy": cluster_data.get("entropy_nats"),
                 "clusters": level_2_clusters,
-                "coverage_clusters": level_2_coverage_clusters,
+                "coverage_clusters": level_3_coverage_clusters,
                 
                 # Molecular Dynamics info from inventory
                 "length": length,

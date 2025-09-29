@@ -653,7 +653,7 @@ def main():
     # Use config defaults or command line overrides
     data_dir = Path(args.data_dir) if args.data_dir else config.data_dir
     process_dir = Path(args.process_dir) if args.process_dir else config.process_dir
-    output_dir = Path(args.output_dir) if args.output_dir else config.output_path
+    output_dir = Path(args.output_dir) if args.output_dir else config.output_dir
     
     logger.info(f"Starting Glycan Analysis Pipeline")
     logger.info(f"Data directory: {data_dir}")

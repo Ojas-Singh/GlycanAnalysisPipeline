@@ -12,8 +12,11 @@ data_dir = Path(os.environ.get("GLYCOSHAPE_DATA_DIR", base_dir / "dummy_database
 # process_dir: Working directory for storing all processing outputs (data, embedding, output folders)
 process_dir = Path(os.environ.get("GLYCOSHAPE_PROCESS_DIR", base_dir / "dummy_database_process"))
 
-# output_path: Final database output directory (separate from processing)
-output_path = Path(os.environ.get("GLYCOSHAPE_OUTPUT_PATH", base_dir / "dummy_database_static"))
+# output_dir: Final database output directory (separate from processing)
+output_dir = Path(os.environ.get("GLYCOSHAPE_OUTPUT_DIR", base_dir / "dummy_database_static"))
+
+# rdf_path: Directory containing RDF files
+rdf_path = Path(os.environ.get("GLYCOSHAPE_RDF_DIR", base_dir / "GLYCOSHAPE_RDF"))
 
 inventory_path = Path(os.environ.get("GLYCOSHAPE_INVENTORY_PATH", base_dir / "GlycoShape_Inventory.csv"))
 
