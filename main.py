@@ -178,6 +178,57 @@ class GlycanPipelineRunner:
             logger.debug(f"Error validating output for {glycan_name}: {str(e)}")
             return False
     
+    def check_glystatic_simple(self, glycan_name: str) -> bool:
+        """Simple check if glystatic processing should be skipped.
+        
+        This is used when GLYCOSHAPE_DB_UPDATE is False - we only need to check
+        if there's a valid data.json with a glytoucan ID, not the full file structure.
+        
+        Args:
+            glycan_name: Name of the glycan
+            
+        Returns:
+            True if a valid data.json exists with glytoucan ID, False otherwise
+        """
+        try:
+            # Look for any GS folder that matches this glycan name
+            for candidate in self.output_dir.iterdir():
+                if not candidate.is_dir():
+                    continue
+
+                data_json = candidate / "data.json"
+                if not data_json.exists():
+                    continue
+
+                # Try to read the data.json
+                try:
+                    with open(data_json, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    continue
+
+                # Check if archetype name matches exactly
+                archetype = data.get('archetype', {})
+                if not isinstance(archetype, dict):
+                    continue
+                    
+                name_field = archetype.get('name') or archetype.get('glycam', '')
+                if name_field != glycan_name:
+                    continue
+                
+                # Simple validation: just check if glytoucan ID exists and is valid
+                glytoucan_id = archetype.get("glytoucan", "").strip()
+                if glytoucan_id and glytoucan_id.lower() != "null" and glytoucan_id != "":
+                    logger.debug(f"Found valid glytoucan ID '{glytoucan_id}' for {glycan_name} in {candidate.name}")
+                    return True
+            
+            logger.debug(f"No valid data.json with glytoucan ID found for {glycan_name}")
+            return False
+
+        except Exception as e:
+            logger.debug(f"Error in simple glystatic check for {glycan_name}: {e}")
+            return False
+    
     def check_glystatic_completion(self, glycan_name: str) -> bool:
         """Check if glystatic processing is complete for a glycan.
         
@@ -317,10 +368,18 @@ class GlycanPipelineRunner:
         try:
             output_glycan_dir = self.output_dir / glycan_name
             
-            # Check if glystatic processing is already complete (unless force update)
-            if not self.force_update and self.check_glystatic_completion(glycan_name):
-                logger.info(f"Glystatic processing already complete for {glycan_name}, skipping")
-                return True
+            # Check if glystatic processing should be skipped
+            if not self.force_update:
+                if not config.update:
+                    # When GLYCOSHAPE_DB_UPDATE is False, use simple check
+                    if self.check_glystatic_simple(glycan_name):
+                        logger.info(f"Glystatic processing already complete for {glycan_name} (found valid data.json with glytoucan ID), skipping")
+                        return True
+                else:
+                    # When GLYCOSHAPE_DB_UPDATE is True, use full validation
+                    if self.check_glystatic_completion(glycan_name):
+                        logger.info(f"Glystatic processing already complete for {glycan_name}, skipping")
+                        return True
                 
             logger.info(f"Running glystatic for {glycan_name}")
             

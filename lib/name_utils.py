@@ -482,7 +482,7 @@ def glytoucan2motif(glytoucan_id):
     Returns:
         dict: Motif data or None if request fails
     """
-    url = f"https://api.alpha.glycosmos.org/sparqlist/get_glycan_motif?id={glytoucan_id}"
+    url = f"https://api.glycosmos.org/sparqlist/get_glycan_motif?id={glytoucan_id}"
     
     try:
         response = requests.get(url)

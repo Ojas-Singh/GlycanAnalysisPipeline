@@ -44,7 +44,7 @@ Before running the pipeline, ensure the following environment variables are set 
 ```bash
 export GLYCOSHAPE_DATA_DIR=/path/to/glycoshape/data
 export GLYCOSHAPE_PROCESS_DIR=/path/to/glycoshape/process_dir
-export GLYCOSHAPE_OUTPUT_PATH=/path/to/glycoshape/final_database
+export GLYCOSHAPE_OUTPUT_DIR=/path/to/glycoshape/final_database
 export GLYCOSHAPE_INVENTORY_PATH=/path/to/glycoshape/inventory
 export GLYCOSHAPE_DB_UPDATE=True
 export GLYTOUCAN_CONTRIBUTOR_ID=your_contributor_id
@@ -71,7 +71,7 @@ Run using install.sh as it will save log in last_run.log
 ```bash
 
 # Set or override the RDF folder (defaults to GLYCOSHAPE_OUTPUT_PATH/GLYCOSHAPE_RDF)
-export GLYCOSHAPE_RDF_DIR="${GLYCOSHAPE_RDF_DIR:-${GLYCOSHAPE_OUTPUT_PATH}/GLYCOSHAPE_RDF}"
+export GLYCOSHAPE_RDF_DIR="${GLYCOSHAPE_RDF_DIR:-${GLYCOSHAPE_OUTPUT_DIR}/GLYCOSHAPE_RDF}"
 
 # Load and serve the RDF dataset
 oxigraph load --location "$GLYCOSHAPE_RDF_DIR" --file "$GLYCOSHAPE_OUTPUT_PATH/GLYCOSHAPE_RDF.ttl"

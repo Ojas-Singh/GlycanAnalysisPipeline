@@ -105,7 +105,7 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
         return pca_path
 
     logger.info("Computing conformation landscape (may be memory intensive)")
-    landscape = get_conformation_landscape(frame_data_dir, method="noH_fast", sample_size=200, seed=0)
+    landscape = get_conformation_landscape(frame_data_dir, method="noH_fast", sample_size=100, seed=0)
     logger.info("Running PCA on conformation landscape")
     pca_df = pca_conformation_landscape(landscape, n_components=10, scale=True)
     pca_df.write_parquet(pca_path)
