@@ -7,6 +7,7 @@ from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 import numpy as np
+import re
 
 from glycowork.motif.processing import canonicalize_iupac
 from glycowork.motif.tokenization import glycan_to_composition
@@ -79,6 +80,84 @@ def get_glycan_metadata_from_inventory(glycam_name: str) -> dict:
         raise
 
 
+def _emit_multimodel_pdbs(dest_level_dir: Path, cluster_data: dict, level_name: str) -> None:
+    """Create multi-model PDBs by concatenating per-cluster PDBs.
+
+    This scans the converted output directories under dest_level_dir, groups
+    PDBs by anomer and format, and writes a single multi-model PDB per group
+    using MODEL/ENDMDL blocks. Files are ordered by cluster_id found in
+    filenames (cluster_<id>_...).
+
+    Args:
+        dest_level_dir: Destination level directory under output (e.g., .../output/level_2)
+        cluster_data: Parsed cluster info dict from info.json for annotating REMARKs
+        level_name: Name of the level (e.g., "level_2") used in output filenames
+    """
+    # Build a map of cluster_id -> population for REMARKs if available
+    cluster_pop: dict[str, float] = {}
+    try:
+        if cluster_data and "levels" in cluster_data and level_name in cluster_data["levels"]:
+            for c in cluster_data["levels"][level_name].get("clusters", []):
+                cid = str(c.get("cluster_id"))
+                pct = c.get("cluster_size_pct")
+                if cid is not None and pct is not None:
+                    try:
+                        cluster_pop[cid] = round(float(pct), 4)
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.debug(f"Could not map cluster populations for {level_name}: {e}")
+
+    def _cluster_id_from_name(p: Path) -> int:
+        """Extract numeric cluster id from a filename; default large to push unknowns last."""
+        m = re.search(r"cluster_(\d+)", p.stem)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 10**9
+        return 10**9
+
+    def _write_multimodel(out_path: Path, files: list[Path], anomer: str) -> None:
+        if not files:
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Writing multi-model PDB: {out_path}")
+        with open(out_path, "w", newline="\n") as out_f:
+            out_f.write(f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}\n")
+            for i, fpath in enumerate(files, start=1):
+                cid_match = re.search(r"cluster_(\d+)", fpath.stem)
+                cid = cid_match.group(1) if cid_match else None
+                pop = cluster_pop.get(str(cid)) if cid else None
+                out_f.write(f"MODEL     {i:4d}\n")
+                if cid is not None:
+                    out_f.write(f"REMARK   CLUSTER_ID {cid}\n")
+                if pop is not None:
+                    out_f.write(f"REMARK   CLUSTER_POPULATION_PCT {pop}\n")
+                # Include atom records; strip headers and any existing MODEL/ENDMDL/END
+                try:
+                    with open(fpath, "r") as in_f:
+                        for line in in_f:
+                            if line.startswith(("ATOM", "HETATM", "ANISOU", "TER")):
+                                out_f.write(line.rstrip("\n") + "\n")
+                except Exception as e:
+                    logger.warning(f"Skipping {fpath} while building multi-model: {e}")
+                out_f.write("ENDMDL\n")
+            out_f.write("END\n")
+
+    # For each format/anomer pair, create a combined file
+    for fmt in ["GLYCAM", "PDB"]:
+        for anomer in ["alpha", "beta"]:
+            src_dir = dest_level_dir / fmt / anomer
+            if not src_dir.exists():
+                continue
+            files = sorted([p for p in src_dir.glob("*.pdb")], key=_cluster_id_from_name)
+            if not files:
+                continue
+            out_path = dest_level_dir / fmt / f"{anomer}.pdb"
+            _write_multimodel(out_path, files, anomer)
+
+
 def generate_glycan_id(glycam_name: str) -> str:
     """Generate a simple ID from glycam name as fallback."""
     # Simple ID generation - you can make this more sophisticated if needed
@@ -103,7 +182,8 @@ def extract_cluster_data(info_data: dict, folder_path: Path) -> dict:
     cluster_data = {
         "entropy_nats": info_data.get("entropy_nats"),
         "torsions": info_data.get("torsions", {}),
-        "levels": {}
+        "levels": {},
+        "pca": info_data.get("pca", {})
     }
     
     # Process each level
@@ -296,6 +376,13 @@ def copy_and_convert_pdbs(
                         if temp_file.exists():
                             temp_file.unlink()
 
+        # After converting individual files, optionally emit multi-model PDBs for level_2
+        try:
+            if level_name == "level_2":
+                _emit_multimodel_pdbs(dest_level_dir, cluster_data, level_name)
+        except Exception as e:
+            logger.warning(f"Failed to build multi-model PDBs for {level_name}: {e}")
+
 
 def make_serializable(obj):
     """Recursively convert numpy types to native Python types for JSON serialization."""
@@ -464,22 +551,42 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
             except Exception as e:
                 logger.warning(f"Could not calculate molecular weight: {e}")
         
-        # Extract level 2 cluster data for simplified structure
-        level_2_clusters = {}
-        level_3_coverage_clusters = {}
+        # Extract level 1 (main) and level 2 (coverage) cluster data
+        level_1_main_clusters = {}
+        level_2_coverage_clusters = {}
+        
+        # Extract PCA clustering metadata (silhouette scores, coverage mapping)
+        silhouette_scores = {}
+        coverage_clusters_per_main = {}
+        pca_variance = {}
+        
+        if "pca" in cluster_data:
+            pca_data = cluster_data["pca"]
+            if "main_clustering" in pca_data:
+                silhouette_scores = pca_data["main_clustering"].get("silhouette_scores", {})
+                coverage_clusters_per_main = pca_data["main_clustering"].get("coverage_clusters_per_main", {})
+            
+            # Extract PCA variance information
+            if "pca_analysis" in pca_data:
+                pca_analysis = pca_data["pca_analysis"]
+                pca_variance = {
+                    "explained_variance_ratio": pca_analysis.get("explained_variance_ratio", []),
+                    "cumulative_variance": pca_analysis.get("cumulative_variance", []),
+                    "n_components": pca_analysis.get("n_components", 10)
+                }
         
         if "levels" in cluster_data:
             for level_key, level_data in cluster_data["levels"].items():
-                if level_key == "level_2":  # We want level 2 for general clusters
+                if level_key == "level_1":  # Main clustering (5 clusters)
                     for cluster in level_data.get("clusters", []):
                         cluster_id = cluster["cluster_id"]
                         cluster_name = f"Cluster {cluster_id}"
-                        level_2_clusters[cluster_name] = round(cluster["cluster_size_pct"], 2)
-                elif level_key == "level_3":  # We want level 3 for coverage clusters
+                        level_1_main_clusters[cluster_name] = round(cluster["cluster_size_pct"], 2)
+                elif level_key == "level_2":  # Coverage clustering
                     for cluster in level_data.get("clusters", []):
                         cluster_id = cluster["cluster_id"]
                         cluster_name = f"Cluster {cluster_id}"
-                        level_3_coverage_clusters[cluster_name] = round(cluster["cluster_size_pct"], 4)
+                        level_2_coverage_clusters[cluster_name] = round(cluster["cluster_size_pct"], 4)
         
         # Build glycan data structure
         glycan_data = {
@@ -508,8 +615,11 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 
                 # cluster analysis data 
                 "entropy": cluster_data.get("entropy_nats"),
-                "clusters": level_2_clusters,
-                "coverage_clusters": level_3_coverage_clusters,
+                "clusters": level_1_main_clusters,
+                "coverage_clusters": level_2_coverage_clusters,
+                "silhouette_scores": silhouette_scores,
+                "coverage_clusters_per_main": coverage_clusters_per_main,
+                "pca_variance": pca_variance,
                 
                 # Molecular Dynamics info from inventory
                 "length": length,

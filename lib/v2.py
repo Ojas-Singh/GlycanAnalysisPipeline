@@ -77,6 +77,51 @@ def _read_parquet_robust(path: str):
             return pl.read_parquet(path)
 
 
+def _update_pca_json(embedding_dir: str, updates: Dict) -> None:
+    """Merge/update a pca.json file in the embedding_dir with the provided updates."""
+    try:
+        p = os.path.join(embedding_dir, "pca.json")
+        base = {}
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as fh:
+                base = json.load(fh) or {}
+        # deep merge: preserve nested mappings and lists where reasonable
+        def _deep_merge(a: dict, b: dict) -> dict:
+            """Return a new dict that's a deep merge of a and b (b overrides a).
+
+            - dict values are merged recursively
+            - list values: if both are lists, we try to merge unique items, else b replaces
+            - scalar values: b overrides
+            """
+            out = dict(a)
+            for k, v in b.items():
+                if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+                    out[k] = _deep_merge(out[k], v)
+                elif k in out and isinstance(out[k], list) and isinstance(v, list):
+                    # merge lists preserving order and uniqueness for simple scalars
+                    try:
+                        seen = set()
+                        merged = []
+                        for item in out[k] + v:
+                            key = item if not isinstance(item, dict) else json.dumps(item, sort_keys=True)
+                            if key not in seen:
+                                seen.add(key)
+                                merged.append(item)
+                        out[k] = merged
+                    except Exception:
+                        out[k] = v
+                else:
+                    out[k] = v
+            return out
+
+        base = _deep_merge(base, updates)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(base, fh, indent=2)
+        logger.info(f"Updated {p} with keys: {list(updates.keys())}")
+    except Exception as exc:
+        logger.warning(f"Failed to update pca.json: {exc}")
+
+
 def step_store(name: str, frame_data_dir: str, pdb_path: str, mol2_path: str, force: bool = False) -> None:
     """Run store_from_pdb unless frame_data_dir already contains data and force==False."""
     out_p = Path(frame_data_dir)
@@ -107,16 +152,86 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
     logger.info("Computing conformation landscape (may be memory intensive)")
     landscape = get_conformation_landscape(frame_data_dir, method="noH_fast", sample_size=100, seed=0)
     logger.info("Running PCA on conformation landscape")
-    pca_df = pca_conformation_landscape(landscape, n_components=10, scale=True)
+    # pass through per_pair_scale and keep scale=True as before
+    pca_df = pca_conformation_landscape(landscape, n_components=10, scale=True, per_pair_scale=per_pair_scale)
     pca_df.write_parquet(pca_path)
     logger.info(f"Wrote PCA parquet: {pca_path}")
+
+    # Save explained variance ratios to pca.json (robust extraction)
+    try:
+        evr_list = []
+        try:
+            # Polars Series -> list of entries (each entry is the evr array)
+            evr_candidate = pca_df["explained_variance_ratio"].to_list()[0] if pca_df.height > 0 else []
+        except Exception:
+            # Fallback indexing
+            try:
+                evr_candidate = pca_df["explained_variance_ratio"][0]
+            except Exception:
+                evr_candidate = []
+
+        # Normalize candidate to a plain Python list of floats
+        if isinstance(evr_candidate, (list, tuple, np.ndarray)):
+            evr_list = [float(x) for x in evr_candidate]
+        elif isinstance(evr_candidate, str):
+            try:
+                evr_parsed = json.loads(evr_candidate)
+                if isinstance(evr_parsed, (list, tuple)):
+                    evr_list = [float(x) for x in evr_parsed]
+            except Exception:
+                evr_list = []
+        else:
+            # last resort: recompute explained variance from the landscape with same preprocessing
+            try:
+                from lib.embedding import _pca_svd
+
+                X = np.asarray(landscape, dtype=float)
+                if X.ndim == 2 and X.shape[0] > 0:
+                    X_proc = X.copy()
+                    if per_pair_scale:
+                        pair_std = X_proc.std(axis=0, ddof=1)
+                        pair_std[pair_std == 0] = 1.0
+                        X_proc = X_proc / pair_std[np.newaxis, :]
+                    # center and scale to match call above
+                    X_proc = X_proc - X_proc.mean(axis=0, keepdims=True)
+                    std = X_proc.std(axis=0, ddof=1, keepdims=True)
+                    std[std == 0] = 1.0
+                    X_proc = X_proc / std
+                    _, evr = _pca_svd(X_proc, 10)
+                    evr_list = [float(x) for x in (evr.tolist() if hasattr(evr, 'tolist') else evr)]
+            except Exception:
+                evr_list = []
+
+        # Ensure numeric types and compute cumulative
+        evr_list = [float(x) for x in evr_list] if evr_list else []
+        cumulative = [float(sum(evr_list[: i + 1])) for i in range(len(evr_list))]
+
+        _update_pca_json(
+            embedding_dir,
+            {
+                "pca_analysis": {
+                    "explained_variance_ratio": evr_list,
+                    "cumulative_variance": cumulative,
+                    "n_components": 10,
+                    "params": {
+                        "scale": True,
+                        "per_pair_scale": per_pair_scale,
+                    },
+                }
+            },
+        )
+    except Exception as exc:
+        logger.warning(f"Could not extract/save PCA variance info: {exc}")
+
     return pca_path
 
 
 def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) -> float:
-    """Run GMM clustering with level-specific constraints.
-    
-    Returns the conformational entropy H (nats).
+    """Run two-level clustering:
+       - main: H_nats-guided target (1–8) with local silhouette refinement; save silhouettes to pca.json
+       - coverage: linear H_nats -> [10..128] via k-center.
+       
+       Returns the conformational entropy H (nats).
     """
     pca_df = _read_parquet_robust(pca_path)
     selected_cols = [f"PC{i}" for i in range(1, 4)]
@@ -128,48 +243,105 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
 
     cluster_out_json = os.path.join(embedding_dir, "clustering_results.json")
     if os.path.exists(cluster_out_json) and not force:
-        logger.info("GMM Clustering step: outputs exist; skipping")
+        logger.info("Clustering step: outputs exist; skipping")
+        # Still update pca.json with current H if not present
+        _update_pca_json(embedding_dir, {"main_clustering": {"H_nats": H}})
         return H
 
-    # Load glycosidic info and torsion data
-    glycosidic_path = os.path.join(embedding_dir, "glycosidic_info.json")
-    torsion_csv = os.path.join(embedding_dir, "torsions.csv")
-    
-    with open(glycosidic_path, 'r') as f:
-        glycosidic_info = json.load(f)
-    
-    torsion_df = _read_csv_robust(torsion_csv)
-    
     # Extract PCA data
     pca_data = pca_df.select(selected_cols).to_numpy()
+
+    # MAIN: Fixed 5 clusters, but compute silhouette scores for n=2..8 for diagnostics
+    n_main = 5
     
-    # Level 1: Single cluster (entire dataset)
-    labels_level1 = np.zeros(len(pca_data), dtype=int)
+    # Compute silhouette scores for n in [2..8]
+    silhouette_scores: Dict[str, Optional[float]] = {}
+    try:
+        from sklearn.mixture import GaussianMixture
+        from sklearn.metrics import silhouette_score as _silhouette_score
+        
+        for n in range(2, 9):
+            try:
+                gmm = GaussianMixture(n_components=n, random_state=42)
+                labels_n = gmm.fit_predict(pca_data)
+                if len(np.unique(labels_n)) > 1:
+                    score = float(_silhouette_score(pca_data, labels_n))
+                    silhouette_scores[str(n)] = score
+                else:
+                    silhouette_scores[str(n)] = None
+            except Exception:
+                silhouette_scores[str(n)] = None
+        
+        # Fit main clustering with 5 clusters
+        gmm_main = GaussianMixture(n_components=n_main, random_state=42)
+        labels_main = gmm_main.fit_predict(pca_data)
 
-    # Level 2: GMM with silhouette optimization (3-10 clusters)
-    labels_level2, n_clusters_level2 = gmm_optimize_silhouette(pca_data, range_clusters=(3, 10))
+    except Exception as exc:
+        logger.warning(f"sklearn unavailable or failed ({exc}); defaulting main clustering via single cluster")
+        silhouette_scores = {}
+        n_main = 1
+        labels_main = np.zeros(len(pca_data), dtype=int)
 
-    # Level 3: K-center coverage clustering (≤128 representatives)
-    labels_level3, n_clusters_level3 = kcenter_coverage_clustering(
+    # COVERAGE: linear map H in [10,20] -> clusters in [10,128]
+    if H <= 10:
+        n_cov_target = 10
+    elif H >= 20:
+        n_cov_target = 128
+    else:
+        n_cov_target = int(round(10 + (H - 10.0) / 10.0 * (128 - 10)))
+
+    labels_cov, n_clusters_cov = kcenter_coverage_clustering(
         pca_data,
-        max_clusters=128,
+        max_clusters=n_cov_target,
         coverage_threshold=0.95,
         min_coverage_improvement=0.01
     )
-    
+
     # Format results and save
     all_levels = {
-        1: create_cluster_info_fast_big(labels_level1, pca_df, 1),
-        2: create_cluster_info_fast_big(labels_level2, pca_df, n_clusters_level2),
-        3: create_cluster_info_fast(labels_level3, pca_df, n_clusters_level3)
+        1: create_cluster_info_fast(labels_main, pca_df, 1 if n_main == 1 else n_main),
+        2: create_cluster_info_fast(labels_cov, pca_df, n_clusters_cov),
     }
-    
+
     save_clustering_results(all_levels, output_path=cluster_out_json)
     save_clustering_results_parquet(all_levels, output_dir=embedding_dir)
+
+    # Map coverage clusters to main clusters
+    # For each coverage cluster, find which main cluster it belongs to (by majority vote of its members)
+    main_to_coverage_map: Dict[int, List[int]] = {i: [] for i in range(n_main)}
     
+    try:
+        for cov_cluster_id in range(n_clusters_cov):
+            # Get frames in this coverage cluster
+            cov_frames_mask = labels_cov == cov_cluster_id
+            cov_frames_main_labels = labels_main[cov_frames_mask]
+            
+            # Find the most common main cluster label
+            if len(cov_frames_main_labels) > 0:
+                unique, counts = np.unique(cov_frames_main_labels, return_counts=True)
+                majority_main_cluster = int(unique[np.argmax(counts)])
+                main_to_coverage_map[majority_main_cluster].append(int(cov_cluster_id))
+    except Exception as exc:
+        logger.warning(f"Failed to map coverage clusters to main clusters: {exc}")
+
+    # Update pca.json with main silhouettes and selections
+    _update_pca_json(
+        embedding_dir,
+        {
+            "main_clustering": {
+                "H_nats": H,
+                "silhouette_scores": silhouette_scores,
+                "selected_n_clusters": int(1 if n_main == 1 else n_main),
+                "coverage_clusters_per_main": {str(k): v for k, v in main_to_coverage_map.items()},
+            },
+            "coverage_clustering": {
+                "selected_n_clusters": int(n_clusters_cov),
+            },
+        },
+    )
+
     logger.info(f"Saved clustering results to {cluster_out_json} and parquet in {embedding_dir}")
-    logger.info(f"Level 1: {1} cluster, Level 2: {n_clusters_level2} clusters, Level 3: {n_clusters_level3} clusters (k-center)")
-    
+    logger.info(f"Main clusters: {1 if n_main == 1 else n_main}; Coverage clusters: {n_clusters_cov}")
     # Quick read-back and simple diagnostics
     cr = load_clustering_results_parquet(embedding_dir)
     logger.info(f"Cluster reader levels: {cr.levels()}")
@@ -311,19 +483,22 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     return torsion_list, labels
 
 
-def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, entropy: float, force: bool = False) -> None:
-    """Compute torsion stats per cluster and write info.json in embedding_dir.
+def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: bool = False) -> None:
+    """Compute torsion stats per cluster and write torsion_stats.json in embedding_dir.
 
     Expects torsions.csv (skip silently if missing) and clustering parquet outputs.
     Reads torsion names directly from CSV and performs glycosidic classification.
     """
-    info_path = os.path.join(embedding_dir, "info.json")
-    if os.path.exists(info_path) and not force:
-        logger.info("Info step: info.json exists; skipping (use --update to force)")
+    stats_path = os.path.join(embedding_dir, "torsion_stats.json")
+    if os.path.exists(stats_path) and not force:
+        logger.info("Torsion stats step: torsion_stats.json exists; skipping (use --update to force)")
         return
     torsion_csv = os.path.join(embedding_dir, "torsions.csv")
     if not os.path.exists(torsion_csv):
         logger.warning("torsions.csv not found; skipping cluster torsion stats")
+        # Create an empty file to mark step as complete
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump({'levels': [], 'torsions': {}}, f)
         return
     
     # Load torsions table and extract column names
@@ -497,26 +672,23 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, entropy:
             'clusters': clusters_out,
             'average_entropy_nats': None if avg_entropy is None else float(avg_entropy),
         })
-    
-    # Assemble JSON
-    info = {
-        'entropy_nats': float(entropy),
+
+    # Assemble JSON for torsion stats
+    torsion_stats_data = {
         'torsions': {
-            'labels': torsion_labels,  # Original atom-based names (used in CSV headers)
+            'labels': torsion_labels,
             'count': len(torsion_labels),
-            'name_mapping': name_mapping,  # Mapping from original to glycosidic names
+            'name_mapping': name_mapping,
             'glycosidic': glycosidic_torsions,
             'other': other_torsions,
             'glycosidic_summary': glycosidic_info.get('summary', {})
         },
         'levels': levels_summary,
-        'schema_version': 1,
     }
-    import json
-    with open(info_path, 'w', encoding='utf-8') as f:
-        json.dump(info, f, indent=2)
-    logger.info(f"Wrote cluster torsion stats to {info_path}")
-    logger.info(f"Found {len(glycosidic_torsions)} glycosidic torsions and {len(other_torsions)} other torsions")
+
+    with open(stats_path, 'w', encoding='utf-8') as f:
+        json.dump(torsion_stats_data, f, indent=2)
+    logger.info(f"Wrote cluster torsion stats to {stats_path}")
 
     # Update embedding/metadata.json with average entropy per level
     try:
@@ -529,12 +701,57 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, entropy:
             except Exception:
                 meta = {}
         # add or replace mapping
-        meta['level_average_entropy'] = {str(k): (None if v is None else float(v)) for k, v in level_entropy_map.items()} if 'level_entropy_map' in locals() or 'level_entropy_map' in globals() else {}
+        meta['level_average_entropy'] = {str(k): (None if v is None else float(v)) for k, v in level_entropy_map.items()}
         with open(meta_path, 'w', encoding='utf-8') as mf:
             json.dump(meta, mf, indent=2)
         logger.info(f"Updated metadata.json with level average entropies at {meta_path}")
     except Exception as exc:
         logger.warning(f"Failed to update metadata.json with entropy info: {exc}")
+
+
+def step_create_info_json(embedding_dir: str, entropy: float, force: bool = False) -> None:
+    """Create info.json by consolidating data from pca.json and torsion_stats.json."""
+    info_path = os.path.join(embedding_dir, "info.json")
+    if os.path.exists(info_path) and not force:
+        logger.info("Create info.json step: info.json exists; skipping (use --update to force)")
+        return
+
+    # Load pca.json data
+    pca_json_data = {}
+    pca_json_path = os.path.join(embedding_dir, 'pca.json')
+    if os.path.exists(pca_json_path):
+        try:
+            with open(pca_json_path, 'r', encoding='utf-8') as pf:
+                pca_json_data = json.load(pf)
+            logger.info(f"Loaded pca.json data for info.json")
+        except Exception as exc:
+            logger.warning(f"Failed to load pca.json for info.json: {exc}")
+
+    # Load torsion_stats.json data
+    torsion_stats_data = {}
+    torsion_stats_path = os.path.join(embedding_dir, 'torsion_stats.json')
+    if os.path.exists(torsion_stats_path):
+        try:
+            with open(torsion_stats_path, 'r', encoding='utf-8') as tsf:
+                torsion_stats_data = json.load(tsf)
+            logger.info(f"Loaded torsion_stats.json data for info.json")
+        except Exception as exc:
+            logger.warning(f"Failed to load torsion_stats.json: {exc}")
+
+    # Assemble final info.json
+    info = {
+        'entropy_nats': float(entropy),
+        'torsions': torsion_stats_data.get('torsions', {}),
+        'levels': torsion_stats_data.get('levels', []),
+        'pca': pca_json_data,
+        'schema_version': 2, # Incremented version
+    }
+
+    with open(info_path, 'w', encoding='utf-8') as f:
+        json.dump(info, f, indent=2)
+    logger.info(f"Wrote consolidated data to {info_path}")
+
+
 
 
 def step_save_representative_structures(
@@ -762,8 +979,10 @@ def step_export_analysis_data(
     files_created = 0
     files_skipped = 0
     
-    # 1. Export PCA data with first 3 components
+    # 1. Export PCA data with first 3 components and cluster assignments
     pca_source_path = os.path.join(embedding_dir, "pca_conformation_landscape.parquet")
+    clustering_results_path = os.path.join(embedding_dir, "clustering_results.json")
+    
     if os.path.exists(pca_source_path):
         if os.path.exists(pca_out_path) and not force:
             logger.info("pca.csv exists; skipping (use --update to force)")
@@ -772,11 +991,29 @@ def step_export_analysis_data(
             try:
                 pca_df = _read_parquet_robust(pca_source_path)
                 # Select only first 3 PCA components
-                pca_cols = ["PC1", "PC2", "PC3"]
+                pca_cols = ["frame", "PC1", "PC2", "PC3"]
                 available_cols = [col for col in pca_cols if col in pca_df.columns]
                 
                 if available_cols:
                     pca_export_df = pca_df.select(available_cols)
+                    
+                    # Add cluster column from main clustering (level 1)
+                    try:
+                        cr = load_clustering_results_parquet(embedding_dir)
+                        # Get cluster assignments for all frames from level 1 (main clustering)
+                        frame_to_cluster = {}
+                        for cluster_id in cr.clusters(1):
+                            members = cr.members(1, int(cluster_id))
+                            for frame in members:
+                                frame_to_cluster[int(frame)] = int(cluster_id)
+                        
+                        # Add cluster column to pca_export_df
+                        cluster_column = [frame_to_cluster.get(f, -1) for f in pca_export_df['frame'].to_list()]
+                        pca_export_df = pca_export_df.with_columns(pl.Series("cluster", cluster_column))
+                        logger.info(f"Added cluster assignments to PCA export")
+                    except Exception as exc:
+                        logger.warning(f"Could not add cluster column to PCA export: {exc}")
+                    
                     pca_export_df.write_csv(pca_out_path)
                     logger.info(f"Exported PCA data with {len(available_cols)} components to {pca_out_path}")
                     files_created += 1
@@ -807,6 +1044,29 @@ def step_export_analysis_data(
                     # Map original_name -> glycosidic_name (fallback to name_mapping)
                     name_mapping = info_data.get('torsions', {}).get('name_mapping', {})
 
+                    # Get cluster information from clustering results
+                    frame_to_cluster = {}
+                    cluster_representatives = {}  # cluster_id -> representative_frame
+                    try:
+                        cr = load_clustering_results_parquet(embedding_dir)
+                        # Get cluster assignments for all frames from level 1 (main clustering)
+                        for cluster_id in cr.clusters(1):
+                            members = cr.members(1, int(cluster_id))
+                            for frame in members:
+                                frame_to_cluster[int(frame)] = int(cluster_id)
+                        
+                        # Get representative frames for each cluster
+                        reps_df = cr.representatives(1)
+                        for row in reps_df.iter_rows(named=True):
+                            cid = int(row['cluster_id'])
+                            rep_idx = row.get('representative_idx')
+                            if rep_idx is not None:
+                                cluster_representatives[cid] = int(rep_idx)
+                        
+                        logger.info(f"Loaded cluster information: {len(frame_to_cluster)} frames, {len(cluster_representatives)} representatives")
+                    except Exception as exc:
+                        logger.warning(f"Could not load cluster information for torsion export: {exc}")
+
                     # Instead of loading the entire CSV with Polars (which can fail
                     # on very wide files or cause memory/parse issues), stream the
                     # CSV: read the header, find column indices, then write a new
@@ -827,6 +1087,9 @@ def step_export_analysis_data(
                             if original_name in col_to_idx:
                                 selected_indices.append(col_to_idx[original_name])
                                 out_header.append(gly_name)
+                        
+                        # Add cluster and center columns to header
+                        out_header.extend(['cluster', 'center'])
 
                         if selected_indices:
                             # Stream rows and write selected columns to output CSV
@@ -835,10 +1098,20 @@ def step_export_analysis_data(
                                 writer.writerow(out_header)
                                 for row in reader:
                                     # frame is always first column (index 0)
+                                    frame_num = int(row[0])
                                     out_row = [row[0]] + [row[idx] for idx in selected_indices]
+                                    
+                                    # Add cluster assignment
+                                    cluster_id = frame_to_cluster.get(frame_num, -1)
+                                    out_row.append(str(cluster_id))
+                                    
+                                    # Add center column: cluster_id if this frame is a representative, empty otherwise
+                                    is_representative = cluster_id in cluster_representatives and cluster_representatives[cluster_id] == frame_num
+                                    out_row.append(str(cluster_id) if is_representative else '')
+                                    
                                     writer.writerow(out_row)
 
-                            logger.info(f"Exported {len(selected_indices)} glycosidic torsions with glycosidic names to {torsion_glycosidic_out_path}")
+                            logger.info(f"Exported {len(selected_indices)} glycosidic torsions with cluster info to {torsion_glycosidic_out_path}")
                             files_created += 1
                         else:
                             logger.warning("No glycosidic torsions found to export (none present in CSV header)")
@@ -1054,25 +1327,38 @@ class GlycanAnalysisPipeline:
                 return results
 
             # Step 5: Cluster torsion statistics
-            # Step 5: Cluster torsion statistics
             try:
-                self.logger.info("Step 5: Cluster torsion statistics")
+                self.logger.info("Step 5: Torsion statistics")
                 step_cluster_torsion_stats(
                     paths['frame_data_dir'], 
+                    paths['embedding_dir'], 
+                    force=force_update
+                )
+                results['steps_completed'].append('torsion_stats')
+            except Exception as e:
+                self.logger.error(f"Torsion stats step failed: {str(e)}")
+                results['steps_failed'].append('torsion_stats')
+                results['error_message'] = f"Torsion stats step failed: {str(e)}"
+                return results
+
+            # Step 6: Create info.json
+            try:
+                self.logger.info("Step 6: Creating info.json")
+                step_create_info_json(
                     paths['embedding_dir'], 
                     entropy, 
                     force=force_update
                 )
-                results['steps_completed'].append('cluster_stats')
+                results['steps_completed'].append('create_info')
             except Exception as e:
-                self.logger.error(f"Cluster stats step failed: {str(e)}")
-                results['steps_failed'].append('cluster_stats')
-                results['error_message'] = f"Cluster stats step failed: {str(e)}"
+                self.logger.error(f"Info.json creation step failed: {str(e)}")
+                results['steps_failed'].append('create_info')
+                results['error_message'] = f"Info.json creation step failed: {str(e)}"
                 return results
 
-            # Step 6: Save representative structures
+            # Step 7: Save representative structures
             try:
-                self.logger.info("Step 6: Saving representative structures")
+                self.logger.info("Step 7: Saving representative structures")
                 step_save_representative_structures(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
@@ -1087,9 +1373,9 @@ class GlycanAnalysisPipeline:
                 results['error_message'] = f"Structure saving step failed: {str(e)}"
                 return results
 
-            # Step 7: Create torsion distribution plots
+            # Step 8: Create torsion distribution plots
             try:
-                self.logger.info("Step 7: Creating distribution plots")
+                self.logger.info("Step 8: Creating distribution plots")
                 step_plot_torsion_distributions(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
@@ -1102,9 +1388,9 @@ class GlycanAnalysisPipeline:
                 results['error_message'] = f"Plotting step failed: {str(e)}"
                 return results
 
-            # Step 8: Export analysis data
+            # Step 9: Export analysis data
             try:
-                self.logger.info("Step 8: Exporting analysis data")
+                self.logger.info("Step 9: Exporting analysis data")
                 step_export_analysis_data(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
@@ -1116,6 +1402,7 @@ class GlycanAnalysisPipeline:
                 results['steps_failed'].append('export')
                 results['error_message'] = f"Export step failed: {str(e)}"
                 return results
+
 
             # All steps completed successfully
             results['success'] = True
