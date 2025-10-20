@@ -5,6 +5,57 @@ from typing import Union, Optional
 # Base path where the script is located
 base_dir = Path(__file__).resolve().parent.parent
 
+# Attempt to load a .env file from the project root so environment variables
+# defined there are available to the rest of this module. Prefer using
+# python-dotenv if it's installed; otherwise fall back to a tiny parser.
+def _load_dotenv_file(dotenv_path: Path) -> bool:
+    """
+    Load environment variables from a .env file.
+
+    Returns True if a file was found and processed, False otherwise.
+    """
+    try:
+        # Try using python-dotenv if available
+        from dotenv import load_dotenv  # type: ignore
+
+        load_dotenv(dotenv_path=str(dotenv_path))
+        return True
+    except Exception:
+        # Fallback: parse simple KEY=VALUE lines
+        if not dotenv_path.exists():
+            return False
+
+        try:
+            for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # handle optional leading export
+                if line.lower().startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # remove surrounding quotes if present
+                if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                    val = val[1:-1]
+                # Only set if not already set in the environment
+                os.environ.setdefault(key, val)
+            return True
+        except Exception:
+            return False
+
+
+# Look for a .env file at the repository root (base_dir)
+try:
+    dotenv_file = base_dir / ".env"
+    _load_dotenv_file(dotenv_file)
+except Exception:
+    # Non-fatal: if loading .env fails, continue with existing environment
+    pass
+
 # Storage configuration
 # Oracle Cloud Object Storage PAR URL (optional - if provided, uses cloud storage)
 oracle_par_url = os.environ.get("GLYCOSHAPE_ORACLE_PAR_URL")

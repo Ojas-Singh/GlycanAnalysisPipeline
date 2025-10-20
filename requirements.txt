@@ -17,3 +17,4 @@ oxigraph==0.4.11
 polars==1.33.1
 zarr==2.18.3 
 requests>=2.31.0 
+python-dotenv>=1.0.0
