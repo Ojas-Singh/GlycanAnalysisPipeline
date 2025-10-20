@@ -4,6 +4,7 @@ import os
 import io
 import re
 from typing import Optional
+from lib.storage import get_storage_manager
 
 
 import numpy as np
@@ -493,7 +494,8 @@ def write_pdb_for_frame(
     resid = atoms["res_id"].to_numpy()
     elem = atoms["element"].to_list()
 
-    with open(path, "w", newline="\n") as fh:
+    storage = get_storage_manager()
+    with storage.open(path, "w") as fh:
         if title:
             fh.write(f"TITLE     {title}\n")
         fh.write(f"MODEL     {frame_idx+1}\n")
@@ -678,67 +680,12 @@ def convert_pdb(input_pdb_path: str, output_pdb_path: str, naming_format: str) -
         raise FileNotFoundError(f"Input PDB file not found: {input_pdb_path}")
     
     # Read the input PDB file
-    with open(input_pdb_path, 'r') as file:
+    storage = get_storage_manager()
+    with storage.open(input_pdb_path, 'r') as file:
         filedata = file.read()
-    
-    # Apply naming format conversions based on the logic from pdb.py convert_pdbs function
-    if naming_format == 'PDB':
-        # Convert GLYCAM to PDB naming
-        filedata = re.sub(r"\s\wYA", " NDG", filedata)  # GlcNAc alpha
-        filedata = re.sub(r"\s\wYB", " NAG", filedata)  # GlcNAc beta
-        filedata = re.sub(r"\s\wVA", " A2G", filedata)  # GalNAc alpha
-        filedata = re.sub(r"\s\wVB", " NGA", filedata)  # GalNAc beta
-        filedata = re.sub(r"\s\wGA", " GLC", filedata)  # Glc alpha
-        filedata = re.sub(r"\s\wGB", " BGC", filedata)  # Glc beta
-        filedata = re.sub(r"\s\wGL", " NGC", filedata)  # Neu5Gc alpha
-        filedata = re.sub(r"\s\wLA", " GLA", filedata)  # Gal alpha
-        filedata = re.sub(r"\s\wLB", " GAL", filedata)  # Gal beta
-        filedata = re.sub(r"\s\wfA", " FUC", filedata)  # L-Fuc alpha
-        filedata = re.sub(r"\s\wfB", " FUL", filedata)  # L-Fuc beta
-        filedata = re.sub(r"\s\wMB", " BMA", filedata)  # Man beta
-        filedata = re.sub(r"\s\wMA", " MAN", filedata)  # Man alpha
-        filedata = re.sub(r"\s\wSA", " SIA", filedata)  # Neu5Ac alpha
-        filedata = re.sub(r"\s\wSA", " SLB", filedata)  # Neu5Ac beta
-        filedata = re.sub(r"\s\wZA", " GCU", filedata)  # GlcA alpha
-        filedata = re.sub(r"\s\wZB", " BDP", filedata)  # GlcA beta
-        filedata = re.sub(r"\s\wXA", " XYS", filedata)  # Xyl alpha
-        filedata = re.sub(r"\s\wXB", " XYP", filedata)  # Xyl beta
-        filedata = re.sub(r"\s\wuA", " IDR", filedata)  # IdoA alpha
-        filedata = re.sub(r"\s\whA", " RAM", filedata)  # Rha alpha
-        filedata = re.sub(r"\s\whB", " RHM", filedata)  # Rha beta
-        filedata = re.sub(r"\s\wRA", " RIB", filedata)  # Rib alpha
-        filedata = re.sub(r"\s\wRB", " BDR", filedata)  # Rib beta
-        filedata = re.sub(r"\s\wAA", " ARA", filedata)  # Ara alpha
-        filedata = re.sub(r"\s\wAB", " ARB", filedata)  # Ara beta
-        
-    elif naming_format == 'CHARMM':
-        # Convert GLYCAM to CHARMM naming
-        filedata = re.sub(r"\s\wYA ", " AGLC", filedata)  # GlcNAc alpha
-        filedata = re.sub(r"\s\wYB ", " BGLC", filedata)  # GlcNAc beta
-        filedata = re.sub(r"\s\wVA ", " AGAL", filedata)  # GalNAc alpha
-        filedata = re.sub(r"\s\wVB ", " BGAL", filedata)  # GalNAc beta
-        filedata = re.sub(r"\s\wGA ", " AGLC", filedata)  # Glc alpha
-        filedata = re.sub(r"\s\wGB ", " BGLC", filedata)  # Glc beta
-        filedata = re.sub(r"\s\wLA ", " AGAL", filedata)  # Gal alpha
-        filedata = re.sub(r"\s\wLB ", " BGAL", filedata)  # Gal beta
-        filedata = re.sub(r"\s\wf[A|B]", " FUC", filedata)  # Fuc alpha and beta
-        filedata = re.sub(r"\s\wMA ", " AMAN", filedata)  # Man alpha
-        filedata = re.sub(r"\s\wMB ", " BMAN", filedata)  # Man beta
-        filedata = re.sub(r"\s\wSA ", " ANE5", filedata)  # Neu5Ac alpha
-        filedata = re.sub(r"\s\wGL ", " ANE5", filedata)  # Neu5Gc
-        filedata = re.sub(r"\s\wXA ", " AXYL", filedata)  # Xyl alpha
-        filedata = re.sub(r"\s\wXB ", " BXYL", filedata)  # Xyl beta
-        filedata = re.sub(r"\s\wuA ", " AIDO", filedata)  # IdoA alpha
-        filedata = re.sub(r"\s\wZA ", " AGLC", filedata)  # GlcA alpha
-        filedata = re.sub(r"\s\wZB ", " BGLC", filedata)  # GlcA beta
-        filedata = re.sub(r"\s\whA ", " ARHM", filedata)  # Rha alpha
-        filedata = re.sub(r"\s\whB ", " BRHM", filedata)  # Rha beta
-        filedata = re.sub(r"\s\wAA ", " AARB", filedata)  # Ara alpha
-        filedata = re.sub(r"\s\wAB ", " BARB", filedata)  # Ara beta
-        filedata = re.sub(r"\s\wRA ", " ARIB", filedata)  # Rib alpha
-        filedata = re.sub(r"\s\wRB ", " BRIB", filedata)  # Rib beta
-    
-    # For GLYCAM format, no conversion needed as input is already GLYCAM
+
+    # Apply naming format conversions
+    filedata = _convert_pdb_text_naming(filedata, naming_format)
     
     # Write the converted data to a temporary file first
     import tempfile
@@ -779,7 +726,8 @@ def _add_pdb_remarks(
         cluster_id: Cluster ID for this structure (optional)
         cluster_population: Cluster population percentage (optional)
     """
-    with open(filename, 'r+') as f:
+    storage = get_storage_manager()
+    with storage.open(filename, 'r+') as f:
         content = f.read()
         f.seek(0, 0)
         f.write("REMARK     GENERATED BY GlycanAnalysisPipeline from GlycoShape     \n")
@@ -817,6 +765,192 @@ def _add_pdb_remarks(
         f.write(content)
         
         
+
+def _convert_pdb_text_naming(filedata: str, naming_format: str) -> str:
+    """Convert PDB residue naming in text for the specified target format.
+
+    Supported naming_format values: 'GLYCAM', 'PDB', 'CHARMM'.
+    GLYCAM returns input unchanged.
+    """
+    if naming_format == 'GLYCAM':
+        return filedata
+    if naming_format == 'PDB':
+        # Convert GLYCAM to PDB naming
+        filedata = re.sub(r"\s\wYA", " NDG", filedata)  # GlcNAc alpha
+        filedata = re.sub(r"\s\wYB", " NAG", filedata)  # GlcNAc beta
+        filedata = re.sub(r"\s\wVA", " A2G", filedata)  # GalNAc alpha
+        filedata = re.sub(r"\s\wVB", " NGA", filedata)  # GalNAc beta
+        filedata = re.sub(r"\s\wGA", " GLC", filedata)  # Glc alpha
+        filedata = re.sub(r"\s\wGB", " BGC", filedata)  # Glc beta
+        filedata = re.sub(r"\s\wGL", " NGC", filedata)  # Neu5Gc alpha
+        filedata = re.sub(r"\s\wLA", " GLA", filedata)  # Gal alpha
+        filedata = re.sub(r"\s\wLB", " GAL", filedata)  # Gal beta
+        filedata = re.sub(r"\s\wfA", " FUC", filedata)  # L-Fuc alpha
+        filedata = re.sub(r"\s\wfB", " FUL", filedata)  # L-Fuc beta
+        filedata = re.sub(r"\s\wMB", " BMA", filedata)  # Man beta
+        filedata = re.sub(r"\s\wMA", " MAN", filedata)  # Man alpha
+        filedata = re.sub(r"\s\wSA", " SIA", filedata)  # Neu5Ac alpha
+        filedata = re.sub(r"\s\wSA", " SLB", filedata)  # Neu5Ac beta (note: original code maps SA twice)
+        filedata = re.sub(r"\s\wZA", " GCU", filedata)  # GlcA alpha
+        filedata = re.sub(r"\s\wZB", " BDP", filedata)  # GlcA beta
+        filedata = re.sub(r"\s\wXA", " XYS", filedata)  # Xyl alpha
+        filedata = re.sub(r"\s\wXB", " XYP", filedata)  # Xyl beta
+        filedata = re.sub(r"\s\wuA", " IDR", filedata)  # IdoA alpha
+        filedata = re.sub(r"\s\whA", " RAM", filedata)  # Rha alpha
+        filedata = re.sub(r"\s\whB", " RHM", filedata)  # Rha beta
+        filedata = re.sub(r"\s\wRA", " RIB", filedata)  # Rib alpha
+        filedata = re.sub(r"\s\wRB", " BDR", filedata)  # Rib beta
+        filedata = re.sub(r"\s\wAA", " ARA", filedata)  # Ara alpha
+        filedata = re.sub(r"\s\wAB", " ARB", filedata)  # Ara beta
+        return filedata
+    if naming_format == 'CHARMM':
+        # Convert GLYCAM to CHARMM naming
+        filedata = re.sub(r"\s\wYA ", " AGLC", filedata)  # GlcNAc alpha
+        filedata = re.sub(r"\s\wYB ", " BGLC", filedata)  # GlcNAc beta
+        filedata = re.sub(r"\s\wVA ", " AGAL", filedata)  # GalNAc alpha
+        filedata = re.sub(r"\s\wVB ", " BGAL", filedata)  # GalNAc beta
+        filedata = re.sub(r"\s\wGA ", " AGLC", filedata)  # Glc alpha
+        filedata = re.sub(r"\s\wGB ", " BGLC", filedata)  # Glc beta
+        filedata = re.sub(r"\s\wLA ", " AGAL", filedata)  # Gal alpha
+        filedata = re.sub(r"\s\wLB ", " BGAL", filedata)  # Gal beta
+        filedata = re.sub(r"\s\wf[A|B]", " FUC", filedata)  # Fuc alpha and beta
+        filedata = re.sub(r"\s\wMA ", " AMAN", filedata)  # Man alpha
+        filedata = re.sub(r"\s\wMB ", " BMAN", filedata)  # Man beta
+        filedata = re.sub(r"\s\wSA ", " ANE5", filedata)  # Neu5Ac alpha
+        filedata = re.sub(r"\s\wGL ", " ANE5", filedata)  # Neu5Gc
+        filedata = re.sub(r"\s\wXA ", " AXYL", filedata)  # Xyl alpha
+        filedata = re.sub(r"\s\wXB ", " BXYL", filedata)  # Xyl beta
+        filedata = re.sub(r"\s\wuA ", " AIDO", filedata)  # IdoA alpha
+        filedata = re.sub(r"\s\wZA ", " AGLC", filedata)  # GlcA alpha
+        filedata = re.sub(r"\s\wZB ", " BGLC", filedata)  # GlcA beta
+        filedata = re.sub(r"\s\whA ", " ARHM", filedata)  # Rha alpha
+        filedata = re.sub(r"\s\whB ", " BRHM", filedata)  # Rha beta
+        filedata = re.sub(r"\s\wAA ", " AARB", filedata)  # Ara alpha
+        filedata = re.sub(r"\s\wAB ", " BARB", filedata)  # Ara beta
+        filedata = re.sub(r"\s\wRA ", " ARIB", filedata)  # Rib alpha
+        filedata = re.sub(r"\s\wRB ", " BRIB", filedata)  # Rib beta
+        return filedata
+    raise ValueError(f"naming_format must be one of ['GLYCAM','PDB','CHARMM'], got '{naming_format}'")
+
+
+def emit_multimodel_pdbs(
+    source_level_dir,
+    dest_level_dir,
+    cluster_data: dict,
+    level_name: str,
+    anomer_meta: dict | None = None,
+    formats: list[str] | None = None,
+) -> None:
+    """Create multi-model PDBs (alpha/beta) for a level into GLYCAM and PDB formats.
+
+    This reads per-cluster PDBs from the source level directory (alpha/beta) and
+    writes a single multi-model file per anomer under dest_level_dir/<FORMAT>/<anomer>.pdb.
+
+    Additionally, GlycoShape remarks (glytoucan/iupac) are added at the top of the
+    resulting files. Per-model REMARKs include cluster ID and population percent
+    when available in cluster_data.
+    """
+    from pathlib import Path
+    storage = get_storage_manager()
+
+    if formats is None:
+        formats = ["GLYCAM", "PDB"]
+
+    # Build a map of cluster_id -> population for REMARKs if available
+    cluster_pop: dict[str, float] = {}
+    try:
+        if cluster_data and "levels" in cluster_data and level_name in cluster_data["levels"]:
+            for c in cluster_data["levels"][level_name].get("clusters", []):
+                cid = str(c.get("cluster_id"))
+                pct = c.get("cluster_size_pct")
+                if cid is not None and pct is not None:
+                    try:
+                        cluster_pop[cid] = round(float(pct), 4)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    def _cluster_id_from_name(p: Path) -> int:
+        m = re.search(r"cluster_(\d+)", p.stem)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 10**9
+        return 10**9
+
+    source_level_dir = Path(source_level_dir)
+    dest_level_dir = Path(dest_level_dir)
+
+    for fmt in formats:
+        out_fmt_dir = dest_level_dir / fmt
+        storage.mkdir(out_fmt_dir)
+        for anomer in ["alpha", "beta"]:
+            src_dir = Path(source_level_dir) / anomer
+            out_path = out_fmt_dir / f"{anomer}.pdb"
+            # If a pre-aggregated alpha.pdb/beta.pdb exists at the source level, reuse it
+            preagg = Path(source_level_dir) / f"{anomer}.pdb"
+            if storage.exists(preagg):
+                try:
+                    raw = storage.read_text(preagg)
+                    converted = _convert_pdb_text_naming(raw, fmt)
+                    storage.write_text(out_path, converted)
+                except Exception:
+                    # Fallback to building from cluster files if conversion fails
+                    pass
+
+            # If file not written yet or conversion failed, build from cluster files
+            if not storage.exists(out_path):
+                if not storage.exists(src_dir):
+                    continue
+                listed = storage.list_files(src_dir, "*.pdb")
+                files = []
+                for p in listed:
+                    pp = Path(p)
+                    if str(pp).lower().endswith(".pdb"):
+                        files.append(pp)
+                files = sorted(files, key=_cluster_id_from_name)
+                if not files:
+                    continue
+                with storage.open(out_path, "w") as out_f:
+                    out_f.write(
+                        f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}\n"
+                    )
+                    for i, fpath in enumerate(files, start=1):
+                        try:
+                            cid_match = re.search(r"cluster_(\d+)", fpath.stem)
+                            cid = cid_match.group(1) if cid_match else None
+                            pop = cluster_pop.get(str(cid)) if cid else None
+                            out_f.write(f"MODEL     {i:4d}\n")
+                            if cid is not None:
+                                out_f.write(f"REMARK   CLUSTER_ID {cid}\n")
+                            if pop is not None:
+                                out_f.write(f"REMARK   CLUSTER_POPULATION_PCT {pop}\n")
+                            with storage.open(fpath, "r") as in_f:
+                                raw = in_f.read()
+                            converted = _convert_pdb_text_naming(raw, fmt)
+                            for line in converted.splitlines():
+                                if line.startswith(("ATOM", "HETATM", "ANISOU", "TER")):
+                                    out_f.write(line + "\n")
+                            out_f.write("ENDMDL\n")
+                        except Exception as e:
+                            out_f.write(f"REMARK   SKIPPED {getattr(fpath, 'name', str(fpath))}: {e}\n")
+                    out_f.write("END\n")
+
+            # Add GlycoShape remarks at file top (no cluster-specific MODEL injection)
+            if anomer_meta:
+                meta = anomer_meta.get(anomer, {}) if isinstance(anomer_meta, dict) else {}
+                try:
+                    _add_pdb_remarks(
+                        str(out_path),
+                        glytoucan_id=meta.get("glytoucan"),
+                        iupac=meta.get("iupac"),
+                        cluster_id=None,
+                        cluster_population=None,
+                    )
+                except Exception:
+                    pass
 
 
 # -------------------------
@@ -870,7 +1004,7 @@ def align_structures_by_residues(
     target_coords: np.ndarray,
     reference_atoms: pl.DataFrame,
     target_atoms: pl.DataFrame,
-    residue_range: tuple[int, int] = (1, 5),
+    residue_range: tuple[int, int] = (1, 3),
     use_rdkit: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -1025,7 +1159,7 @@ def align_frame_to_reference(
     frame_data_dir: str,
     reference_frame_idx: int,
     target_frame_idx: int,
-    residue_range: tuple[int, int] = (1, 5),
+    residue_range: tuple[int, int] = (1, 3),
     use_rdkit: bool = True
 ) -> np.ndarray:
     """
@@ -1143,7 +1277,8 @@ def write_aligned_pdb_for_frame(
     resid = atoms["res_id"].to_numpy()
     elem = atoms["element"].to_list()
 
-    with open(path, 'w') as out:
+    storage = get_storage_manager()
+    with storage.open(path, 'w') as out:
         if title:
             out.write(f"TITLE     {title}\n")
         out.write(f"MODEL     {frame_idx+1}\n")
@@ -1177,7 +1312,8 @@ def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
         List of tuples containing bonded atom pairs with missing connections added
     """
     try:
-        with open(file_path, 'r') as file:
+        storage = get_storage_manager()
+        with storage.open(file_path, 'r') as file:
             lines = file.readlines()
 
         # Parse atom coordinates

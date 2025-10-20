@@ -7,6 +7,7 @@ each frame.
 """
 
 from __future__ import annotations
+from lib.storage import get_storage_manager
 
 from typing import Optional
 
@@ -968,7 +969,8 @@ def save_clustering_results(all_levels: Dict[int, List[Dict[str, Any]]], output_
 			serializable_reps.append(serializable_rep)
 		# Store under sequential level key (stringified)
 		serializable_levels[str(level)] = serializable_reps
-	with open(output_path, 'w') as f:
+	storage = get_storage_manager()
+	with storage.open(output_path, 'w') as f:
 		json.dump(serializable_levels, f, indent=2)
 
 
@@ -1068,7 +1070,8 @@ def save_clustering_results_parquet(
 		'has_members': include_members,
 		'format_version': 2,
 	}
-	with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
+	storage = get_storage_manager()
+	with storage.open(f"{output_dir}/metadata.json", 'w') as f:
 		json.dump(meta, f, indent=2)
 
 
@@ -1217,9 +1220,33 @@ def load_clustering_results_parquet(output_dir: str) -> ClusteringResults:
 	"""
 	import json
 	meta_path = os.path.join(output_dir, 'metadata.json')
-	if not os.path.exists(meta_path):
-		raise FileNotFoundError(f'Metadata file not found: {meta_path}')
-	with open(meta_path, 'r') as f:
+	storage = get_storage_manager()
+	# Be robust: if metadata.json not present yet, synthesize a minimal one from available files
+	if not storage.exists(meta_path):
+		try:
+			levels = []
+			# Best-effort infer levels from cluster_summary.parquet if present
+			summary_path = os.path.join(output_dir, 'cluster_summary.parquet')
+			if os.path.exists(summary_path):
+				sdf = _read_parquet_robust(summary_path)
+				if 'level' in sdf.columns:
+					levels = sorted(set(int(x) for x in sdf['level'].to_list()))
+				elif 'n_clusters' in sdf.columns:
+					# legacy: treat distinct n_clusters as sequential levels
+					unique_nc = sorted(set(int(x) for x in sdf['n_clusters'].to_list()))
+					levels = list(range(1, len(unique_nc)+1))
+			meta = {
+				'levels': levels,
+				'level_to_n_clusters': {},
+				'has_members': os.path.exists(os.path.join(output_dir, 'cluster_members.parquet')),
+				'format_version': 2,
+			}
+			with storage.open(meta_path, 'w') as f:
+				json.dump(meta, f, indent=2)
+			logger.info(f"Synthesized missing metadata.json at {meta_path}")
+		except Exception:
+			raise FileNotFoundError(f'Metadata file not found: {meta_path}')
+	with storage.open(meta_path, 'r') as f:
 		meta = json.load(f)
 	
 	logger.info(f"Loading clustering results from {output_dir}, metadata: {meta}")

@@ -8,6 +8,7 @@ import glob
 import json
 import requests
 from typing import Dict, List, Union, Optional
+from lib.storage import get_storage_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -161,7 +162,9 @@ class GlycoShapeBaker:
                 if json_path.exists():
                     self.logger.info(f"Processing JSON for {glycan_id}")
                     try:
-                        with open(json_path, 'r', encoding='utf-8') as f:
+                        storage = get_storage_manager()
+                        json_path_str = str(json_path)
+                        with storage.open(json_path_str, 'r') as f:
                             consolidated_data[glycan_id] = json.load(f)
                     except json.JSONDecodeError as e:
                         self.logger.error(f"Invalid JSON in {json_path}: {str(e)}")
@@ -170,7 +173,7 @@ class GlycoShapeBaker:
                         
             # Write consolidated JSON
             self.logger.info(f"Writing consolidated JSON to {output_file}")
-            with open(output_path, 'w', encoding='utf-8') as f:
+            with storage.open(output_path, 'w') as f:
                 json.dump(
                     dict(sorted(consolidated_data.items())), 
                     f, 
@@ -198,7 +201,9 @@ class GlycoShapeBaker:
         try:
             json_path = self.database_dir / json_file
             
-            with open(json_path, 'r', encoding='utf-8') as f:
+            storage = get_storage_manager()
+            json_path_str = str(json_path)
+            with storage.open(json_path_str, 'r') as f:
                 data = json.load(f)
 
             missing_entries = []
@@ -223,8 +228,9 @@ class GlycoShapeBaker:
                         self.logger.info(f"Missing GlyTouCan ID for {glycan_id} ({entry_type}): {wurcs}")
 
             # Write missing entries to file
-            output_path = self.database_dir / output_file
-            with open(output_path, 'w', encoding='utf-8') as f:
+            output_path = f"{self.database_dir}/{output_file}"
+            storage = get_storage_manager()
+            with storage.open(output_path, 'w') as f:
                 f.write("\n".join(missing_entries))
                 
             self.logger.info(f"Found {len(missing_entries)} WURCS entries missing GlyTouCan IDs")
@@ -250,7 +256,8 @@ class GlycoShapeBaker:
         file_path = Path(file_path)
         
         try:
-            with open(file_path, 'rb') as file:
+            storage = get_storage_manager()
+            with storage.open(file_path, 'rb') as file:
                 response = requests.post(
                     url,
                     files={"file": file},
@@ -285,7 +292,9 @@ class GlycoShapeBaker:
         try:
             json_path = self.database_dir / json_file
             
-            with open(json_path, 'r', encoding='utf-8') as f:
+            storage = get_storage_manager()
+            json_path_str = str(json_path)
+            with storage.open(json_path_str, 'r') as f:
                 data = json.load(f)
             
             total_length = 0.0
@@ -344,7 +353,9 @@ class GlycoShapeBaker:
             data_json = glycan_dir / "data.json"
             if data_json.exists():
                 try:
-                    with open(data_json, 'r', encoding='utf-8') as f:
+                    storage = get_storage_manager()
+                    data_json_str = str(data_json)
+                    with storage.open(data_json_str, 'r') as f:
                         json.load(f)
                 except json.JSONDecodeError:
                     issues["invalid_json"].append(glycan_id)

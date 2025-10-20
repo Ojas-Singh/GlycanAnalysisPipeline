@@ -21,6 +21,7 @@ from typing import List, Dict, Optional
 import json
 
 import lib.config as config
+from lib.storage import get_storage_manager, reset_storage_manager
 from lib.glystatic import process_glycan as glystatic_process_glycan
 from lib.glymeta import GlycanMetadataProcessor
 from lib.glybake import GlycoShapeBaker
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 class GlycanPipelineRunner:
     """Main pipeline runner for processing glycans."""
     
-    def __init__(self, data_dir: Path, process_dir: Path, output_dir: Path, force_update: bool = False):
+    def __init__(self, data_dir, process_dir, output_dir, force_update: bool = False):
         """Initialize the pipeline runner.
         
         Args:
@@ -47,15 +48,18 @@ class GlycanPipelineRunner:
             output_dir: Directory for final database output
             force_update: Whether to force recomputation of existing results
         """
-        self.data_dir = Path(data_dir)
-        self.process_dir = Path(process_dir) 
-        self.output_dir = Path(output_dir)
+        self.data_dir = data_dir
+        self.process_dir = process_dir 
+        self.output_dir = output_dir
         self.force_update = force_update
         
+        # Initialize storage manager
+        self.storage = get_storage_manager()
+        
         # Ensure directories exist
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.process_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.storage.mkdir(self.data_dir)
+        self.storage.mkdir(self.process_dir)
+        self.storage.mkdir(self.output_dir)
         
         # Initialize processors
         self.metadata_processor = GlycanMetadataProcessor(self.output_dir)
@@ -69,21 +73,70 @@ class GlycanPipelineRunner:
         """
         glycan_dirs = []
         
-        if not self.data_dir.exists():
+        # For Oracle storage, directory existence checking is different
+        # We'll try to proceed and handle missing gracefully
+        logger.info(f"Discovering glycans in data directory: {self.data_dir}")
+        if not self.storage.exists(self.data_dir) and not config.use_oracle_storage:
             logger.error(f"Data directory does not exist: {self.data_dir}")
             return glycan_dirs
             
-        for item in self.data_dir.iterdir():
-            if item.is_dir():
-                # Check for required files
-                pdb_file = item / f"{item.name}.pdb"
-                mol2_file = item / f"{item.name}.mol2"
-                
-                if pdb_file.exists() and mol2_file.exists():
-                    glycan_dirs.append(item.name)
-                    logger.info(f"Found glycan: {item.name}")
+        # List items in data directory - different approach for Oracle vs Local
+        if config.use_oracle_storage:
+            # For Oracle, enumerate objects under the data prefix and infer glycan folders
+            logger.info("Using Oracle storage - listing objects under data prefix and detecting glycans")
+            try:
+                objs = self.storage.list_files(self.data_dir, "*")
+            except Exception as e:
+                logger.error(f"Failed to list objects under {self.data_dir}: {e}")
+                objs = []
+
+            prefix = str(self.data_dir).strip('/')
+            candidates = set()
+            for it in objs:
+                key = it.as_posix() if hasattr(it, 'as_posix') else str(it)
+                rel = key[len(prefix) + 1:] if prefix and key.startswith(prefix + '/') else key
+                if '/' in rel:
+                    cand = rel.split('/', 1)[0]
+                    if cand:
+                        candidates.add(cand)
+
+            for cand in sorted(candidates):
+                # Accept either <cand>.pdb/.mol2 or simulation.pdb/structure.mol2
+                pdb_file_1 = f"{cand}/{cand}.pdb"
+                mol2_file_1 = f"{cand}/{cand}.mol2"
+                pdb_file_2 = f"{cand}/simulation.pdb"
+                mol2_file_2 = f"{cand}/structure.mol2"
+                ok_named = self.storage.exists(pdb_file_1, self.data_dir) and self.storage.exists(mol2_file_1, self.data_dir)
+                ok_alt = self.storage.exists(pdb_file_2, self.data_dir) and self.storage.exists(mol2_file_2, self.data_dir)
+                if ok_named or ok_alt:
+                    glycan_dirs.append(cand)
+                    logger.info(f"Found glycan: {cand}")
                 else:
-                    logger.warning(f"Skipping {item.name}: missing required files (.pdb and .mol2)")
+                    logger.debug(f"Skipping {cand}: missing required files (.pdb/.mol2 or simulation.pdb/structure.mol2)")
+        else:
+            # Local storage - use normal directory listing
+            items = self.storage.list_files(self.data_dir, "*")
+            
+            for item in items:
+                item_name = item.name if hasattr(item, 'name') else str(item).split('/')[-1]
+                
+                # Check if it's a directory
+                is_directory = False
+                if hasattr(item, 'is_dir'):
+                    is_directory = item.is_dir()
+                else:
+                    is_directory = self.storage.is_file(item) is False and '/' not in str(item).split('/')[-1]
+                
+                if is_directory:
+                    # Check for required files
+                    pdb_file = f"{item_name}/{item_name}.pdb"
+                    mol2_file = f"{item_name}/{item_name}.mol2"
+                    
+                    if self.storage.exists(pdb_file, self.data_dir) and self.storage.exists(mol2_file, self.data_dir):
+                        glycan_dirs.append(item_name)
+                        logger.info(f"Found glycan: {item_name}")
+                    else:
+                        logger.warning(f"Skipping {item_name}: missing required files (.pdb and .mol2)")
                     
         logger.info(f"Discovered {len(glycan_dirs)} glycan directories")
         return sorted(glycan_dirs)
@@ -131,20 +184,20 @@ class GlycanPipelineRunner:
         Returns:
             True if structure is valid, False otherwise
         """
-        output_glycan_dir = self.output_dir / glycan_name
-        data_json = output_glycan_dir / "data.json"
+        output_glycan_dir = f"{self.output_dir}/{glycan_name}"
+        data_json = f"{output_glycan_dir}/data.json"
         
-        if not output_glycan_dir.exists():
+        if not self.storage.exists(output_glycan_dir):
             logger.debug(f"Output directory missing for {glycan_name}")
             return False
             
-        if not data_json.exists():
+        if not self.storage.exists(data_json):
             logger.debug(f"data.json missing for {glycan_name}")
             return False
             
         try:
             # Validate JSON structure
-            with open(data_json, 'r', encoding='utf-8') as f:
+            with self.storage.open(data_json, 'r') as f:
                 data = json.load(f)
                 
             # Check for required sections
@@ -192,17 +245,22 @@ class GlycanPipelineRunner:
         """
         try:
             # Look for any GS folder that matches this glycan name
-            for candidate in self.output_dir.iterdir():
-                if not candidate.is_dir():
+            candidates = self.storage.list_files(self.output_dir, "GS*")
+            
+            for candidate in candidates:
+                candidate_name = candidate.name if hasattr(candidate, 'name') else str(candidate).split('/')[-1]
+                
+                # Check if it's a directory
+                if not self.storage.is_dir(candidate):
                     continue
 
-                data_json = candidate / "data.json"
-                if not data_json.exists():
+                data_json = f"{candidate}/data.json"
+                if not self.storage.exists(data_json, self.output_dir):
                     continue
 
                 # Try to read the data.json
                 try:
-                    with open(data_json, 'r', encoding='utf-8') as f:
+                    with self.storage.open(data_json, 'r', self.output_dir) as f:
                         data = json.load(f)
                 except Exception:
                     continue
@@ -219,7 +277,7 @@ class GlycanPipelineRunner:
                 # Simple validation: just check if glytoucan ID exists and is valid
                 glytoucan_id = archetype.get("glytoucan", "").strip()
                 if glytoucan_id and glytoucan_id.lower() != "null" and glytoucan_id != "":
-                    logger.debug(f"Found valid glytoucan ID '{glytoucan_id}' for {glycan_name} in {candidate.name}")
+                    logger.debug(f"Found valid glytoucan ID '{glytoucan_id}' for {glycan_name} in {candidate_name}")
                     return True
             
             logger.debug(f"No valid data.json with glytoucan ID found for {glycan_name}")
@@ -243,88 +301,76 @@ class GlycanPipelineRunner:
             True if glystatic processing is complete, False otherwise
         """
         try:
-            # First, find the correct GS folder by matching the archetype name exactly
-            matching_candidate = None
-            
-            # Iterate over possible processed ID directories to find the matching one
-            for candidate in self.output_dir.iterdir():
-                if not candidate.is_dir():
-                    continue
+            # Use storage abstraction to support Oracle and local modes
+            storage = self.storage
+            base = str(self.output_dir)
+            # List GS* candidates under output dir
+            try:
+                candidates = storage.list_files(base, "GS*")
+            except Exception:
+                candidates = []
 
-                data_json = candidate / "data.json"
-                if not data_json.exists():
+            matching_key = None
+            for cand in candidates:
+                cand_key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                # Build path to data.json under this candidate
+                data_json = f"{cand_key}/data.json" if not cand_key.endswith('/data.json') else cand_key
+                if not storage.exists(data_json):
                     continue
-
-                # Try to read the data.json
                 try:
-                    with open(data_json, 'r', encoding='utf-8') as f:
+                    with storage.open(data_json, 'r') as f:
                         data = json.load(f)
+                    archetype = data.get('archetype', {}) if isinstance(data, dict) else {}
+                    name_field = archetype.get('name') or archetype.get('glycam', '')
+                    if name_field == glycan_name:
+                        matching_key = cand_key
+                        break
                 except Exception:
                     continue
 
-                # Check if archetype name matches exactly
-                archetype = data.get('archetype', {})
-                name_field = archetype.get('name') or archetype.get('glycam', '')
-                if name_field == glycan_name:
-                    matching_candidate = candidate
-                    break
-            
-            if not matching_candidate:
+            if not matching_key:
                 logger.debug(f"No GS folder found with exact name match for {glycan_name}")
                 return False
-            
-            # Now validate only the matching candidate
+
+            # Validate minimal output structure
             validation_errors = []
-            
-            data_json = matching_candidate / "data.json"
+            data_json = f"{matching_key}/data.json"
             try:
-                with open(data_json, 'r', encoding='utf-8') as f:
+                with storage.open(data_json, 'r') as f:
                     data = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to read data.json for {matching_candidate.name}: {e}")
+                logger.warning(f"Failed to read data.json for {matching_key}: {e}")
                 return False
 
-            # Validate JSON structure - must be a dict with 'archetype' section
             if not isinstance(data, dict):
-                validation_errors.append(f"data.json is not a dictionary")
-                
-            archetype = data.get('archetype', {})
+                validation_errors.append("data.json is not a dictionary")
+            archetype = data.get('archetype', {}) if isinstance(data, dict) else {}
             if not isinstance(archetype, dict):
-                validation_errors.append(f"missing or invalid archetype section")
-
-            # Check for required archetype fields
+                validation_errors.append("missing or invalid archetype section")
             required_fields = ["ID", "name", "iupac", "glytoucan"]
-            missing_fields = [field for field in required_fields if field not in archetype or not archetype[field]]
+            missing_fields = [f for f in required_fields if f not in archetype or not archetype[f]]
             if missing_fields:
                 validation_errors.append(f"missing required archetype fields: {missing_fields}")
-                
-            # Specifically validate glytoucan ID - must not be null, empty, or "null"
-            glytoucan_id = archetype.get("glytoucan", "").strip()
-            if not glytoucan_id or glytoucan_id.lower() == "null" or glytoucan_id == "":
+            glytoucan_id = (archetype.get("glytoucan", "") or "").strip()
+            if not glytoucan_id or glytoucan_id.lower() == "null":
                 validation_errors.append(f"invalid glytoucan ID '{glytoucan_id}'")
 
-            # Validate output structure - must have output/ folder with required files
-            out_folder = matching_candidate / 'output'
-            if not out_folder.exists():
-                validation_errors.append(f"missing output/ folder")
-
-            expected_files = [out_folder / 'pca.csv', out_folder / 'torparts.npz']
-            missing_files = [str(f.relative_to(matching_candidate)) for f in expected_files if not f.exists()]
-            if missing_files:
-                validation_errors.append(f"missing output files: {missing_files}")
-
-            # Ensure at least level_1 exists for representative structures
-            if not (out_folder / 'level_1').exists():
-                validation_errors.append(f"missing level_1 structures")
+            out_folder = f"{matching_key}/output"
+            if not storage.exists(out_folder):
+                validation_errors.append("missing output/ folder")
+            for rel in ["pca.csv", "torparts.npz"]:
+                if not storage.exists(f"{out_folder}/{rel}"):
+                    validation_errors.append(f"missing output file: {rel}")
+            if not storage.exists(f"{out_folder}/level_1"):
+                validation_errors.append("missing level_1 structures")
 
             if validation_errors:
-                logger.warning(f"Glystatic validation failed for {glycan_name} in {matching_candidate.name}. Issues found:")
-                for error in validation_errors:
-                    logger.warning(f"  - {error}")
+                logger.warning(f"Glystatic validation failed for {glycan_name} in {matching_key}. Issues:")
+                for err in validation_errors:
+                    logger.warning(f"  - {err}")
                 return False
 
-            # All validation passed!
-            logger.debug(f"Glystatic completion fully validated in {matching_candidate} for {glycan_name} (GlyTouCan: {glytoucan_id})")
+            logger.debug(f"Glystatic completion validated in {matching_key} for {glycan_name} (GlyTouCan: {glytoucan_id})")
             return True
 
         except Exception as e:
@@ -366,7 +412,7 @@ class GlycanPipelineRunner:
             True if successful, False otherwise
         """
         try:
-            output_glycan_dir = self.output_dir / glycan_name
+            output_glycan_dir = f"{self.output_dir}/{glycan_name}"
             
             # Check if glystatic processing should be skipped
             if not self.force_update:
@@ -384,16 +430,16 @@ class GlycanPipelineRunner:
             logger.info(f"Running glystatic for {glycan_name}")
             
             # Define paths for glystatic processing
-            glycan_input_dir = self.data_dir / glycan_name
-            process_glycan_dir = self.process_dir / glycan_name
+            glycan_input_dir = f"{self.data_dir}/{glycan_name}"
+            process_glycan_dir = f"{self.process_dir}/{glycan_name}"
             
-            if not process_glycan_dir.exists():
+            if not self.storage.exists(process_glycan_dir):
                 logger.error(f"Process directory not found: {process_glycan_dir}")
                 return False
             
             # Verify that the output subdirectory exists in process_dir
-            process_output_dir = process_glycan_dir / "output"
-            if not process_output_dir.exists():
+            process_output_dir = f"{process_glycan_dir}/output"
+            if not self.storage.exists(process_output_dir):
                 logger.error(f"Output subdirectory not found in process directory: {process_output_dir}")
                 return False
             
@@ -439,27 +485,29 @@ class GlycanPipelineRunner:
             
             # Locate the glystatic output directory containing data.json for this glycan
             candidate_dir = None
-            for subdir in self.output_dir.iterdir():
-                if not subdir.is_dir():
+            try:
+                candidates = self.storage.list_files(self.output_dir, "GS*")
+            except Exception:
+                candidates = []
+            for cand in candidates:
+                key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                data_json = f"{key}/data.json"
+                if not self.storage.exists(data_json):
                     continue
-                data_json = subdir / "data.json"
-                if not data_json.exists():
-                    continue
-                # Try to match glycan_name in the archetype section
                 try:
-                    with open(data_json, 'r', encoding='utf-8') as f:
+                    with self.storage.open(data_json, 'r') as f:
                         data = json.load(f)
                 except Exception:
                     continue
                 arche = data.get('archetype', {}) if isinstance(data, dict) else {}
                 name_field = arche.get('name') or arche.get('glycam')
                 if name_field and glycan_name.lower() in str(name_field).lower():
-                    candidate_dir = subdir
+                    candidate_dir = key
                     break
             if candidate_dir is None:
                 logger.error(f"data.json not found for {glycan_name}")
                 return False
-            json_path = candidate_dir / "data.json"
+            json_path = f"{candidate_dir}/data.json"
                 
             # Update metadata for this specific glycan
             success = self.metadata_processor.update_glycan_metadata(json_path)
@@ -498,7 +546,24 @@ class GlycanPipelineRunner:
             logger.info(f"v2 analysis already complete for {glycan_name}, skipping")
             results["v2"] = True
         else:
-            results["v2"] = self.run_v2_analysis(glycan_name)
+            # Run v2 and upload process dir to Oracle if enabled
+            v2_ok = self.run_v2_analysis(glycan_name)
+            results["v2"] = v2_ok
+            if v2_ok and config.use_oracle_storage:
+                try:
+                    local_process_dir = os.path.join(str(self.process_dir), glycan_name)
+                    remote_prefix = f"{self.process_dir}/{glycan_name}"
+                    self.storage.upload_dir(local_process_dir, remote_prefix)
+                    logger.info(f"Uploaded process outputs to Oracle: {remote_prefix}")
+                    
+                    # Clean up local folder after successful upload
+                    if config.should_cleanup_process_files():
+                        if self.storage.delete_local_directory(local_process_dir):
+                            logger.info(f"Cleaned up local process directory: {local_process_dir}")
+                        else:
+                            logger.warning(f"Failed to clean up local process directory: {local_process_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to upload/cleanup process outputs for {glycan_name}: {e}")
             
         if not results["v2"]:
             logger.error(f"Pipeline failed at v2 step for {glycan_name}")
@@ -506,6 +571,14 @@ class GlycanPipelineRunner:
             
         # Step 2: glystatic
         results["glystatic"] = self.run_glystatic(glycan_name)
+        if results["glystatic"] and config.use_oracle_storage:
+            try:
+                local_static_dir = str(self.output_dir)
+                remote_static_prefix = str(self.output_dir)
+                self.storage.upload_dir(local_static_dir, remote_static_prefix)
+                logger.info(f"Uploaded static outputs to Oracle: {remote_static_prefix}")
+            except Exception as e:
+                logger.warning(f"Failed to upload static outputs for {glycan_name}: {e}")
         if not results["glystatic"]:
             logger.error(f"Pipeline failed at glystatic step for {glycan_name}")
             return results
@@ -531,9 +604,14 @@ class GlycanPipelineRunner:
             
             # Validate that we have processed glycans
             processed_glycans = []
-            for glycan_dir in self.output_dir.glob("GS*"):
-                if glycan_dir.is_dir() and (glycan_dir / "data.json").exists():
-                    processed_glycans.append(glycan_dir.name)
+            try:
+                candidates = self.storage.list_files(self.output_dir, "GS*")
+            except Exception:
+                candidates = []
+            for cand in candidates:
+                key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                if self.storage.exists(f"{key}/data.json"):
+                    processed_glycans.append(key.split('/')[-1])
             
             if not processed_glycans:
                 logger.warning("No processed glycans found in output directory")
@@ -551,16 +629,16 @@ class GlycanPipelineRunner:
             
             # Run json2rdf conversion (only if consolidated JSON exists and is valid)
             logger.info("Preparing to run json2rdf conversion")
-            input_path = self.output_dir / "GLYCOSHAPE.json"
-            output_path = self.output_dir / "GLYCOSHAPE_RDF.ttl"
+            input_path = f"{self.output_dir}/GLYCOSHAPE.json"
+            output_path = f"{self.output_dir}/GLYCOSHAPE_RDF.ttl"
 
-            if not input_path.exists():
+            if not self.storage.exists(input_path):
                 logger.warning(f"Consolidated JSON not found at expected location: {input_path}")
                 logger.warning("Skipping json2rdf conversion")
             else:
                 # Validate JSON is readable and non-empty
                 try:
-                    with open(input_path, 'r', encoding='utf-8') as jf:
+                    with self.storage.open(input_path, 'r') as jf:
                         json_data = json.load(jf)
                 except Exception as e:
                     logger.error(f"Failed to read/parse consolidated JSON '{input_path}': {e}")
@@ -709,10 +787,21 @@ def main():
     
     args = parser.parse_args()
     
+    # Initialize storage based on configuration
+    if not config.initialize_storage():
+        logger.error("Failed to initialize storage. Exiting.")
+        sys.exit(1)
+    
+    # Get storage info
+    storage_info = config.get_storage_info()
+    logger.info(f"Storage mode: {storage_info['storage_mode']}")
+    if storage_info['storage_mode'] == 'oracle':
+        logger.info(f"Using Oracle Cloud Object Storage")
+    
     # Use config defaults or command line overrides
-    data_dir = Path(args.data_dir) if args.data_dir else config.data_dir
-    process_dir = Path(args.process_dir) if args.process_dir else config.process_dir
-    output_dir = Path(args.output_dir) if args.output_dir else config.output_dir
+    data_dir = args.data_dir if args.data_dir else config.data_dir
+    process_dir = args.process_dir if args.process_dir else config.process_dir
+    output_dir = args.output_dir if args.output_dir else config.output_dir
     
     logger.info(f"Starting Glycan Analysis Pipeline")
     logger.info(f"Data directory: {data_dir}")

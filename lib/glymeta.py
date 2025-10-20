@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Dict, List, Set, Optional, Union
 import re
+from lib.storage import get_storage_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -365,7 +366,8 @@ class GlycanMetadataProcessor:
         """
         try:
             # Read current data
-            with open(json_file_path, 'r', encoding='utf-8') as f:
+            storage = get_storage_manager()
+            with storage.open(json_file_path, 'r') as f:
                 data = json.load(f)
                 
             # Initialize search_meta if not present
@@ -400,7 +402,7 @@ class GlycanMetadataProcessor:
                 self.logger.info(f"Updated common names for {json_file_path.name}: {new_common_names}")
                 
             # Write updated data back to file
-            with open(json_file_path, 'w', encoding='utf-8') as f:
+            with storage.open(json_file_path, 'w') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
                 
             return True
@@ -482,7 +484,9 @@ class GlycanMetadataProcessor:
                 continue
                 
             try:
-                with open(json_path, 'r', encoding='utf-8') as f:
+                storage = get_storage_manager()
+                json_path_str = str(json_path)
+                with storage.open(json_path_str, 'r') as f:
                     data = json.load(f)
                     
                 glycan_id = glycan_dir.name

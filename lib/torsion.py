@@ -20,6 +20,7 @@ from typing import Iterable, List, Sequence, Tuple
 import os
 
 import numpy as np
+from lib.storage import get_storage_manager
 
 try:  # Optional dependency import block
 	from rdkit import Chem  # type: ignore
@@ -601,9 +602,10 @@ def plot_torsion_distribution(
 	glycosidic_original_names = set()
 	name_mapping = {}
 	
-	if os.path.exists(info_json_path):
+	storage = get_storage_manager()
+	if storage.exists(info_json_path):
 		try:
-			with open(info_json_path, 'r') as f:
+			with storage.open(info_json_path, 'r') as f:
 				info_data = json.load(f)
 			
 			# Get glycosidic torsion names from info.json

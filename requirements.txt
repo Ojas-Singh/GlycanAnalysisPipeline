@@ -3,6 +3,7 @@ scipy==1.15.2
 scikit-learn
 networkx==3.4.2
 matplotlib==3.10.1
+pandas>=2.0.0
 bio==1.7.1
 tqdm==4.67.1
 pyarrow==19.0.1
@@ -15,3 +16,4 @@ rdflib==7.1.4
 oxigraph==0.4.11
 polars==1.33.1
 zarr==2.18.3 
+requests>=2.31.0 

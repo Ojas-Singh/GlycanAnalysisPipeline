@@ -3,6 +3,7 @@ import json
 from rdflib import Graph, Literal, URIRef, Namespace, BNode
 from rdflib.namespace import RDF, RDFS, XSD, DCTERMS, OWL, SKOS
 import os # Import os for file path handling
+from lib.storage import get_storage_manager
 
 # --- Define Namespaces (Best Practice with rdf.glycoshape.org) ---
 GS = Namespace("http://rdf.glycoshape.org/ontology/")          # Ontology/vocabulary terms
@@ -329,7 +330,8 @@ def convert_glycoshape_to_rdf(input_path, output_path):
     # Read JSON data
     print(f"Reading JSON data from: {input_path}")
     try:
-        with open(input_path, 'r', encoding='utf-8') as file:
+        storage = get_storage_manager()
+        with storage.open(input_path, 'r') as file:
             data = json.load(file)
     except FileNotFoundError:
         print(f"Error: Input file not found at {input_path}")

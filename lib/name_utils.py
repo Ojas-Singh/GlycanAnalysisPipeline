@@ -8,6 +8,7 @@ import polars as pl
 import pyarrow.csv as pacsv
 import math
 from pathlib import Path
+from lib.storage import get_storage_manager
 from glypy.io import iupac as glypy_iupac
 
 # Import glycowork functions (thankyou daniel for this amazing package!)
@@ -36,7 +37,8 @@ def get_oxford(iupac, oxford_dict='oxford.json'):
     if not Path(oxford_dict).is_absolute():
         oxford_dict = Path(__file__).parent / oxford_dict
     
-    with open(oxford_dict, 'r') as f:
+    storage = get_storage_manager()
+    with storage.open(oxford_dict, 'r') as f:
         oxford_data = json.load(f)
     
     input_length = len(iupac)

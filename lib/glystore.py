@@ -8,6 +8,7 @@ from typing import Callable, Iterable, Tuple, Optional, List
 import numpy as np
 import polars as pl
 import zarr
+from lib.storage import get_storage_manager
 from numcodecs import Blosc
 
 # -------------------------
@@ -150,7 +151,8 @@ def _iter_models(pdb_path: str):
     """Yield lists of ATOM/HETATM lines per MODEL. If no MODEL/ENDMDL found, yield one model of all atoms."""
     has_model = False
     current: List[str] = []
-    with open(pdb_path, "r", encoding="utf-8", errors="ignore") as fh:
+    storage = get_storage_manager()
+    with storage.open(pdb_path, "r") as fh:
         for line in fh:
             rec = line[:6]
             if rec.startswith("MODEL"):

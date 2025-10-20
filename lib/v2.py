@@ -30,6 +30,7 @@ import numpy as np
 import json
 
 from lib import config
+from lib.storage import get_storage_manager
 from lib.glystore import store_from_pdb
 from lib.glypdbio import parse_mol2_bonds
 from lib.glypdbio import get_conformation_landscape
@@ -80,10 +81,11 @@ def _read_parquet_robust(path: str):
 def _update_pca_json(embedding_dir: str, updates: Dict) -> None:
     """Merge/update a pca.json file in the embedding_dir with the provided updates."""
     try:
-        p = os.path.join(embedding_dir, "pca.json")
+        storage = get_storage_manager()
+        p = f"{embedding_dir}/pca.json"
         base = {}
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as fh:
+        if storage.exists(p):
+            with storage.open(p, "r") as fh:
                 base = json.load(fh) or {}
         # deep merge: preserve nested mappings and lists where reasonable
         def _deep_merge(a: dict, b: dict) -> dict:
@@ -115,11 +117,29 @@ def _update_pca_json(embedding_dir: str, updates: Dict) -> None:
             return out
 
         base = _deep_merge(base, updates)
-        with open(p, "w", encoding="utf-8") as fh:
+        with storage.open(p, "w") as fh:
             json.dump(base, fh, indent=2)
         logger.info(f"Updated {p} with keys: {list(updates.keys())}")
     except Exception as exc:
         logger.warning(f"Failed to update pca.json: {exc}")
+
+
+def clusters_from_entropy(
+    H,
+    H_min=5.0,   # ~mono
+    H_max=21.0,  # your biggest glycan
+    n_min=5,     # clusters for mono
+    n_max=128,   # clusters for H≈21
+    gamma=1.0    # <1 -> even more top-heavy; >1 -> flatter
+):
+    if H < 5:
+        return 5
+    # clamp H to [H_min, H_max]
+    Hc = max(H_min, min(H, H_max))
+    t = (Hc - H_min) / (H_max - H_min)  # 0..1
+    # geometric interpolation; raise t to gamma to tune steepness
+    n = n_min * ((n_max / n_min) ** (t ** gamma))
+    return int(round(n))
 
 
 def step_store(name: str, frame_data_dir: str, pdb_path: str, mol2_path: str, force: bool = False) -> None:
@@ -150,7 +170,7 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
         return pca_path
 
     logger.info("Computing conformation landscape (may be memory intensive)")
-    landscape = get_conformation_landscape(frame_data_dir, method="noH_fast", sample_size=100, seed=0)
+    landscape = get_conformation_landscape(frame_data_dir, method="noH_fast", sample_size=300, seed=0)
     logger.info("Running PCA on conformation landscape")
     # pass through per_pair_scale and keep scale=True as before
     pca_df = pca_conformation_landscape(landscape, n_components=10, scale=True, per_pair_scale=per_pair_scale)
@@ -282,13 +302,8 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
         n_main = 1
         labels_main = np.zeros(len(pca_data), dtype=int)
 
-    # COVERAGE: linear map H in [10,20] -> clusters in [10,128]
-    if H <= 10:
-        n_cov_target = 10
-    elif H >= 20:
-        n_cov_target = 128
-    else:
-        n_cov_target = int(round(10 + (H - 10.0) / 10.0 * (128 - 10)))
+    # COVERAGE: exponential scaling H in [4,21] -> clusters in [5,128]
+    n_cov_target = clusters_from_entropy(H)
 
     labels_cov, n_clusters_cov = kcenter_coverage_clustering(
         pca_data,
@@ -391,16 +406,17 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
 
     Returns (torsion_list, torsion_labels). If RDKit not available, returns ([],[]).
     """
-    os.makedirs(embedding_dir, exist_ok=True)
-    torsion_csv = os.path.join(embedding_dir, "torsions.csv")
-    torparts_path = os.path.join(embedding_dir, "torparts.npz")
+    storage = get_storage_manager()
+    storage.mkdir(embedding_dir)
+    torsion_csv = f"{embedding_dir}/torsions.csv"
+    torparts_path = f"{embedding_dir}/torparts.npz"
     
-    if os.path.exists(torsion_csv) and os.path.exists(torparts_path) and not force:
+    if storage.exists(torsion_csv) and storage.exists(torparts_path) and not force:
         logger.info("Torsion step: torsions.csv and torparts.npz exist; skipping (use --update to force)")
         # Attempt to recover labels by reading header
         try:
             import csv
-            with open(torsion_csv, "r", newline="", encoding="utf-8") as fh:
+            with storage.open(torsion_csv, "r") as fh:
                 r = csv.reader(fh)
                 header = next(r)
             labels = header[1:]
@@ -453,7 +469,7 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     
     # Write results to CSV
     logger.info(f"Writing {n_frames} x {len(torsion_list)} torsion values to CSV")
-    with open(torsion_csv, "w", encoding="utf-8") as fh:
+    with storage.open(torsion_csv, "w") as fh:
         fh.write("frame," + ",".join(labels) + "\n")
         for f in range(n_frames):
             vals = torsion_angles[f, :]
@@ -464,7 +480,7 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     logger.info(f"Wrote torsion angles to {torsion_csv}")
     
     # Save glycosidic linkage info
-    glycosidic_path = os.path.join(embedding_dir, "glycosidic_info.json")
+    glycosidic_path = f"{embedding_dir}/glycosidic_info.json"
     glycosidic_torsions = []
     for i, label in enumerate(labels):
         glycosidic_name = classify_glycosidic_from_name(label)
@@ -476,7 +492,7 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
                 'torsion_indices': torsion_list[i]
             })
     
-    with open(glycosidic_path, 'w', encoding='utf-8') as f:
+    with storage.open(glycosidic_path, 'w') as f:
         json.dump(glycosidic_torsions, f, indent=2)
     logger.info(f"Saved glycosidic info to {glycosidic_path}")
     
@@ -490,14 +506,28 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
     Reads torsion names directly from CSV and performs glycosidic classification.
     """
     stats_path = os.path.join(embedding_dir, "torsion_stats.json")
+    # If file exists but appears incomplete (empty torsions/levels), recompute
     if os.path.exists(stats_path) and not force:
-        logger.info("Torsion stats step: torsion_stats.json exists; skipping (use --update to force)")
-        return
+        try:
+            storage = get_storage_manager()
+            with storage.open(stats_path, 'r') as f:
+                existing = json.load(f)
+            tors_ok = isinstance(existing, dict) and existing.get('torsions', {}).get('labels')
+            levels_ok = isinstance(existing, dict) and existing.get('levels')
+            if tors_ok and levels_ok:
+                logger.info("Torsion stats step: torsion_stats.json complete; skipping (use --update to force)")
+                return
+            else:
+                logger.info("Torsion stats step: existing file incomplete; recomputing")
+        except Exception:
+            # Fall through to recompute
+            pass
     torsion_csv = os.path.join(embedding_dir, "torsions.csv")
     if not os.path.exists(torsion_csv):
         logger.warning("torsions.csv not found; skipping cluster torsion stats")
         # Create an empty file to mark step as complete
-        with open(stats_path, 'w', encoding='utf-8') as f:
+        storage = get_storage_manager()
+        with storage.open(stats_path, 'w') as f:
             json.dump({'levels': [], 'torsions': {}}, f)
         return
     
@@ -686,7 +716,8 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
         'levels': levels_summary,
     }
 
-    with open(stats_path, 'w', encoding='utf-8') as f:
+    storage = get_storage_manager()
+    with storage.open(stats_path, 'w') as f:
         json.dump(torsion_stats_data, f, indent=2)
     logger.info(f"Wrote cluster torsion stats to {stats_path}")
 
@@ -696,13 +727,14 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
         meta = {}
         if os.path.exists(meta_path):
             try:
-                with open(meta_path, 'r', encoding='utf-8') as mf:
+                storage = get_storage_manager()
+                with storage.open(meta_path, 'r') as mf:
                     meta = json.load(mf)
             except Exception:
                 meta = {}
         # add or replace mapping
         meta['level_average_entropy'] = {str(k): (None if v is None else float(v)) for k, v in level_entropy_map.items()}
-        with open(meta_path, 'w', encoding='utf-8') as mf:
+        with storage.open(meta_path, 'w') as mf:
             json.dump(meta, mf, indent=2)
         logger.info(f"Updated metadata.json with level average entropies at {meta_path}")
     except Exception as exc:
@@ -721,7 +753,8 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
     pca_json_path = os.path.join(embedding_dir, 'pca.json')
     if os.path.exists(pca_json_path):
         try:
-            with open(pca_json_path, 'r', encoding='utf-8') as pf:
+            storage = get_storage_manager()
+            with storage.open(pca_json_path, 'r') as pf:
                 pca_json_data = json.load(pf)
             logger.info(f"Loaded pca.json data for info.json")
         except Exception as exc:
@@ -732,7 +765,7 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
     torsion_stats_path = os.path.join(embedding_dir, 'torsion_stats.json')
     if os.path.exists(torsion_stats_path):
         try:
-            with open(torsion_stats_path, 'r', encoding='utf-8') as tsf:
+            with storage.open(torsion_stats_path, 'r') as tsf:
                 torsion_stats_data = json.load(tsf)
             logger.info(f"Loaded torsion_stats.json data for info.json")
         except Exception as exc:
@@ -747,7 +780,8 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
         'schema_version': 2, # Incremented version
     }
 
-    with open(info_path, 'w', encoding='utf-8') as f:
+    storage = get_storage_manager()
+    with storage.open(info_path, 'w') as f:
         json.dump(info, f, indent=2)
     logger.info(f"Wrote consolidated data to {info_path}")
 
@@ -775,15 +809,15 @@ def step_save_representative_structures(
     """
     os.makedirs(out_dir, exist_ok=True)
     
-    # Check if structures already exist (simple check for any PDB files)
-    existing_pdbs = []
-    if os.path.exists(out_dir):
+    # If multi-model files already exist and not forcing, skip
+    if os.path.exists(out_dir) and not force:
+        already = []
         for root, dirs, files in os.walk(out_dir):
-            existing_pdbs.extend([f for f in files if f.endswith('.pdb')])
-    
-    if existing_pdbs and not force:
-        logger.info("Representative structures exist; skipping (use --update to force)")
-        return
+            if any(fn in files for fn in ("alpha.pdb", "beta.pdb")):
+                already.append(root)
+        if already:
+            logger.info("Multi-model representative structures exist; skipping (use --update to force)")
+            return
     
     # Load clustering results
     try:
@@ -806,14 +840,32 @@ def step_save_representative_structures(
         reps_df = cr.representatives(level)
         level_dir = os.path.join(out_dir, f"level_{level}")
         os.makedirs(level_dir, exist_ok=True)
+        # Prepare aggregated alpha/beta files
+        alpha_out = os.path.join(level_dir, "alpha.pdb")
+        beta_out = os.path.join(level_dir, "beta.pdb")
+        # Write a small header remark to each
+        with open(alpha_out, "w") as fa:
+            fa.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER ALPHA\n")
+        with open(beta_out, "w") as fb:
+            fb.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER BETA\n")
         
-        # Create alpha and beta subdirectories
-        alpha_dir = os.path.join(level_dir, "alpha")
-        beta_dir = os.path.join(level_dir, "beta")
-        os.makedirs(alpha_dir, exist_ok=True)
-        os.makedirs(beta_dir, exist_ok=True)
-        
-        for row in reps_df.iter_rows(named=True):
+        # Materialize rows so we can inspect for a cluster-0 representative to use
+        rows = list(reps_df.iter_rows(named=True))
+
+        # Determine reference frame for alignment: prefer representative of cluster 0 if present
+        reference_frame_idx = 0
+        try:
+            for r in rows:
+                try:
+                    if int(r.get('cluster_id', -1)) == 0 and r.get('representative_idx') is not None:
+                        reference_frame_idx = int(r.get('representative_idx'))
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            reference_frame_idx = 0
+
+        for row in rows:
             cid = int(row['cluster_id'])
             rep_idx = row.get('representative_idx')
             cluster_size_pct = row.get('cluster_size_pct', 0.0)
@@ -827,53 +879,91 @@ def step_save_representative_structures(
             # Format cluster percentage for display
             pct_str = f"{cluster_size_pct:.1f}%" if cluster_size_pct is not None else "0.0%"
             
-            # Save original anomer structure
-            original_filename = f"cluster_{cid}_rep_{rep_frame}_{pct_str}.pdb"
-            if current_anomer == "alpha":
-                original_path = os.path.join(alpha_dir, original_filename)
-            else:
-                original_path = os.path.join(beta_dir, original_filename)
-            
+            # Append original anomer to the corresponding aggregated file
             try:
                 title = f"Level {level} Cluster {cid} Representative {rep_frame} ({current_anomer}) - {pct_str}"
-                glypdbio.write_pdb_for_frame(
-                    out_dir=frame_data_dir,
+                # Write to a temp file using alignment, then append with normalized MODEL numbering
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w+', suffix='.pdb', delete=False) as tf:
+                    tmp_path = tf.name
+                glypdbio.write_aligned_pdb_for_frame(
+                    frame_data_dir=frame_data_dir,
                     frame_idx=rep_frame,
-                    path=original_path,
+                    reference_frame_idx=0,
+                    path=tmp_path,
                     title=title,
-                    flip=False
+                    flip=False,
                 )
+                with open(tmp_path, 'r') as ftmp:
+                    content = ftmp.read().splitlines()
+                os.unlink(tmp_path)
+                # Normalize: replace MODEL number with sequential, strip TITLE, keep ATOM/HETATM/ANISOU/TER and ENDMDL
+                # Determine next model index by counting existing ENDMDL in file
+                def _append_model(out_path: str, lines: list[str], cid: int, pct: float):
+                    try:
+                        with open(out_path, 'r') as fh:
+                            prev = fh.read()
+                        m_idx = prev.count('ENDMDL') + 1
+                    except Exception:
+                        m_idx = 1
+                    with open(out_path, 'a') as fh:
+                        fh.write(f"MODEL     {m_idx:4d}\n")
+                        fh.write(f"REMARK   CLUSTER_ID {cid}\n")
+                        try:
+                            fh.write(f"REMARK   CLUSTER_POPULATION_PCT {float(pct):.4f}\n")
+                        except Exception:
+                            pass
+                        for ln in lines:
+                            if ln.startswith('TITLE'):
+                                continue
+                            if ln.startswith(('ATOM', 'HETATM', 'ANISOU', 'TER')):
+                                fh.write(ln + "\n")
+                        fh.write("ENDMDL\n")
+                if current_anomer == 'alpha':
+                    _append_model(alpha_out, content, cid, cluster_size_pct)
+                else:
+                    _append_model(beta_out, content, cid, cluster_size_pct)
                 total_structures += 1
-                logger.debug(f"Saved {original_filename}")
             except Exception as exc:
-                logger.warning(f"Failed to save original structure for cluster {cid}: {exc}")
+                logger.warning(f"Failed to append original structure for cluster {cid}: {exc}")
                 continue
-            
-            # Save flipped anomer structure
-            flipped_anomer = "beta" if current_anomer == "alpha" else "alpha"
-            flipped_filename = f"cluster_{cid}_rep_{rep_frame}_{pct_str}.pdb"
-            if flipped_anomer == "alpha":
-                flipped_path = os.path.join(alpha_dir, flipped_filename)
-            else:
-                flipped_path = os.path.join(beta_dir, flipped_filename)
-            
+
+            # Append flipped anomer to the other aggregated file
+            flipped_anomer = 'beta' if current_anomer == 'alpha' else 'alpha'
             try:
                 title = f"Level {level} Cluster {cid} Representative {rep_frame} ({flipped_anomer}) - {pct_str}"
-                glypdbio.write_pdb_for_frame(
-                    out_dir=frame_data_dir,
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w+', suffix='.pdb', delete=False) as tf2:
+                    tmp2 = tf2.name
+                glypdbio.write_aligned_pdb_for_frame(
+                    frame_data_dir=frame_data_dir,
                     frame_idx=rep_frame,
-                    path=flipped_path,
+                    reference_frame_idx=0,
+                    path=tmp2,
                     title=title,
-                    flip=True
+                    flip=True,
                 )
+                with open(tmp2, 'r') as f2:
+                    content2 = f2.read().splitlines()
+                os.unlink(tmp2)
+                if flipped_anomer == 'alpha':
+                    _append_model(alpha_out, content2, cid, cluster_size_pct)
+                else:
+                    _append_model(beta_out, content2, cid, cluster_size_pct)
                 total_structures += 1
-                logger.debug(f"Saved {flipped_filename}")
             except Exception as exc:
-                logger.warning(f"Failed to save flipped structure for cluster {cid}: {exc}")
+                logger.warning(f"Failed to append flipped structure for cluster {cid}: {exc}")
                 continue
+
+        # Finalize files with END
+        for outp in (alpha_out, beta_out):
+            try:
+                with open(outp, 'a') as fh:
+                    fh.write('END\n')
+            except Exception:
+                pass
     
-    logger.info(f"Saved {total_structures} representative structures in {out_dir}")
-    logger.info(f"Structures organized by level and anomer type (alpha/beta subdirectories)")
+    logger.info(f"Saved {total_structures} representative models across alpha/beta multi-model files in {out_dir}")
 
 
 def step_plot_torsion_distributions(
@@ -1035,7 +1125,8 @@ def step_export_analysis_data(
         else:
             try:
                 # Load info.json to get glycosidic torsion information
-                with open(info_source_path, 'r', encoding='utf-8') as f:
+                storage = get_storage_manager()
+                with storage.open(info_source_path, 'r') as f:
                     info_data = json.load(f)
 
                 glycosidic_torsions = info_data.get('torsions', {}).get('glycosidic', [])
@@ -1073,7 +1164,8 @@ def step_export_analysis_data(
                     # CSV with only the requested columns.
                     import csv
 
-                    with open(torsion_source_path, 'r', encoding='utf-8', newline='') as fin:
+                    storage = get_storage_manager()
+                    with storage.open(torsion_source_path, 'r') as fin:
                         reader = csv.reader(fin)
                         header = next(reader)
                         col_to_idx = {col: i for i, col in enumerate(header)}
@@ -1093,7 +1185,7 @@ def step_export_analysis_data(
 
                         if selected_indices:
                             # Stream rows and write selected columns to output CSV
-                            with open(torsion_glycosidic_out_path, 'w', encoding='utf-8', newline='') as fout:
+                            with storage.open(torsion_glycosidic_out_path, 'w') as fout:
                                 writer = csv.writer(fout)
                                 writer.writerow(out_header)
                                 for row in reader:
@@ -1194,19 +1286,30 @@ class GlycanAnalysisPipeline:
         else:
             json_path = os.path.join(input_glycan_dir, "name.json")
             try:
-                with open(json_path, 'r') as f:
+                storage = get_storage_manager()
+                with storage.open(json_path, 'r') as f:
                     data = json.load(f)
                 glycam_name = data['indexOrderedSequence']
             except (FileNotFoundError, KeyError, json.JSONDecodeError):
                 self.logger.warning(f"Could not read GLYCAM name from {json_path}, using directory name")
                 glycam_name = glycan_name
         
+        # Resolve input file names, supporting alternate names used in Oracle bucket
+        storage = get_storage_manager()
+        default_pdb = os.path.join(input_glycan_dir, f"{glycan_name}.pdb")
+        default_mol2 = os.path.join(input_glycan_dir, f"{glycan_name}.mol2")
+        alt_pdb = os.path.join(input_glycan_dir, "simulation.pdb")
+        alt_mol2 = os.path.join(input_glycan_dir, "structure.mol2")
+
+        pdb_path = default_pdb if storage.exists(default_pdb) else (alt_pdb if storage.exists(alt_pdb) else default_pdb)
+        mol2_path = default_mol2 if storage.exists(default_mol2) else (alt_mol2 if storage.exists(alt_mol2) else default_mol2)
+
         return {
             'input_glycan_dir': input_glycan_dir,  # For reading input files
             'process_glycan_dir': process_glycan_dir,  # For storing processing outputs
             'glycam_name': glycam_name,
-            'pdb_path': os.path.join(input_glycan_dir, f"{glycan_name}.pdb"),
-            'mol2_path': os.path.join(input_glycan_dir, f"{glycan_name}.mol2"),
+            'pdb_path': pdb_path,
+            'mol2_path': mol2_path,
             'frame_data_dir': os.path.join(process_glycan_dir, "data"),
             'out_dir': os.path.join(process_glycan_dir, "output"),
             'embedding_dir': os.path.join(process_glycan_dir, "embedding")
@@ -1221,14 +1324,14 @@ class GlycanAnalysisPipeline:
         Returns:
             True if all required files exist, False otherwise
         """
-        required_files = ['pdb_path', 'mol2_path']
-        
-        for file_key in required_files:
-            file_path = paths[file_key]
-            if not os.path.exists(file_path):
-                self.logger.error(f"Required file not found: {file_path}")
-                return False
-                
+        storage = get_storage_manager()
+        # Already resolved preferred paths in get_glycan_paths
+        if not storage.exists(paths['pdb_path']):
+            self.logger.error(f"Required file not found: {paths['pdb_path']}")
+            return False
+        if not storage.exists(paths['mol2_path']):
+            self.logger.error(f"Required file not found: {paths['mol2_path']}")
+            return False
         return True
     
     def run_analysis(self, glycan_name: str, force_update: bool = False, per_pair_scale: bool = False) -> Dict[str, any]:
@@ -1432,18 +1535,18 @@ class GlycanAnalysisPipeline:
         }
         
         # Check each step's output
+        storage = get_storage_manager()
         steps_to_check = {
             'store': os.path.join(paths['frame_data_dir'], 'atoms.parquet'),
             'pca': os.path.join(paths['embedding_dir'], 'pca_conformation_landscape.parquet'),
             'clustering': os.path.join(paths['embedding_dir'], 'clustering_results.json'),
             'torsions': os.path.join(paths['embedding_dir'], 'torsions.csv'),
             'cluster_stats': os.path.join(paths['embedding_dir'], 'info.json'),
-            'structures': paths['out_dir'],  # Check if output directory exists
+            'structures': paths['out_dir'],
             'export': os.path.join(paths['out_dir'], 'pca.csv')
         }
-        
         for step, check_path in steps_to_check.items():
-            status['steps_status'][step] = os.path.exists(check_path)
+            status['steps_status'][step] = storage.exists(check_path)
             
         return status
 
