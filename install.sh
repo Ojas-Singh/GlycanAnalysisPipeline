@@ -260,11 +260,14 @@ if python main.py; then
     
     # Check for POWEROFF environment variable
     if [[ "${POWEROFF,,}" == "true" ]]; then
-        echo "POWEROFF=true detected. Shutting down the system..."
-        if command -v systemctl &> /dev/null; then
-            sudo systemctl poweroff
+        echo "POWEROFF=true detected. Shutting down the instance via OCI..."
+        if command -v oci &> /dev/null; then
+            oci compute instance action \
+              --instance-id "$(curl -s -H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id)" \
+              --action SOFTSTOP \
+              --auth instance_principal
         else
-            echo "systemctl not found. Cannot power off automatically."
+            echo "oci command not found. Cannot shut down instance automatically."
         fi
     fi
 else
