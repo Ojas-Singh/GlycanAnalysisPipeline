@@ -29,3 +29,6 @@ query_tool
 last_run.log
 docs/TODO.md
 .env
+process/
+static/
+GLYCOSHAPE_RDF/

@@ -175,6 +175,35 @@ fi
 echo "Installation complete!"
 echo "Virtual environment created at .venv"
 
+# Function to load .env file
+load_dotenv() {
+    if [[ -f ".env" ]]; then
+        echo "Loading environment variables from .env file..."
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ $key =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            # Remove optional 'export ' prefix
+            key=${key#export }
+            # Trim whitespace
+            key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            # Remove surrounding quotes
+            value=${value#\"}
+            value=${value%\"}
+            value=${value#\'}
+            value=${value%\'}
+            # Set only if not already set
+            if [[ -z "${!key}" ]]; then
+                export "$key=$value"
+            fi
+        done < .env
+    fi
+}
+
+# Load .env file if present
+load_dotenv
+
 # Check if environment variables are set
 echo "Checking environment variables..."
 
@@ -197,6 +226,7 @@ done
 if [[ ${#MISSING_VARS[@]} -gt 0 ]]; then
     echo "WARNING: Missing required environment variables: ${MISSING_VARS[*]}"
     echo "Please set these variables before running the pipeline."
+    echo "You can set them in your shell environment or in a .env file in the project root."
     echo "See README.md for configuration instructions."
     echo ""
     if [[ "$RUN_MODE" == true ]]; then
@@ -227,6 +257,16 @@ if python main.py; then
     echo "To run the pipeline again in the future:"
     echo "1. Activate environment: source .venv/bin/activate"
     echo "2. Run: python main.py"
+    
+    # Check for POWEROFF environment variable
+    if [[ "${POWEROFF,,}" == "true" ]]; then
+        echo "POWEROFF=true detected. Shutting down the system..."
+        if command -v systemctl &> /dev/null; then
+            sudo systemctl poweroff
+        else
+            echo "systemctl not found. Cannot power off automatically."
+        fi
+    fi
 else
     echo ""
     echo "✗ Pipeline run completed with errors."
