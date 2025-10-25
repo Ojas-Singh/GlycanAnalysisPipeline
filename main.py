@@ -82,23 +82,15 @@ class GlycanPipelineRunner:
             
         # List items in data directory - different approach for Oracle vs Local
         if config.use_oracle_storage:
-            # For Oracle, enumerate objects under the data prefix and infer glycan folders
-            logger.info("Using Oracle storage - listing objects under data prefix and detecting glycans")
+            # For Oracle, list immediate directories under data/ using delimiter (fast)
+            logger.info("Using Oracle storage - fast listing of glycan directories under data prefix")
             try:
-                objs = self.storage.list_files(self.data_dir, "*")
+                dirs = self.storage.list_dirs(self.data_dir)
             except Exception as e:
-                logger.error(f"Failed to list objects under {self.data_dir}: {e}")
-                objs = []
+                logger.error(f"Failed to list directories under {self.data_dir}: {e}")
+                dirs = []
 
-            prefix = str(self.data_dir).strip('/')
-            candidates = set()
-            for it in objs:
-                key = it.as_posix() if hasattr(it, 'as_posix') else str(it)
-                rel = key[len(prefix) + 1:] if prefix and key.startswith(prefix + '/') else key
-                if '/' in rel:
-                    cand = rel.split('/', 1)[0]
-                    if cand:
-                        candidates.add(cand)
+            candidates = sorted([d.name if hasattr(d, 'name') else str(d).split('/')[-1] for d in dirs])
 
             for cand in sorted(candidates):
                 # Accept either <cand>.pdb/.mol2 or simulation.pdb/structure.mol2
@@ -553,7 +545,8 @@ class GlycanPipelineRunner:
                 try:
                     local_process_dir = os.path.join(str(self.process_dir), glycan_name)
                     remote_prefix = f"{self.process_dir}/{glycan_name}"
-                    self.storage.upload_dir(local_process_dir, remote_prefix)
+                    # Upload only new/modified files, skip existing
+                    self.storage.upload_dir(local_process_dir, remote_prefix, skip_existing=True)
                     logger.info(f"Uploaded process outputs to Oracle: {remote_prefix}")
                     
                     # Clean up local folder after successful upload
@@ -570,13 +563,44 @@ class GlycanPipelineRunner:
             return results
             
         # Step 2: glystatic
-        results["glystatic"] = self.run_glystatic(glycan_name)
-        if results["glystatic"] and config.use_oracle_storage:
+        did_run_glystatic = False
+        # If outputs already exist and are valid (locally or in Oracle), skip recomputation and re-upload
+        if not self.force_update and self.check_glystatic_completion(glycan_name):
+            logger.info(f"glystatic already complete for {glycan_name}, skipping")
+            results["glystatic"] = True
+        else:
+            results["glystatic"] = self.run_glystatic(glycan_name)
+            did_run_glystatic = results["glystatic"]
+
+        if results["glystatic"] and did_run_glystatic and config.use_oracle_storage:
             try:
-                local_static_dir = str(self.output_dir)
-                remote_static_prefix = str(self.output_dir)
-                self.storage.upload_dir(local_static_dir, remote_static_prefix)
-                logger.info(f"Uploaded static outputs to Oracle: {remote_static_prefix}")
+                # Only upload the specific GS* folder generated for this glycan, not the entire output directory
+                # Find matching GS folder locally
+                gs_folder_local = None
+                try:
+                    candidates = self.storage.list_files(self.output_dir, "GS*")
+                except Exception:
+                    candidates = []
+                for cand in candidates:
+                    key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                    data_json = f"{key}/data.json"
+                    try:
+                        with self.storage.open(data_json, 'r') as f:
+                            data = json.load(f)
+                    except Exception:
+                        continue
+                    arche = data.get('archetype', {}) if isinstance(data, dict) else {}
+                    name_field = arche.get('name') or arche.get('glycam')
+                    if name_field and glycan_name.lower() in str(name_field).lower():
+                        gs_folder_local = key
+                        break
+                if gs_folder_local is None:
+                    logger.warning(f"Could not determine GS folder for {glycan_name}; skipping upload of static outputs")
+                else:
+                    local_static_dir = gs_folder_local
+                    remote_static_prefix = gs_folder_local
+                    self.storage.upload_dir(local_static_dir, remote_static_prefix, skip_existing=True)
+                    logger.info(f"Uploaded static outputs to Oracle: {remote_static_prefix}")
             except Exception as e:
                 logger.warning(f"Failed to upload static outputs for {glycan_name}: {e}")
         if not results["glystatic"]:

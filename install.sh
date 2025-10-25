@@ -175,25 +175,100 @@ fi
 echo "Installation complete!"
 echo "Virtual environment created at .venv"
 
+# Ensure Java is installed (required for running java -jar tools)
+echo "Checking Java installation..."
+ensure_java() {
+    if command -v java >/dev/null 2>&1; then
+        echo "Java detected: $(java -version 2>&1 | head -n 1)"
+        return 0
+    fi
+
+    echo "Java not found. Attempting to install OpenJDK 17 (LTS)..."
+
+    run_install() {
+        # forward all args to the package manager command
+        if command -v sudo >/dev/null 2>&1; then
+            sudo "$@"
+        else
+            "$@"
+        fi
+    }
+
+    if command -v dnf >/dev/null 2>&1; then
+        # Oracle Linux / RHEL 8/9
+        if ! run_install dnf -y install java-17-openjdk-headless; then
+            echo "Falling back to OpenJDK 11..."
+            run_install dnf -y install java-11-openjdk-headless
+        fi
+    elif command -v yum >/dev/null 2>&1; then
+        if ! run_install yum -y install java-17-openjdk-headless; then
+            echo "Falling back to OpenJDK 11..."
+            run_install yum -y install java-11-openjdk-headless
+        fi
+    elif command -ve apt-get >/dev/null 2>&1; then
+        run_install apt-get update
+        if ! run_install apt-get -y install openjdk-17-jre-headless; then
+            echo "Falling back to OpenJDK 11..."
+            run_install apt-get -y install openjdk-11-jre-headless
+        fi
+    elif command -v zypper >/dev/null 2>&1; then
+        run_install zypper --non-interactive install java-17-openjdk
+    elif command -v pacman >/dev/null 2>&1; then
+        run_install pacman -Sy --noconfirm jre-openjdk
+    else
+        echo "ERROR: Could not detect a supported package manager to install Java. Please install Java 11+ manually."
+        return 1
+    fi
+
+    if command -v java >/dev/null 2>&1; then
+        echo "Java installed: $(java -version 2>&1 | head -n 1)"
+        # Set JAVA_HOME for this session
+        JAVA_BIN=$(readlink -f "$(command -v java)")
+        JAVA_HOME=$(dirname "$(dirname "$JAVA_BIN")")
+        export JAVA_HOME
+        export PATH="$JAVA_HOME/bin:$PATH"
+        echo "JAVA_HOME set to: $JAVA_HOME"
+        return 0
+    else
+        echo "ERROR: Java installation appears to have failed."
+        return 1
+    fi
+}
+
+ensure_java
+
 # Function to load .env file
 load_dotenv() {
     if [[ -f ".env" ]]; then
         echo "Loading environment variables from .env file..."
-        while IFS='=' read -r key value; do
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Trim leading/trailing whitespace
+            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             # Skip comments and empty lines
-            [[ $key =~ ^[[:space:]]*# ]] && continue
-            [[ -z "$key" ]] && continue
-            # Remove optional 'export ' prefix
-            key=${key#export }
-            # Trim whitespace
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            # Support optional 'export ' prefix
+            line=${line#export }
+            # Ensure the line contains an '=' for KEY=VALUE
+            if [[ "$line" != *"="* ]]; then
+                echo "Skipping invalid .env line (no '='): $line" >&2
+                continue
+            fi
+            # Split on first '=' only to allow '=' inside values
+            key=${line%%=*}
+            value=${line#*=}
+            # Trim whitespace from key/value
             key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            # Remove surrounding quotes
-            value=${value#\"}
-            value=${value%\"}
-            value=${value#\'}
-            value=${value%\'}
-            # Set only if not already set
+            # Validate key (alnum and underscore, cannot start with digit)
+            if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "Skipping invalid env var name: $key" >&2
+                continue
+            fi
+            # Remove optional surrounding quotes from value
+            if [[ "$value" =~ ^\".*\"$ || "$value" =~ ^\'.*\'$ ]]; then
+                value=${value:1:${#value}-2}
+            fi
+            # Set only if not already set in environment
             if [[ -z "${!key}" ]]; then
                 export "$key=$value"
             fi
@@ -207,10 +282,15 @@ load_dotenv
 # Check if environment variables are set
 echo "Checking environment variables..."
 
+# Backward compatibility: support GLYCOSHAPE_OUTPUT_PATH if set
+if [[ -z "$GLYCOSHAPE_OUTPUT_DIR" && -n "$GLYCOSHAPE_OUTPUT_PATH" ]]; then
+    export GLYCOSHAPE_OUTPUT_DIR="$GLYCOSHAPE_OUTPUT_PATH"
+fi
+
 REQUIRED_VARS=(
     "GLYCOSHAPE_DATA_DIR"
     "GLYCOSHAPE_PROCESS_DIR" 
-    "GLYCOSHAPE_OUTPUT_PATH"
+    "GLYCOSHAPE_OUTPUT_DIR"
     "GLYCOSHAPE_INVENTORY_PATH"
     "GLYTOUCAN_CONTRIBUTOR_ID"
     "GLYTOUCAN_API_KEY"

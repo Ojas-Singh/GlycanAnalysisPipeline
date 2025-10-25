@@ -342,6 +342,71 @@ class OracleStorageBackend(StorageBackend):
         except Exception as e:
             logger.error(f"Failed to list files in {path}: {e}")
             return []
+
+    def list_common_prefixes(self, prefix: Union[str, Path]) -> list:
+        """List immediate child 'directories' under the given prefix using delimiter.
+
+        Returns a list of prefix strings (e.g., 'data/folder').
+        """
+        base = str(prefix).replace('\\', '/').strip('/')
+        url = f"{self.par_url}/"
+        try:
+            prefixes = []
+            next_marker = None
+            while True:
+                params = {"prefix": (base + '/' if base else ''), "limit": 1000, "delimiter": "/"}
+                if next_marker:
+                    params.update({
+                        "start": next_marker,
+                        "startAfter": next_marker,
+                        "continuation-token": next_marker,
+                        "marker": next_marker,
+                    })
+                resp = requests.get(url, params=params, timeout=15)
+                if resp.status_code != 200:
+                    break
+                next_marker = None
+                # Try JSON first
+                try:
+                    data = resp.json()
+                    prefs = data.get('prefixes') or data.get('Prefixes') or []
+                    for p in prefs:
+                        p = str(p).lstrip('/')
+                        prefixes.append(p)
+                    next_marker = data.get('nextStartWith') or data.get('NextStartWith')
+                except ValueError:
+                    # XML fallback
+                    try:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(resp.text)
+                        for cp in root.findall('.//{*}CommonPrefixes'):
+                            pe = cp.find('{*}Prefix')
+                            if pe is not None and pe.text:
+                                prefixes.append(pe.text.lstrip('/'))
+                        is_truncated = root.find('.//{*}IsTruncated')
+                        if is_truncated is not None and is_truncated.text and is_truncated.text.lower() == 'true':
+                            token_el = root.find('.//{*}NextContinuationToken')
+                            if token_el is not None and token_el.text:
+                                next_marker = token_el.text
+                    except Exception:
+                        pass
+                if not next_marker:
+                    break
+            # Reduce to immediate child folders: data/foo/, not deeper
+            out = []
+            seen = set()
+            base_with_slash = (base + '/') if base else ''
+            for p in prefixes:
+                rel = p[len(base_with_slash):] if p.startswith(base_with_slash) else p
+                seg = rel.split('/', 1)[0]
+                full = (base_with_slash + seg).rstrip('/')
+                if seg and full not in seen:
+                    seen.add(full)
+                    out.append(full)
+            return out
+        except Exception as e:
+            logger.error(f"Failed to list prefixes for {prefix}: {e}")
+            return []
     
     def open_text(self, path: Union[str, Path], mode: str = "r") -> TextIO:
         """Open a text file."""
@@ -488,6 +553,12 @@ class StorageManager:
         p = str(path).lstrip('/')
         return 'process' in p
 
+    def _is_output_prefix(self, path: Union[str, Path]) -> bool:
+        """Check if path is an output/static directory path."""
+        p = str(path).lstrip('/')
+        # Default output dir is 'static'; also handle any path containing '/output' subdir
+        return p == 'static' or p.startswith('static/') or 'output/' in p or p.endswith('/output') or p == 'output'
+
     def _should_write_locally(self, path: Union[str, Path]) -> bool:
         # In Oracle mode, stage all writes locally; sync handled elsewhere
         return self._is_oracle
@@ -575,6 +646,12 @@ class StorageManager:
             if 'inventory' in path_str and path_str.endswith('.csv'):
                 # For inventory CSV, check Oracle first
                 return self.backend.exists(path)
+            # For output/static prefixes, prefer remote check to avoid missing remote-only content
+            if self._is_output_prefix(path):
+                try:
+                    return self.backend.exists(path)
+                except Exception:
+                    return False
             # For other files, prefer local staged files first, then fall back to remote
             try:
                 if self._local_backend.exists(path):
@@ -614,6 +691,12 @@ class StorageManager:
             pass
         # In Oracle mode, prefer local staged dirs first, then fall back to remote
         if self._is_oracle:
+            # Output/static prefixes should query remote first
+            if self._is_output_prefix(path):
+                try:
+                    return self.backend.is_dir(path)
+                except Exception:
+                    return False
             try:
                 if self._local_backend.is_dir(path):
                     return True
@@ -634,7 +717,7 @@ class StorageManager:
         # In Oracle mode, prioritize remote for process and data prefixes
         if self._is_oracle:
             path_str = str(path)
-            if self._is_process_prefix(path_str) or self._is_data_prefix(path_str):
+            if self._is_process_prefix(path_str) or self._is_data_prefix(path_str) or self._is_output_prefix(path_str):
                 return self.backend.list_files(path, pattern)
             # For other directories, prefer local listings (best effort)
             try:
@@ -642,6 +725,29 @@ class StorageManager:
             except Exception:
                 return []
         return self.backend.list_files(path, pattern)
+
+    def list_dirs(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> list:
+        """List immediate subdirectories for the given path.
+
+        - For Oracle backend, uses delimiter to fetch common prefixes (fast).
+        - For local backend, returns directories under the path.
+        Returns a list of Path-like entries.
+        """
+        path = self._wrap_path(path, base_dir)
+        if isinstance(self.backend, OracleStorageBackend):
+            base = str(path)
+            prefixes = self.backend.list_common_prefixes(base)
+            return [Path(p) for p in prefixes]
+        # Local: filter directories under path
+        items = self._local_backend.list_files(path, '*')
+        dirs = []
+        for it in items:
+            try:
+                if self._local_backend.is_dir(it):
+                    dirs.append(it)
+            except Exception:
+                pass
+        return dirs
     
     def mkdir(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None, 
               parents: bool = True, exist_ok: bool = True) -> None:
@@ -665,7 +771,7 @@ class StorageManager:
         # For Oracle mode, prioritize remote reads for process directories and inventory CSV
         if self._is_oracle:
             path_str = str(path)
-            if self._is_process_prefix(path_str) or ('inventory' in path_str.lower() and path_str.lower().endswith('.csv')):
+            if self._is_process_prefix(path_str) or self._is_output_prefix(path_str) or ('inventory' in path_str.lower() and path_str.lower().endswith('.csv')):
                 # For process directories and inventory CSV, read from Oracle bucket first
                 return self.backend.read_text(path, encoding)
             # For other directories, prefer local staged file
@@ -685,7 +791,7 @@ class StorageManager:
         # For Oracle mode, prioritize remote reads for process directories and inventory CSV
         if self._is_oracle:
             path_str = str(path)
-            if self._is_process_prefix(path_str) or ('inventory' in path_str.lower() and path_str.lower().endswith('.csv')):
+            if self._is_process_prefix(path_str) or self._is_output_prefix(path_str) or ('inventory' in path_str.lower() and path_str.lower().endswith('.csv')):
                 # For process directories and inventory CSV, read from Oracle bucket first
                 return self.backend.read_binary(path)
             # For other directories, prefer local staged file
@@ -720,8 +826,13 @@ class StorageManager:
             pass
         self.backend.unlink(path)
 
-    def upload_dir(self, local_dir: Union[str, Path], remote_prefix: Union[str, Path]) -> None:
+    def upload_dir(self, local_dir: Union[str, Path], remote_prefix: Union[str, Path], skip_existing: bool = True) -> None:
         """Recursively upload a local directory to the current backend under remote_prefix.
+
+        Args:
+            local_dir: Local directory to traverse and upload
+            remote_prefix: Destination prefix/path in the active backend
+            skip_existing: When True, do not overwrite files that already exist remotely
 
         Note: Intended for syncing local outputs to remote object storage in Oracle mode.
         """
@@ -732,12 +843,22 @@ class StorageManager:
             return
         success_count = 0
         fail_count = 0
+        skip_count = 0
         for root, _, files in os.walk(local_dir):
             for fname in files:
                 lpath = Path(root) / fname
                 rel = lpath.relative_to(local_dir).as_posix()
                 rpath = f"{remote_prefix}/{rel}" if remote_prefix else rel
                 try:
+                    # If requested, skip upload when destination already exists
+                    if skip_existing:
+                        try:
+                            if self.backend.exists(rpath):
+                                skip_count += 1
+                                continue
+                        except Exception:
+                            # If existence check fails, fall back to uploading
+                            pass
                     with open(lpath, 'rb') as f:
                         data = f.read()
                     self.backend.write_binary(rpath, data)
@@ -745,7 +866,7 @@ class StorageManager:
                 except Exception as e:
                     logger.warning(f"upload_dir: failed to upload {lpath} -> {rpath}: {e}")
                     fail_count += 1
-        logger.info(f"upload_dir: uploaded {success_count} files to '{remote_prefix}' ({fail_count} failures)")
+        logger.info(f"upload_dir: uploaded {success_count} files to '{remote_prefix}' (skipped {skip_count} existing, {fail_count} failures)")
 
     def delete_local_directory(self, path: Union[str, Path]) -> bool:
         """Safely delete a local directory and all its contents.
