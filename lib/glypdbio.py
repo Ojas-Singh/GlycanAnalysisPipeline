@@ -843,8 +843,12 @@ def emit_multimodel_pdbs(
 ) -> None:
     """Create multi-model PDBs (alpha/beta) for a level into GLYCAM and PDB formats.
 
-    This reads per-cluster PDBs from the source level directory (alpha/beta) and
-    writes a single multi-model file per anomer under dest_level_dir/<FORMAT>/<anomer>.pdb.
+    Preferred path: rebuild the multi-models from the underlying atoms/bonds/coords
+    to ensure proper CONECT records and alignment across models using the first
+    5 residues as the alignment core. If underlying trajectory data is not
+    accessible, fall back to concatenating per‑cluster PDB files.
+
+    Outputs one multi-model file per anomer under dest_level_dir/<FORMAT>/<anomer>.pdb.
 
     Additionally, GlycoShape remarks (glytoucan/iupac) are added at the top of the
     resulting files. Per-model REMARKs include cluster ID and population percent
@@ -883,25 +887,368 @@ def emit_multimodel_pdbs(
     source_level_dir = Path(source_level_dir)
     dest_level_dir = Path(dest_level_dir)
 
+    # ---------- Helpers for rebuild-from-trajectory path ----------
+    def _select_align_indices(atoms_df: pl.DataFrame, n_residues: int = 5) -> np.ndarray:
+        """Return atom indices for alignment using heavy atoms of first n residues.
+
+        Select the lowest n unique res_id values and include atoms whose element
+        does not start with 'H'. Returns an int numpy array (possibly empty).
+        """
+        try:
+            res_ids = atoms_df["res_id"].to_numpy()
+        except Exception:
+            return np.array([], dtype=int)
+        try:
+            elems = atoms_df["element"].to_numpy()
+        except Exception:
+            elems = np.array(["C"] * len(res_ids))
+        # first n unique residue ids (sorted)
+        uniq = []
+        for r in res_ids:
+            if r not in uniq:
+                uniq.append(int(r))
+            if len(uniq) >= int(n_residues):
+                break
+        uniq_set = set(uniq)
+        mask = np.array([(rid in uniq_set) and (str(el).strip().upper()[:1] != "H") for rid, el in zip(res_ids, elems)], dtype=bool)
+        idx = np.nonzero(mask)[0]
+        return idx.astype(int)
+
+    def _kabsch(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Compute optimal rotation (R) and translation (t) to map P->Q.
+
+        P, Q: (m,3) arrays. Returns R (3x3) and t (3,) such that Q ≈ P@R + t.
+        """
+        Pc = P.mean(axis=0)
+        Qc = Q.mean(axis=0)
+        P0 = P - Pc
+        Q0 = Q - Qc
+        H = P0.T @ Q0
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        t = Qc - Pc @ R
+        return R, t
+
+    def _aligned_xyzs(data_dir: Path, frame_indices: list[int]) -> list[np.ndarray]:
+        """Load xyz for frames and align each to the first using first 5 residues.
+
+        Returns list of (n_atoms,3) float32 arrays.
+        """
+        atoms_df = load_atoms(str(data_dir))
+        align_idx = _select_align_indices(atoms_df, n_residues=5)
+        # Fallback: if insufficient atoms, skip alignment
+        do_align = align_idx.size >= 3
+        xyz0 = load_frame_xyz(str(data_dir), int(frame_indices[0]))
+        out = [np.asarray(xyz0, dtype=np.float32)]
+        if not do_align:
+            for fi in frame_indices[1:]:
+                out.append(np.asarray(load_frame_xyz(str(data_dir), int(fi)), dtype=np.float32))
+            return out
+        ref = np.asarray(xyz0[align_idx, :], dtype=np.float64)
+        for fi in frame_indices[1:]:
+            xyz = np.asarray(load_frame_xyz(str(data_dir), int(fi)), dtype=np.float64)
+            P = xyz[align_idx, :]
+            try:
+                R, t = _kabsch(P, ref)
+                aligned = (xyz @ R) + t
+                out.append(aligned.astype(np.float32))
+            except Exception:
+                out.append(np.asarray(xyz, dtype=np.float32))
+        return out
+
+    def _write_multimodel_with_connect(
+        data_dir: Path,
+        out_path: Path,
+        frame_indices: list[int],
+        title_header: str | None,
+        per_model_meta: list[tuple[str | None, float | None]] | None,
+    ) -> None:
+        """Write a GLYCAM multi-model PDB with CONECT, aligned to first 5 residues.
+
+        per_model_meta: list of (cluster_id, population_pct) parallel to frame_indices
+        """
+        atoms = load_atoms(str(data_dir))
+        bonds = load_bonds(str(data_dir))
+        # Build aligned coordinates
+        aligned_xyzs = _aligned_xyzs(data_dir, frame_indices)
+
+        serials = atoms["serial"].to_numpy()
+        names = atoms["name"].to_list()
+        resn = atoms["res_name"].to_list()
+        chain_u8 = atoms["chain_id_u8"].to_numpy()
+        resid = atoms["res_id"].to_numpy()
+        elem = atoms["element"].to_list()
+
+        with storage.open(out_path, "w") as fh:
+            if title_header:
+                fh.write(title_header + "\n")
+            for i, xyz in enumerate(aligned_xyzs, start=1):
+                fh.write(f"MODEL     {i:4d}\n")
+                # Per-model REMARKs
+                if per_model_meta and i-1 < len(per_model_meta):
+                    cid, pop = per_model_meta[i-1]
+                    if cid is not None:
+                        fh.write(f"REMARK   CLUSTER_ID {cid}\n")
+                    if pop is not None:
+                        fh.write(f"REMARK   CLUSTER_POPULATION_PCT {pop}\n")
+                for j in range(len(serials)):
+                    x, y, z = map(float, xyz[j])
+                    fh.write(_pdb_atom_line(
+                        serial=int(serials[j]),
+                        name=names[j],
+                        res_name=resn[j],
+                        chain_u8=int(chain_u8[j]),
+                        res_id=int(resid[j]),
+                        x=x, y=y, z=z,
+                        element=elem[j],
+                    ))
+                conect = _pdb_conect_block(serials, bonds)
+                if conect:
+                    fh.write(conect)
+                fh.write("ENDMDL\n")
+            fh.write("END\n")
+
+    def _parse_multimodel_xyzs_from_pdb(pdb_text: str, n_atoms: int) -> list[np.ndarray]:
+        """Parse a multi-model PDB text into a list of (n_atoms,3) arrays.
+
+        Assumes models are contiguous blocks of ATOM/HETATM ending with ENDMDL.
+        Coordinates are mapped in the encountered order. If a model has fewer
+        or more atoms than n_atoms, it will be skipped to avoid mismatches.
+        """
+        models: list[np.ndarray] = []
+        cur: list[tuple[float, float, float]] = []
+        for line in pdb_text.splitlines():
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                try:
+                    # PDB fixed columns: x[30:38], y[38:46], z[46:54]
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    cur.append((x, y, z))
+                except Exception:
+                    continue
+            elif line.startswith("ENDMDL"):
+                if len(cur) == n_atoms:
+                    models.append(np.asarray(cur, dtype=np.float32))
+                cur = []
+        # Handle trailing model if file lacks ENDMDL
+        if cur:
+            if len(cur) == n_atoms:
+                models.append(np.asarray(cur, dtype=np.float32))
+        return models
+
     for fmt in formats:
         out_fmt_dir = dest_level_dir / fmt
         storage.mkdir(out_fmt_dir)
         for anomer in ["alpha", "beta"]:
             src_dir = Path(source_level_dir) / anomer
             out_path = out_fmt_dir / f"{anomer}.pdb"
-            # If a pre-aggregated alpha.pdb/beta.pdb exists at the source level, reuse it
-            preagg = Path(source_level_dir) / f"{anomer}.pdb"
-            if storage.exists(preagg):
-                try:
-                    raw = storage.read_text(preagg)
-                    converted = _convert_pdb_text_naming(raw, fmt)
-                    storage.write_text(out_path, converted)
-                except Exception:
-                    # Fallback to building from cluster files if conversion fails
-                    pass
+            # Attempt to rebuild from trajectory for aligned, CONECT-rich output
+            wrote = False
+            try:
+                # Identify the data directory containing coords.zarr
+                glycan_root = source_level_dir.parent  # .../output
+                glycan_dir = glycan_root.parent        # .../<glycan>
+                data_dir = glycan_dir / "data"
+                if storage.exists(data_dir / "coords.zarr") and isinstance(cluster_data, dict):
+                    # Collect frame indices for this anomer using representative_idx
+                    level = cluster_data.get("levels", {}).get(level_name, {})
+                    frames: list[int] = []
+                    per_meta: list[tuple[str | None, float | None]] = []
+                    for c in level.get("clusters", []) or []:
+                        rep = c.get("representative_idx")
+                        # decide anomer by presence of per-cluster file under source alpha/beta
+                        which = c.get("pdb_files", {}) if isinstance(c.get("pdb_files"), dict) else {}
+                        has = which.get(anomer)
+                        if rep is not None and has:
+                            try:
+                                frames.append(int(rep))
+                                cid = str(c.get("cluster_id")) if c.get("cluster_id") is not None else None
+                                per_meta.append((cid, cluster_pop.get(str(c.get("cluster_id"))) ))
+                            except Exception:
+                                continue
+                    # Sort by cluster_id order if possible (frames/per_meta same permutation)
+                    order = list(range(len(frames)))
+                    try:
+                        order = sorted(order, key=lambda i: int(per_meta[i][0]) if per_meta[i][0] is not None else 10**9)
+                    except Exception:
+                        pass
+                    if order:
+                        frames = [frames[i] for i in order]
+                        per_meta = [per_meta[i] for i in order]
+                    if frames:
+                        # Always write GLYCAM first, then convert if fmt==PDB
+                        if fmt == "GLYCAM":
+                            _write_multimodel_with_connect(
+                                data_dir=data_dir,
+                                out_path=out_path,
+                                frame_indices=frames,
+                                title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
+                                per_model_meta=per_meta,
+                            )
+                            wrote = True
+                        else:
+                            # Write to temp GLYCAM then convert
+                            import tempfile, os
+                            with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp:
+                                tmp_path = tmp.name
+                            try:
+                                _write_multimodel_with_connect(
+                                    data_dir=data_dir,
+                                    out_path=Path(tmp_path),
+                                    frame_indices=frames,
+                                    title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
+                                    per_model_meta=per_meta,
+                                )
+                                with open(tmp_path, "r", encoding="utf-8") as _fh:
+                                    raw = _fh.read()
+                                converted = _convert_pdb_text_naming(raw, fmt)
+                                storage.write_text(out_path, converted)
+                                wrote = True
+                            finally:
+                                try:
+                                    os.unlink(tmp_path)
+                                except Exception:
+                                    pass
+            except Exception:
+                wrote = False
 
-            # If file not written yet or conversion failed, build from cluster files
-            if not storage.exists(out_path):
+            # Fallbacks: try rebuilding from pre-aggregated file (with align + CONECT),
+            # then as a last resort simple concatenation of per-cluster files.
+            if not wrote:
+                # If a pre-aggregated alpha.pdb/beta.pdb exists at the source level, rebuild it
+                preagg = Path(source_level_dir) / f"{anomer}.pdb"
+                if storage.exists(preagg):
+                    try:
+                        # We prefer to rebuild to inject CONECT + alignment; use atoms/bonds
+                        # If atoms/bonds unavailable, fall back to simple conversion
+                        # Determine data_dir as above
+                        glycan_root = source_level_dir.parent
+                        glycan_dir = glycan_root.parent
+                        data_dir = glycan_dir / "data"
+                        atoms_df = None
+                        bonds_df = None
+                        try:
+                            atoms_df = load_atoms(str(data_dir))
+                            bonds_df = load_bonds(str(data_dir))
+                        except Exception:
+                            atoms_df = None
+                        raw = storage.read_text(preagg)
+                        if atoms_df is not None:
+                            n_atoms = len(atoms_df)
+                            xyzs = _parse_multimodel_xyzs_from_pdb(raw, n_atoms=n_atoms)
+                            if xyzs:
+                                # Align using first-5-residues heavy-atom indices
+                                align_idx = _select_align_indices(atoms_df, n_residues=5)
+                                do_align = align_idx.size >= 3
+                                if do_align:
+                                    ref = np.asarray(xyzs[0][align_idx, :], dtype=np.float64)
+                                    aligned = []
+                                    for i, arr in enumerate(xyzs):
+                                        if i == 0:
+                                            aligned.append(arr)
+                                            continue
+                                        P = np.asarray(arr[align_idx, :], dtype=np.float64)
+                                        try:
+                                            R, t = _kabsch(P, ref)
+                                            aa = (np.asarray(arr, dtype=np.float64) @ R) + t
+                                            aligned.append(aa.astype(np.float32))
+                                        except Exception:
+                                            aligned.append(arr)
+                                    xyzs = aligned
+                                # Write GLYCAM then convert if needed
+                                if fmt == "GLYCAM":
+                                    with storage.open(out_path, "w") as fh:
+                                        fh.write(
+                                            f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}\n"
+                                        )
+                                        serials = atoms_df["serial"].to_numpy()
+                                        names = atoms_df["name"].to_list()
+                                        resn = atoms_df["res_name"].to_list()
+                                        chain_u8 = atoms_df["chain_id_u8"].to_numpy()
+                                        resid = atoms_df["res_id"].to_numpy()
+                                        elem = atoms_df["element"].to_list()
+                                        for i, xyz in enumerate(xyzs, start=1):
+                                            fh.write(f"MODEL     {i:4d}\n")
+                                            for j in range(len(serials)):
+                                                x, y, z = map(float, xyz[j])
+                                                fh.write(_pdb_atom_line(
+                                                    serial=int(serials[j]),
+                                                    name=names[j],
+                                                    res_name=resn[j],
+                                                    chain_u8=int(chain_u8[j]),
+                                                    res_id=int(resid[j]),
+                                                    x=x, y=y, z=z,
+                                                    element=elem[j],
+                                                ))
+                                            conect = _pdb_conect_block(serials, bonds_df if bonds_df is not None else pl.DataFrame({"a": [], "b": []}))
+                                            if conect:
+                                                fh.write(conect)
+                                            fh.write("ENDMDL\n")
+                                        fh.write("END\n")
+                                    wrote = True
+                                else:
+                                    # Write to temp GLYCAM then convert
+                                    import tempfile, os
+                                    with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp:
+                                        tmp_path = tmp.name
+                                    try:
+                                        with open(tmp_path, "w", encoding="utf-8") as fh:
+                                            fh.write(
+                                                f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}\n"
+                                            )
+                                            serials = atoms_df["serial"].to_numpy()
+                                            names = atoms_df["name"].to_list()
+                                            resn = atoms_df["res_name"].to_list()
+                                            chain_u8 = atoms_df["chain_id_u8"].to_numpy()
+                                            resid = atoms_df["res_id"].to_numpy()
+                                            elem = atoms_df["element"].to_list()
+                                            for i, xyz in enumerate(xyzs, start=1):
+                                                fh.write(f"MODEL     {i:4d}\n")
+                                                for j in range(len(serials)):
+                                                    x, y, z = map(float, xyz[j])
+                                                    fh.write(_pdb_atom_line(
+                                                        serial=int(serials[j]),
+                                                        name=names[j],
+                                                        res_name=resn[j],
+                                                        chain_u8=int(chain_u8[j]),
+                                                        res_id=int(resid[j]),
+                                                        x=x, y=y, z=z,
+                                                        element=elem[j],
+                                                    ))
+                                                conect = _pdb_conect_block(serials, bonds_df if bonds_df is not None else pl.DataFrame({"a": [], "b": []}))
+                                                if conect:
+                                                    fh.write(conect)
+                                                fh.write("ENDMDL\n")
+                                            fh.write("END\n")
+                                        with open(tmp_path, "r", encoding="utf-8") as _fh:
+                                            raw2 = _fh.read()
+                                        converted = _convert_pdb_text_naming(raw2, fmt)
+                                        storage.write_text(out_path, converted)
+                                        wrote = True
+                                    finally:
+                                        try:
+                                            os.unlink(tmp_path)
+                                        except Exception:
+                                            pass
+                            else:
+                                # No parseable models -> simple conversion
+                                converted = _convert_pdb_text_naming(raw, fmt)
+                                storage.write_text(out_path, converted)
+                                wrote = True
+                        else:
+                            # atoms/bonds not available -> simple conversion
+                            converted = _convert_pdb_text_naming(raw, fmt)
+                            storage.write_text(out_path, converted)
+                            wrote = True
+                    except Exception:
+                        wrote = False
+
+            if not wrote:
+                # Build from per-cluster files (no align / no CONECT beyond what exists)
                 if not storage.exists(src_dir):
                     continue
                 listed = storage.list_files(src_dir, "*.pdb")

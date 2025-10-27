@@ -442,6 +442,37 @@ class GlycanPipelineRunner:
                 glycam_name=glycan_name,
                 output_static_dir=str(self.output_dir)  # Final database output location
             )
+
+            # In Oracle mode, immediately upload/update the just-written GS* folder to the bucket
+            # before validating (validation reads via remote in Oracle mode).
+            if config.use_oracle_storage:
+                try:
+                    # Find the local GS folder for this glycan by matching archetype.name
+                    local_base = Path(str(self.output_dir))
+                    if local_base.exists():
+                        gs_local_dir: Optional[Path] = None
+                        for data_json in local_base.glob("GS*/data.json"):
+                            try:
+                                with open(data_json, 'r', encoding='utf-8') as f:
+                                    d = json.load(f)
+                                arche = d.get('archetype', {}) if isinstance(d, dict) else {}
+                                name_field = arche.get('name') or arche.get('glycam')
+                                if name_field and glycan_name.lower() in str(name_field).lower():
+                                    gs_local_dir = data_json.parent
+                                    break
+                            except Exception:
+                                continue
+                        if gs_local_dir is not None:
+                            remote_prefix = f"{self.output_dir}/{gs_local_dir.name}"
+                            # Overwrite remote to ensure updates land
+                            self.storage.upload_dir(gs_local_dir, remote_prefix, skip_existing=False)
+                            logger.info(f"Uploaded/updated static outputs to Oracle: {remote_prefix}")
+                        else:
+                            logger.warning(f"Could not locate local GS folder for {glycan_name} to upload")
+                    else:
+                        logger.warning(f"Local output base not found for upload: {local_base}")
+                except Exception as e:
+                    logger.warning(f"Failed to upload static outputs for {glycan_name}: {e}")
             
             # Validate the output. The glystatic processor writes final output
             # under an ID directory (for example: output_dir/GS00449). Use the
@@ -572,37 +603,7 @@ class GlycanPipelineRunner:
             results["glystatic"] = self.run_glystatic(glycan_name)
             did_run_glystatic = results["glystatic"]
 
-        if results["glystatic"] and did_run_glystatic and config.use_oracle_storage:
-            try:
-                # Only upload the specific GS* folder generated for this glycan, not the entire output directory
-                # Find matching GS folder locally
-                gs_folder_local = None
-                try:
-                    candidates = self.storage.list_files(self.output_dir, "GS*")
-                except Exception:
-                    candidates = []
-                for cand in candidates:
-                    key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
-                    data_json = f"{key}/data.json"
-                    try:
-                        with self.storage.open(data_json, 'r') as f:
-                            data = json.load(f)
-                    except Exception:
-                        continue
-                    arche = data.get('archetype', {}) if isinstance(data, dict) else {}
-                    name_field = arche.get('name') or arche.get('glycam')
-                    if name_field and glycan_name.lower() in str(name_field).lower():
-                        gs_folder_local = key
-                        break
-                if gs_folder_local is None:
-                    logger.warning(f"Could not determine GS folder for {glycan_name}; skipping upload of static outputs")
-                else:
-                    local_static_dir = gs_folder_local
-                    remote_static_prefix = gs_folder_local
-                    self.storage.upload_dir(local_static_dir, remote_static_prefix, skip_existing=True)
-                    logger.info(f"Uploaded static outputs to Oracle: {remote_static_prefix}")
-            except Exception as e:
-                logger.warning(f"Failed to upload static outputs for {glycan_name}: {e}")
+        # Post-glystatic upload is handled inside run_glystatic for Oracle mode
         if not results["glystatic"]:
             logger.error(f"Pipeline failed at glystatic step for {glycan_name}")
             return results
@@ -681,6 +682,32 @@ class GlycanPipelineRunner:
                     except Exception as e:
                         logger.error(f"json2rdf conversion failed with exception: {e}")
                         return False
+
+            # In Oracle mode, upload/update the key finalization artifacts
+            if config.use_oracle_storage:
+                try:
+                    artifacts = [
+                        "GlycoShape.zip",  # from baker
+                        "GLYCOSHAPE_RDF.ttl",  # from json2rdf
+                        "GLYCOSHAPE.json",     # from baker
+                        "missing_glytoucan.txt",
+                    ]
+                    for fname in artifacts:
+                        local_path = Path(str(self.output_dir)) / fname
+                        if local_path.exists():
+                            remote_path = f"{self.output_dir}/{fname}"
+                            try:
+                                with open(local_path, 'rb') as f:
+                                    data = f.read()
+                                # Overwrite to ensure updates land
+                                self.storage.backend.write_binary(remote_path, data)
+                                logger.info(f"Uploaded/updated artifact to Oracle: {remote_path}")
+                            except Exception as e:
+                                logger.warning(f"Failed to upload artifact {local_path} -> {remote_path}: {e}")
+                        else:
+                            logger.warning(f"Finalization artifact not found locally: {local_path}")
+                except Exception as e:
+                    logger.warning(f"Failed uploading final artifacts to Oracle: {e}")
             
             logger.info("Successfully completed database finalization")
             return True
