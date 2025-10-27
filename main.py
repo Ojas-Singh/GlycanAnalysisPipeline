@@ -305,8 +305,13 @@ class GlycanPipelineRunner:
             matching_key = None
             for cand in candidates:
                 cand_key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                # Normalize: Oracle list_files may return file keys; ensure we use GS folder
+                base_key = cand_key
+                # Normalize candidates that may be file keys (e.g. '.../GSxxxx/data.json')
+                if base_key.endswith('/data.json') or base_key.endswith('data.json'):
+                    base_key = str(Path(base_key).parent)
                 # Build path to data.json under this candidate
-                data_json = f"{cand_key}/data.json" if not cand_key.endswith('/data.json') else cand_key
+                data_json = f"{base_key}/data.json"
                 if not storage.exists(data_json):
                     continue
                 try:
@@ -315,7 +320,7 @@ class GlycanPipelineRunner:
                     archetype = data.get('archetype', {}) if isinstance(data, dict) else {}
                     name_field = archetype.get('name') or archetype.get('glycam', '')
                     if name_field == glycan_name:
-                        matching_key = cand_key
+                        matching_key = base_key
                         break
                 except Exception:
                     continue
@@ -513,7 +518,9 @@ class GlycanPipelineRunner:
             except Exception:
                 candidates = []
             for cand in candidates:
-                key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                key_raw = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                # Normalize returned items which may be file keys
+                key = str(Path(key_raw).parent) if key_raw.endswith('/data.json') or key_raw.endswith('data.json') else key_raw
                 data_json = f"{key}/data.json"
                 if not self.storage.exists(data_json):
                     continue
@@ -634,7 +641,8 @@ class GlycanPipelineRunner:
             except Exception:
                 candidates = []
             for cand in candidates:
-                key = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                key_raw = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                key = str(Path(key_raw).parent) if key_raw.endswith('/data.json') or key_raw.endswith('data.json') else key_raw
                 if self.storage.exists(f"{key}/data.json"):
                     processed_glycans.append(key.split('/')[-1])
             
