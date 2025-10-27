@@ -29,45 +29,83 @@ def load_atoms(out_dir: str) -> pl.DataFrame:
     # '[' and ']'. To be robust, try reading via pyarrow first (no globbing),
     # and fall back to Polars. If pyarrow is missing, escape glob meta-chars
     # before calling Polars.
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    try:
-        # Prefer pyarrow if available (atomic file read, avoids glob interpretation)
-        import pyarrow.parquet as pq  # type: ignore
-
-        table = pq.read_table(path)
-        return pl.from_arrow(table)
-    except Exception:
-        # Fallback: escape glob characters and use polars reader
+    if os.path.exists(path):
         try:
-            import glob
-
-            escaped = glob.escape(path)
-            return pl.read_parquet(escaped)
+            # Prefer pyarrow if available (atomic file read, avoids glob interpretation)
+            import pyarrow.parquet as pq  # type: ignore
+            table = pq.read_table(path)
+            return pl.from_arrow(table)
         except Exception:
-            # Last resort: call pl.read_parquet on the raw path
-            return pl.read_parquet(path)
+            # Fallback: escape glob characters and use polars reader
+            try:
+                import glob
+                escaped = glob.escape(path)
+                return pl.read_parquet(escaped)
+            except Exception:
+                # Last resort: call pl.read_parquet on the raw path
+                return pl.read_parquet(path)
+    # Remote read fallback (e.g., Oracle PAR)
+    try:
+        storage = get_storage_manager()
+        import pyarrow.parquet as pq  # type: ignore
+        data = storage.read_binary(path)
+        table = pq.read_table(io.BytesIO(data))
+        return pl.from_arrow(table)
+    except Exception as e:
+        raise FileNotFoundError(f"atoms.parquet not found locally or remotely at {path}: {e}")
 
 def load_bonds(out_dir: str) -> pl.DataFrame:
     path = os.path.join(out_dir, "bonds.parquet")
-    if not os.path.exists(path):
-        return pl.DataFrame({"a": [], "b": []})
-    # Use pyarrow first to avoid any glob interpretation by underlying readers
+    if os.path.exists(path):
+        # Use pyarrow first to avoid any glob interpretation by underlying readers
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+            table = pq.read_table(path)
+            return pl.from_arrow(table)
+        except Exception:
+            try:
+                import glob
+                escaped = glob.escape(path)
+                return pl.read_parquet(escaped)
+            except Exception:
+                return pl.read_parquet(path)
+    # Remote read fallback
     try:
+        storage = get_storage_manager()
         import pyarrow.parquet as pq  # type: ignore
-        table = pq.read_table(path)
+        data = storage.read_binary(path)
+        table = pq.read_table(io.BytesIO(data))
         return pl.from_arrow(table)
     except Exception:
-        try:
-            import glob
-
-            escaped = glob.escape(path)
-            return pl.read_parquet(escaped)
-        except Exception:
-            return pl.read_parquet(path)
+        return pl.DataFrame({"a": [], "b": []})
 
 def load_coords(out_dir: str):
-    root = zarr.open(os.path.join(out_dir, "coords.zarr"), mode="r")
+    """Open coords.zarr array; if missing locally in Oracle mode, fetch it first.
+
+    In Oracle/PAR mode, materializes the remote zarr prefix to a local mirror under
+    out_dir/coords.zarr when not present locally.
+    """
+    zarr_path = os.path.join(out_dir, "coords.zarr")
+    if not os.path.exists(zarr_path):
+        try:
+            storage = get_storage_manager()
+            if getattr(storage, "_is_oracle", False):
+                remote_prefix = f"{out_dir}/coords.zarr".replace("\\", "/").rstrip('/')
+                objs = storage.backend.list_files(remote_prefix)
+                if objs:
+                    for obj in objs:
+                        key = obj.as_posix() if hasattr(obj, 'as_posix') else str(obj)
+                        if not key.startswith(remote_prefix + '/'):
+                            continue
+                        rel = key[len(remote_prefix)+1:]
+                        local_file = Path(zarr_path) / rel
+                        local_file.parent.mkdir(parents=True, exist_ok=True)
+                        data = storage.backend.read_binary(key)
+                        with open(local_file, 'wb') as fh:
+                            fh.write(data)
+        except Exception:
+            pass
+    root = zarr.open(zarr_path, mode="r")
     return root["xyz"]  # zarr array: shape (n_frames, n_atoms, 3), float32
 
 def load_frame_xyz(out_dir: str, frame_idx: int) -> np.ndarray:
@@ -1046,78 +1084,8 @@ def emit_multimodel_pdbs(
         for anomer in ["alpha", "beta"]:
             src_dir = Path(source_level_dir) / anomer
             out_path = out_fmt_dir / f"{anomer}.pdb"
-            # Attempt to rebuild from trajectory for aligned, CONECT-rich output
             wrote = False
-            try:
-                # Identify the data directory containing coords.zarr
-                glycan_root = source_level_dir.parent  # .../output
-                glycan_dir = glycan_root.parent        # .../<glycan>
-                data_dir = glycan_dir / "data"
-                if storage.exists(data_dir / "coords.zarr") and isinstance(cluster_data, dict):
-                    # Collect frame indices for this anomer using representative_idx
-                    level = cluster_data.get("levels", {}).get(level_name, {})
-                    frames: list[int] = []
-                    per_meta: list[tuple[str | None, float | None]] = []
-                    for c in level.get("clusters", []) or []:
-                        rep = c.get("representative_idx")
-                        # decide anomer by presence of per-cluster file under source alpha/beta
-                        which = c.get("pdb_files", {}) if isinstance(c.get("pdb_files"), dict) else {}
-                        has = which.get(anomer)
-                        if rep is not None and has:
-                            try:
-                                frames.append(int(rep))
-                                cid = str(c.get("cluster_id")) if c.get("cluster_id") is not None else None
-                                per_meta.append((cid, cluster_pop.get(str(c.get("cluster_id"))) ))
-                            except Exception:
-                                continue
-                    # Sort by cluster_id order if possible (frames/per_meta same permutation)
-                    order = list(range(len(frames)))
-                    try:
-                        order = sorted(order, key=lambda i: int(per_meta[i][0]) if per_meta[i][0] is not None else 10**9)
-                    except Exception:
-                        pass
-                    if order:
-                        frames = [frames[i] for i in order]
-                        per_meta = [per_meta[i] for i in order]
-                    if frames:
-                        # Always write GLYCAM first, then convert if fmt==PDB
-                        if fmt == "GLYCAM":
-                            _write_multimodel_with_connect(
-                                data_dir=data_dir,
-                                out_path=out_path,
-                                frame_indices=frames,
-                                title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
-                                per_model_meta=per_meta,
-                            )
-                            wrote = True
-                        else:
-                            # Write to temp GLYCAM then convert
-                            import tempfile, os
-                            with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp:
-                                tmp_path = tmp.name
-                            try:
-                                _write_multimodel_with_connect(
-                                    data_dir=data_dir,
-                                    out_path=Path(tmp_path),
-                                    frame_indices=frames,
-                                    title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
-                                    per_model_meta=per_meta,
-                                )
-                                with open(tmp_path, "r", encoding="utf-8") as _fh:
-                                    raw = _fh.read()
-                                converted = _convert_pdb_text_naming(raw, fmt)
-                                storage.write_text(out_path, converted)
-                                wrote = True
-                            finally:
-                                try:
-                                    os.unlink(tmp_path)
-                                except Exception:
-                                    pass
-            except Exception:
-                wrote = False
-
-            # Fallbacks: try rebuilding from pre-aggregated file (with align + CONECT),
-            # then as a last resort simple concatenation of per-cluster files.
+            # First preference: rebuild from pre-aggregated alpha/beta.pdb (fast, no zarr download)
             if not wrote:
                 # If a pre-aggregated alpha.pdb/beta.pdb exists at the source level, rebuild it
                 preagg = Path(source_level_dir) / f"{anomer}.pdb"
@@ -1246,6 +1214,72 @@ def emit_multimodel_pdbs(
                             wrote = True
                     except Exception:
                         wrote = False
+
+            # Second preference: rebuild from trajectory frames (coords.zarr) if available
+            if not wrote:
+                try:
+                    # Identify the data directory containing coords.zarr
+                    glycan_root = source_level_dir.parent  # .../output
+                    glycan_dir = glycan_root.parent        # .../<glycan>
+                    data_dir = glycan_dir / "data"
+                    if storage.exists(data_dir / "coords.zarr") and isinstance(cluster_data, dict):
+                        # Collect frame indices for this anomer using representative_idx
+                        level = cluster_data.get("levels", {}).get(level_name, {})
+                        frames: list[int] = []
+                        per_meta: list[tuple[str | None, float | None]] = []
+                        for c in level.get("clusters", []) or []:
+                            rep = c.get("representative_idx")
+                            which = c.get("pdb_files", {}) if isinstance(c.get("pdb_files"), dict) else {}
+                            has = which.get(anomer)
+                            if rep is not None and has:
+                                try:
+                                    frames.append(int(rep))
+                                    cid = str(c.get("cluster_id")) if c.get("cluster_id") is not None else None
+                                    per_meta.append((cid, cluster_pop.get(str(c.get("cluster_id"))) ))
+                                except Exception:
+                                    continue
+                        order = list(range(len(frames)))
+                        try:
+                            order = sorted(order, key=lambda i: int(per_meta[i][0]) if per_meta[i][0] is not None else 10**9)
+                        except Exception:
+                            pass
+                        if order:
+                            frames = [frames[i] for i in order]
+                            per_meta = [per_meta[i] for i in order]
+                        if frames:
+                            if fmt == "GLYCAM":
+                                _write_multimodel_with_connect(
+                                    data_dir=data_dir,
+                                    out_path=out_path,
+                                    frame_indices=frames,
+                                    title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
+                                    per_model_meta=per_meta,
+                                )
+                                wrote = True
+                            else:
+                                import tempfile, os
+                                with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as tmp:
+                                    tmp_path = tmp.name
+                                try:
+                                    _write_multimodel_with_connect(
+                                        data_dir=data_dir,
+                                        out_path=Path(tmp_path),
+                                        frame_indices=frames,
+                                        title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
+                                        per_model_meta=per_meta,
+                                    )
+                                    with open(tmp_path, "r", encoding="utf-8") as _fh:
+                                        raw = _fh.read()
+                                    converted = _convert_pdb_text_naming(raw, fmt)
+                                    storage.write_text(out_path, converted)
+                                    wrote = True
+                                finally:
+                                    try:
+                                        os.unlink(tmp_path)
+                                    except Exception:
+                                        pass
+                except Exception:
+                    wrote = False
 
             if not wrote:
                 # Build from per-cluster files (no align / no CONECT beyond what exists)
