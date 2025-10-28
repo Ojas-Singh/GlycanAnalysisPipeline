@@ -335,6 +335,32 @@ class GlycanPipelineRunner:
                 except Exception:
                     continue
 
+            # If not found remotely, try local GS folder and upload it to Oracle if enabled
+            if not matching_key:
+                try:
+                    local_base = Path(str(self.output_dir))
+                    if local_base.exists():
+                        for data_json in local_base.glob("GS*/data.json"):
+                            try:
+                                with open(data_json, 'r', encoding='utf-8') as f:
+                                    d = json.load(f)
+                                arche = d.get('archetype', {}) if isinstance(d, dict) else {}
+                                name_field = arche.get('name') or arche.get('glycam', '')
+                                if name_field == glycan_name:
+                                    gs_local_dir = data_json.parent
+                                    if config.use_oracle_storage:
+                                        remote_prefix = f"{self._remote_output_base()}/{gs_local_dir.name}"
+                                        self.storage.upload_dir(gs_local_dir, remote_prefix, skip_existing=False)
+                                        logger.info(f"Uploaded local GS folder to Oracle: {remote_prefix}")
+                                        matching_key = remote_prefix
+                                    else:
+                                        matching_key = str(gs_local_dir)
+                                    break
+                            except Exception:
+                                continue
+                except Exception as e:
+                    logger.debug(f"Local GS scan/upload attempt failed: {e}")
+
             if not matching_key:
                 logger.debug(f"No GS folder found with exact name match for {glycan_name}")
                 return False
