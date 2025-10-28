@@ -64,6 +64,14 @@ class GlycanPipelineRunner:
         # Initialize processors
         self.metadata_processor = GlycanMetadataProcessor(self.output_dir)
         self.baker = GlycoShapeBaker(self.output_dir)
+    
+    def _remote_output_base(self) -> str:
+        """Return the remote base prefix for outputs.
+
+        In Oracle mode, we always upload/list under 'static' in the bucket,
+        regardless of the local output_dir path. Locally, use output_dir.
+        """
+        return "static" if config.use_oracle_storage else str(self.output_dir)
         
     def discover_glycans(self) -> List[str]:
         """Discover glycan directories in data_dir.
@@ -237,7 +245,8 @@ class GlycanPipelineRunner:
         """
         try:
             # Look for any GS folder that matches this glycan name
-            candidates = self.storage.list_files(self.output_dir, "GS*")
+            base = self._remote_output_base()
+            candidates = self.storage.list_files(base, "GS*")
             
             for candidate in candidates:
                 candidate_name = candidate.name if hasattr(candidate, 'name') else str(candidate).split('/')[-1]
@@ -247,12 +256,12 @@ class GlycanPipelineRunner:
                     continue
 
                 data_json = f"{candidate}/data.json"
-                if not self.storage.exists(data_json, self.output_dir):
+                if not self.storage.exists(data_json):
                     continue
 
                 # Try to read the data.json
                 try:
-                    with self.storage.open(data_json, 'r', self.output_dir) as f:
+                    with self.storage.open(data_json, 'r') as f:
                         data = json.load(f)
                 except Exception:
                     continue
@@ -295,7 +304,8 @@ class GlycanPipelineRunner:
         try:
             # Use storage abstraction to support Oracle and local modes
             storage = self.storage
-            base = str(self.output_dir)
+            # In Oracle, check completion against remote 'static' prefix
+            base = str(self._remote_output_base())
             # List GS* candidates under output dir
             try:
                 candidates = storage.list_files(base, "GS*")
@@ -468,7 +478,8 @@ class GlycanPipelineRunner:
                             except Exception:
                                 continue
                         if gs_local_dir is not None:
-                            remote_prefix = f"{self.output_dir}/{gs_local_dir.name}"
+                            # Always upload under 'static/<GSID>' in Oracle
+                            remote_prefix = f"{self._remote_output_base()}/{gs_local_dir.name}"
                             # Overwrite remote to ensure updates land
                             self.storage.upload_dir(gs_local_dir, remote_prefix, skip_existing=False)
                             logger.info(f"Uploaded/updated static outputs to Oracle: {remote_prefix}")
@@ -514,7 +525,9 @@ class GlycanPipelineRunner:
             # Locate the glystatic output directory containing data.json for this glycan
             candidate_dir = None
             try:
-                candidates = self.storage.list_files(self.output_dir, "GS*")
+                # In Oracle, list under 'static'; locally, under output_dir
+                base = self._remote_output_base()
+                candidates = self.storage.list_files(base, "GS*")
             except Exception:
                 candidates = []
             for cand in candidates:
@@ -637,7 +650,8 @@ class GlycanPipelineRunner:
             # Validate that we have processed glycans
             processed_glycans = []
             try:
-                candidates = self.storage.list_files(self.output_dir, "GS*")
+                base = self._remote_output_base()
+                candidates = self.storage.list_files(base, "GS*")
             except Exception:
                 candidates = []
             for cand in candidates:
@@ -703,7 +717,8 @@ class GlycanPipelineRunner:
                     for fname in artifacts:
                         local_path = Path(str(self.output_dir)) / fname
                         if local_path.exists():
-                            remote_path = f"{self.output_dir}/{fname}"
+                            # Always upload under 'static/<artifact>' in Oracle
+                            remote_path = f"{self._remote_output_base()}/{fname}"
                             try:
                                 with open(local_path, 'rb') as f:
                                     data = f.read()
