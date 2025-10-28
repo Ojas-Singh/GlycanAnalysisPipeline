@@ -355,7 +355,7 @@ class GlycanMetadataProcessor:
                 
         return common_names
     
-    def update_glycan_metadata(self, json_file_path: Path) -> bool:
+    def update_glycan_metadata(self, json_file_path: Union[str, Path]) -> bool:
         """Update search metadata for a single glycan JSON file.
         
         Args:
@@ -365,6 +365,8 @@ class GlycanMetadataProcessor:
             True if successful, False otherwise
         """
         try:
+            # Normalize to Path for consistent .name access
+            json_file_path = Path(json_file_path)
             # Read current data
             storage = get_storage_manager()
             with storage.open(json_file_path, 'r') as f:
@@ -414,7 +416,11 @@ class GlycanMetadataProcessor:
             self.logger.error(f"Invalid JSON in {json_file_path}: {str(e)}")
             return False
         except Exception as e:
-            self.logger.error(f"Error updating {json_file_path.name}: {str(e)}")
+            try:
+                name = Path(json_file_path).name  # type: ignore[arg-type]
+            except Exception:
+                name = str(json_file_path)
+            self.logger.error(f"Error updating {name}: {str(e)}")
             return False
     
     def update_all_metadata(self) -> Dict[str, int]:
