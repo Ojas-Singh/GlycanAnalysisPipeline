@@ -26,13 +26,41 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 
-def get_glycan_metadata_from_inventory(glycam_name: str) -> dict:
-    """
-    Get glycan metadata from the inventory CSV file.
-    
+def get_glycan_metadata(glycam_name: str) -> dict:
+    """Get glycan metadata, trying PocketBase first then falling back to CSV.
+
     Args:
         glycam_name: GLYCAM name of the glycan
-    
+
+    Returns:
+        Dictionary containing metadata from PocketBase or the inventory CSV
+    """
+    if config.use_pocketbase:
+        try:
+            from lib.pocketbase import get_pocketbase_client, extract_inventory_metadata
+            client = get_pocketbase_client()
+            if client.is_available():
+                record = client.get_record_by_glycam_name(glycam_name)
+                if record is not None:
+                    metadata = extract_inventory_metadata(record)
+                    logger.info(f"Found metadata for {glycam_name} from PocketBase: ID={metadata['ID']}")
+                    return metadata
+                else:
+                    logger.warning(f"Glycan '{glycam_name}' not found in PocketBase, falling back to CSV")
+            else:
+                logger.warning("PocketBase not available, falling back to CSV")
+        except Exception as e:
+            logger.warning(f"PocketBase lookup failed for {glycam_name}: {e}, falling back to CSV")
+
+    return _get_metadata_from_csv(glycam_name)
+
+
+def _get_metadata_from_csv(glycam_name: str) -> dict:
+    """Get glycan metadata from the inventory CSV file (fallback).
+
+    Args:
+        glycam_name: GLYCAM name of the glycan
+
     Returns:
         Dictionary containing metadata from the inventory
     """
@@ -342,7 +370,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
     
     # Get metadata from inventory CSV
     try:
-        metadata = get_glycan_metadata_from_inventory(glycam_name)
+        metadata = get_glycan_metadata(glycam_name)
         ID = metadata["ID"]
         length = metadata["length"]
         package = metadata["package"]

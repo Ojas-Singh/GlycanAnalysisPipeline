@@ -35,14 +35,16 @@ class GlycanMetadataProcessor:
         "G44362TS": "GP1c",
     }
     
-    def __init__(self, database_dir: Union[str, Path]):
+    def __init__(self, database_dir: Union[str, Path], pb_client=None):
         """Initialize the metadata processor.
-        
+
         Args:
             database_dir: Path to the database directory containing glycan folders
+            pb_client: Optional PocketBaseClient for search metadata enrichment
         """
         self.database_dir = Path(database_dir)
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.pb_client = pb_client
         
     def get_glycan_keywords(self, iupac_string: str) -> List[str]:
         """Determine keywords based on the IUPAC string.
@@ -354,7 +356,230 @@ class GlycanMetadataProcessor:
                 common_names.add(self.GANGLIOSIDE_MAP[glytoucan_id])
                 
         return common_names
+
+    def _normalize_string_list(self, values: List[str]) -> List[str]:
+        normalized: List[str] = []
+        seen = set()
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            key = text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(text)
+        return normalized
+
+    def _extract_variant_payload(self, entry: Dict) -> Dict[str, str]:
+        if not isinstance(entry, dict):
+            return {}
+
+        payload: Dict[str, str] = {}
+        for key in ("name", "glycam", "iupac", "iupac_extended", "glytoucan", "wurcs", "oxford"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                payload[key] = text
+        return payload
+
+    def _build_name_variants(self, glycan_data: Dict) -> Dict[str, Dict[str, str]]:
+        name_variants: Dict[str, Dict[str, str]] = {}
+        for variant_name in ("archetype", "alpha", "beta"):
+            payload = self._extract_variant_payload(glycan_data.get(variant_name, {}))
+            if payload:
+                name_variants[variant_name] = payload
+        return name_variants
+
+    def _build_aliases(self, glycan_data: Dict, common_names: List[str]) -> List[str]:
+        aliases: List[str] = []
+        for variant_name in ("archetype", "alpha", "beta"):
+            entry = glycan_data.get(variant_name, {})
+            if not isinstance(entry, dict):
+                continue
+            for key in ("name", "glycam", "iupac", "iupac_extended", "oxford"):
+                value = entry.get(key)
+                if value:
+                    aliases.append(str(value))
+
+        aliases.extend(common_names)
+        return self._normalize_string_list(aliases)
+
+    def _choose_canonical_name(self, glycan_data: Dict, common_names: List[str]) -> str:
+        archetype = glycan_data.get("archetype", {})
+        if not isinstance(archetype, dict):
+            return ""
+
+        oxford = str(archetype.get("oxford") or "").strip()
+        if oxford:
+            return oxford
+
+        if common_names:
+            return common_names[0]
+
+        for key in ("iupac_extended", "iupac", "name", "glycam", "ID"):
+            value = archetype.get(key)
+            if value:
+                return str(value).strip()
+
+        return ""
     
+    def _enrich_from_pocketbase(self, data: Dict, search_meta: Dict) -> None:
+        """Merge PocketBase-sourced keywords and description into search_meta.
+
+        Gracefully no-ops if PocketBase is unavailable or the record is missing.
+        """
+        if self.pb_client is None or not self.pb_client.is_available():
+            return
+
+        gs_id = data.get("archetype", {}).get("ID")
+        if not gs_id:
+            return
+
+        try:
+            submission_record = self.pb_client.get_record_by_glycoshape_id(gs_id)
+            glycan_record = self.pb_client.get_glycan_record_by_glycoshape_id(gs_id)
+            if submission_record is None and glycan_record is None:
+                self.logger.debug(f"No PocketBase record found for {gs_id}")
+                return
+
+            from lib.pocketbase import extract_search_enrichment
+            enrichment = extract_search_enrichment(
+                glycan_record=glycan_record,
+                submission_record=submission_record,
+            )
+
+            # Add extra keywords (additive, never replace)
+            extra_kw = enrichment.get("extra_keywords", [])
+            if extra_kw:
+                current = set(search_meta.get("keywords", []))
+                current.update(extra_kw)
+                search_meta["keywords"] = sorted(list(current))
+
+            # Add user-curated common names from PocketBase (additive)
+            user_common_names = enrichment.get("user_common_names", [])
+            if user_common_names:
+                current_names = set(search_meta.get("common_names", []))
+                current_names.update(user_common_names)
+                search_meta["common_names"] = sorted(list(current_names))
+
+            # Use user-curated description from PocketBase, or generate one
+            user_desc = enrichment.get("user_description", "")
+            if user_desc:
+                search_meta["description"] = user_desc
+            elif not search_meta.get("description"):
+                search_meta["description"] = self._generate_description(
+                    data, enrichment
+                )
+
+            self.logger.info(f"Enriched search_meta from PocketBase for {gs_id}")
+
+        except Exception as e:
+            self.logger.warning(f"PocketBase enrichment failed for {gs_id}: {e}")
+
+    def _generate_description(self, data: Dict, pb_enrichment: Dict) -> str:
+        """Generate a natural language description for search and vector relevance.
+
+        Builds a concise sentence from glycan identity, classification,
+        simulation context, common names, and composition.
+        """
+        parts = []
+        archetype = data.get("archetype", {})
+        search_meta = data.get("search_meta", {})
+
+        # Glycan identity
+        gs_id = archetype.get("ID", "")
+        iupac = archetype.get("iupac", "")
+        if iupac:
+            parts.append(f"{gs_id} is a glycan with IUPAC notation {iupac}.")
+
+        # Type classification
+        type_keywords = [
+            k for k in search_meta.get("keywords", [])
+            if k in (
+                "N-Glycan", "O-Glycan", "GAG", "Oligomannose",
+                "Complex N-Glycan", "Hybrid N-Glycan",
+                "Biantennary N-Glycan", "Triantennary N-Glycan",
+                "Tetraantennary N-Glycan", "Fucosylated N-Glycan",
+            )
+        ]
+        if type_keywords:
+            parts.append(f"Classified as: {', '.join(type_keywords)}.")
+
+        # Simulation context from archetype fields
+        sim_parts = []
+        package = archetype.get("package")
+        if package:
+            sim_parts.append(f"MD package {package}")
+        forcefield = archetype.get("forcefield")
+        if forcefield:
+            sim_parts.append(f"force field {forcefield}")
+        temperature = archetype.get("temperature")
+        if temperature is not None:
+            sim_parts.append(f"{temperature}K")
+        if sim_parts:
+            parts.append(f"Simulated with {', '.join(sim_parts)}.")
+
+        # Common names
+        common_names = search_meta.get("common_names", [])
+        if common_names:
+            parts.append(f"Also known as: {', '.join(common_names)}.")
+
+        # Composition
+        components = archetype.get("components", {})
+        if components:
+            comp_str = ", ".join(f"{v}x {k}" for k, v in components.items())
+            parts.append(f"Composed of {comp_str}.")
+
+        # User comments from PocketBase
+        user_comments = pb_enrichment.get("user_comments", "")
+        if user_comments:
+            parts.append(user_comments)
+
+        return " ".join(parts)
+
+    def _sync_pocketbase_metadata(self, data: Dict, search_meta: Dict) -> None:
+        """Upsert the derived glycan metadata into the PocketBase glycans collection."""
+        if self.pb_client is None or not self.pb_client.is_available():
+            return
+
+        archetype = data.get("archetype", {})
+        if not isinstance(archetype, dict):
+            return
+
+        glycoshape_id = str(archetype.get("ID") or "").strip()
+        if not glycoshape_id:
+            return
+
+        common_names = self._normalize_string_list(search_meta.get("common_names", []))
+        keywords = self._normalize_string_list(search_meta.get("keywords", []))
+        name_variants = self._build_name_variants(data)
+        aliases = self._build_aliases(data, common_names)
+        canonical_name = self._choose_canonical_name(data, common_names)
+
+        payload = {
+            "glycoshape_id": glycoshape_id,
+            "canonical_name": canonical_name,
+            "glycam_name": str(archetype.get("name") or archetype.get("glycam") or "").strip(),
+            "iupac_name": str(archetype.get("iupac_extended") or archetype.get("iupac") or "").strip(),
+            "glytoucan_id": str(archetype.get("glytoucan") or "").strip(),
+            "name_variants": name_variants,
+            "aliases": aliases,
+            "common_names": common_names,
+            "keywords": keywords,
+            "description": str(search_meta.get("description") or "").strip(),
+        }
+
+        try:
+            self.pb_client.upsert_glycan_metadata(payload)
+            self.logger.info(f"Upserted glycan metadata record for {glycoshape_id}")
+        except Exception as e:
+            self.logger.warning(f"Failed to upsert glycan metadata for {glycoshape_id}: {e}")
+
     def update_glycan_metadata(self, json_file_path: Union[str, Path]) -> bool:
         """Update search metadata for a single glycan JSON file.
         
@@ -402,10 +627,16 @@ class GlycanMetadataProcessor:
             
             if new_common_names:
                 self.logger.info(f"Updated common names for {json_file_path.name}: {new_common_names}")
-                
+
+            # Enrich from PocketBase (optional, gracefully degraded)
+            self._enrich_from_pocketbase(data, search_meta)
+
             # Write updated data back to file
             with storage.open(json_file_path, 'w') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
+
+            # Keep PocketBase glycans metadata in sync with the generated static data.
+            self._sync_pocketbase_metadata(data, search_meta)
                 
             return True
             

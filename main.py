@@ -61,8 +61,27 @@ class GlycanPipelineRunner:
         self.storage.mkdir(self.process_dir)
         self.storage.mkdir(self.output_dir)
         
+        # Initialize PocketBase client (optional)
+        self.pb_client = None
+        if config.use_pocketbase:
+            try:
+                from lib.pocketbase import GLYCAN_COLLECTION, get_pocketbase_client
+                client = get_pocketbase_client()
+                if client.is_available():
+                    self.pb_client = client
+                    client.prefetch_all()
+                    try:
+                        client.prefetch_all(collection=GLYCAN_COLLECTION)
+                    except Exception as e:
+                        logger.warning(f"Failed to prefetch glycans metadata collection: {e}")
+                    logger.info("PocketBase integration enabled")
+                else:
+                    logger.info("PocketBase not available, using CSV fallback")
+            except Exception as e:
+                logger.warning(f"PocketBase initialization failed: {e}")
+
         # Initialize processors
-        self.metadata_processor = GlycanMetadataProcessor(self.output_dir)
+        self.metadata_processor = GlycanMetadataProcessor(self.output_dir, pb_client=self.pb_client)
         self.baker = GlycoShapeBaker(self.output_dir)
     
     def _remote_output_base(self) -> str:
