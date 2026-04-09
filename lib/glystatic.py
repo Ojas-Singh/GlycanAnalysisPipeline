@@ -285,7 +285,7 @@ def copy_and_convert_pdbs(
             content = storage.read_binary(dist_file)
             storage.write_binary(dest_level_dir / "dist.svg", content)
 
-        # Build multi-model PDBs for both level_1 and level_2; do not emit per-cluster converted PDBs
+        # Build multi-model PDBs for every discovered clustering level; do not emit per-cluster converted PDBs.
         try:
             anomer_meta = {
                 "alpha": {"glytoucan": alpha_glytoucan or archetype_glytoucan, "iupac": alpha_iupac or archetype_iupac},
@@ -497,9 +497,12 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
             except Exception as e:
                 logger.warning(f"Could not calculate molecular weight: {e}")
         
-        # Extract level 1 (main) and level 2 (coverage) cluster data
+        # Extract cluster-level summaries for static JSON.
         level_1_main_clusters = {}
         level_2_coverage_clusters = {}
+        level_3_clusters = {}
+        cluster_levels = {}
+        torsion_summary = {}
         
         # Extract PCA clustering metadata (silhouette scores, coverage mapping)
         silhouette_scores = {}
@@ -521,18 +524,38 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                     "n_components": pca_analysis.get("n_components", 10)
                 }
         
+        torsions_block = cluster_data.get("torsions", {}) if isinstance(cluster_data, dict) else {}
+        family_summary = torsions_block.get("family_summary", {}) if isinstance(torsions_block, dict) else {}
+        if torsions_block:
+            torsion_summary = {
+                "count": torsions_block.get("count"),
+                "glycosidic": len(torsions_block.get("glycosidic", [])),
+                "non_glycosidic": len(torsions_block.get("non_glycosidic", torsions_block.get("other", []))),
+                "by_family": family_summary.get("by_family", {}),
+                "by_subtype": family_summary.get("by_subtype", {}),
+                "by_common_name": family_summary.get("by_common_name", {}),
+            }
+
         if "levels" in cluster_data:
             for level_key, level_data in cluster_data["levels"].items():
+                cluster_pct_map = {}
+                precision = 2 if level_key == "level_1" else 4
+                for cluster in level_data.get("clusters", []):
+                    cluster_id = cluster["cluster_id"]
+                    cluster_name = f"Cluster {cluster_id}"
+                    cluster_pct_map[cluster_name] = round(cluster["cluster_size_pct"], precision)
+
+                cluster_levels[level_key] = {
+                    "n_clusters": level_data.get("n_clusters"),
+                    "clusters": cluster_pct_map,
+                }
+
                 if level_key == "level_1":  # Main clustering (5 clusters)
-                    for cluster in level_data.get("clusters", []):
-                        cluster_id = cluster["cluster_id"]
-                        cluster_name = f"Cluster {cluster_id}"
-                        level_1_main_clusters[cluster_name] = round(cluster["cluster_size_pct"], 2)
+                    level_1_main_clusters = dict(cluster_pct_map)
                 elif level_key == "level_2":  # Coverage clustering
-                    for cluster in level_data.get("clusters", []):
-                        cluster_id = cluster["cluster_id"]
-                        cluster_name = f"Cluster {cluster_id}"
-                        level_2_coverage_clusters[cluster_name] = round(cluster["cluster_size_pct"], 4)
+                    level_2_coverage_clusters = dict(cluster_pct_map)
+                elif level_key == "level_3":
+                    level_3_clusters = dict(cluster_pct_map)
         
         # Build glycan data structure
         glycan_data = {
@@ -563,6 +586,9 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 "entropy": cluster_data.get("entropy_nats"),
                 "clusters": level_1_main_clusters,
                 "coverage_clusters": level_2_coverage_clusters,
+                "level_3_clusters": level_3_clusters,
+                "cluster_levels": cluster_levels,
+                "torsion_summary": torsion_summary,
                 "silhouette_scores": silhouette_scores,
                 "coverage_clusters_per_main": coverage_clusters_per_main,
                 "pca_variance": pca_variance,
@@ -631,7 +657,10 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         output_subdir = f"{final_output_dir}/output"
         storage.mkdir(output_subdir)
         
-        for file_name in ["pca.csv", "torsion_glycosidic.csv", "torparts.npz"]:
+        analysis_files = ["pca.csv", "torsion_glycosidic.csv", "torsion_all.csv", "torparts.npz", "info.json"]
+        analysis_files.extend([f"torsion_{level_key}_reps.csv" for level_key in cluster_levels.keys()])
+
+        for file_name in analysis_files:
             src_file = f"{folder_path}/output/{file_name}"
             if storage.exists(src_file):
                 # Use storage abstraction to copy files

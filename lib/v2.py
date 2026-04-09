@@ -49,7 +49,17 @@ from lib.embedding import (
     create_cluster_info_fast_big
 )
 from lib import glypdbio
-from lib.torsion import get_glycan_torsions_enhanced, get_torsion_values, get_torsion_values_batch, classify_glycosidic_from_name, circular_stats, save_torparts_npz, plot_torsion_distribution
+from lib.torsion import (
+    build_torsion_metadata,
+    classify_glycosidic_from_name,
+    circular_stats,
+    get_glycan_torsions_enhanced,
+    get_torsion_values,
+    get_torsion_values_batch,
+    plot_torsion_distribution,
+    save_torparts_npz,
+    summarize_torsion_metadata,
+)
 
 try:  # RDKit is optional; torsion steps will be skipped if absent
     from rdkit import Chem
@@ -140,6 +150,156 @@ def clusters_from_entropy(
     # geometric interpolation; raise t to gamma to tune steepness
     n = n_min * ((n_max / n_min) ** (t ** gamma))
     return int(round(n))
+
+
+def _load_json_if_exists(path: str, default):
+    storage = get_storage_manager()
+    if not storage.exists(path):
+        return default
+    try:
+        with storage.open(path, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def _write_json(path: str, payload) -> None:
+    storage = get_storage_manager()
+    with storage.open(path, "w") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def _fallback_torsion_metadata_from_labels(labels: List[str]) -> List[Dict]:
+    metadata: List[Dict] = []
+    for index, label in enumerate(labels):
+        canonical_name = classify_glycosidic_from_name(label)
+        is_glycosidic = isinstance(canonical_name, str) and not canonical_name.startswith("other_")
+        subtype = canonical_name.rsplit("_", 1)[-1] if is_glycosidic else "unknown"
+        metadata.append({
+            "index": int(index),
+            "original_name": label,
+            "canonical_name": canonical_name if is_glycosidic else label.replace("-", "__"),
+            "family": "glycosidic" if is_glycosidic else "unknown",
+            "subtype": subtype,
+            "common_name": subtype if is_glycosidic else None,
+            "atom_indices": [],
+            "atom_names": [],
+            "residue_ids": [],
+            "residue_names": [],
+            "central_bond_atoms": [],
+            "central_bond_residues": [],
+            **({"glycosidic_name": canonical_name} if is_glycosidic else {}),
+        })
+    return metadata
+
+
+def _persist_torsion_annotation_files(
+    frame_data_dir: str,
+    embedding_dir: str,
+    torsion_list: List[Tuple[int, int, int, int]],
+    labels: List[str],
+) -> List[Dict]:
+    atoms_df = glypdbio.load_atoms(frame_data_dir)
+    metadata = build_torsion_metadata(torsion_list, atoms_df=atoms_df, original_names=labels)
+
+    metadata_path = os.path.join(embedding_dir, "torsion_metadata.json")
+    _write_json(metadata_path, metadata)
+
+    glycosidic_torsions = []
+    for entry in metadata:
+        if entry.get("family") == "glycosidic":
+            glycosidic_torsions.append({
+                "index": int(entry["index"]),
+                "original_name": entry["original_name"],
+                "glycosidic_name": entry.get("glycosidic_name") or entry["canonical_name"],
+                "torsion_indices": torsion_list[int(entry["index"])],
+                "canonical_name": entry["canonical_name"],
+                "family": entry.get("family"),
+                "subtype": entry.get("subtype"),
+                "common_name": entry.get("common_name"),
+                "atom_indices": entry.get("atom_indices", []),
+                "atom_names": entry.get("atom_names", []),
+                "residue_ids": entry.get("residue_ids", []),
+                "residue_names": entry.get("residue_names", []),
+                "central_bond_atoms": entry.get("central_bond_atoms", []),
+                "central_bond_residues": entry.get("central_bond_residues", []),
+            })
+    glycosidic_path = os.path.join(embedding_dir, "glycosidic_info.json")
+    _write_json(glycosidic_path, glycosidic_torsions)
+    return metadata
+
+
+def _load_or_build_torsion_metadata(
+    frame_data_dir: str,
+    embedding_dir: str,
+    torsion_labels: List[str],
+    torsion_list: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> List[Dict]:
+    metadata_path = os.path.join(embedding_dir, "torsion_metadata.json")
+    metadata = _load_json_if_exists(metadata_path, [])
+    if isinstance(metadata, list) and len(metadata) == len(torsion_labels):
+        return metadata
+
+    try:
+        if torsion_list is None:
+            atoms_df = glypdbio.load_atoms(frame_data_dir)
+            bonds_df = glypdbio.load_bonds(frame_data_dir)
+            torsion_list = get_glycan_torsions_enhanced(atoms_df, bonds_df)
+        if torsion_list and len(torsion_list) == len(torsion_labels):
+            return _persist_torsion_annotation_files(frame_data_dir, embedding_dir, torsion_list, torsion_labels)
+    except Exception as exc:
+        logger.warning(f"Could not rebuild torsion metadata from structure; using label fallback ({exc})")
+
+    metadata = _fallback_torsion_metadata_from_labels(torsion_labels)
+    _write_json(metadata_path, metadata)
+    return metadata
+
+
+def _canonical_torsion_export_names(torsion_metadata: List[Dict]) -> List[str]:
+    counts: Dict[str, int] = {}
+    for entry in torsion_metadata:
+        base_name = str(entry.get("canonical_name") or entry.get("original_name") or f"torsion_{entry.get('index', 0)}")
+        counts[base_name] = counts.get(base_name, 0) + 1
+
+    names: List[str] = []
+    for entry in torsion_metadata:
+        base_name = str(entry.get("canonical_name") or entry.get("original_name") or f"torsion_{entry.get('index', 0)}")
+        if counts.get(base_name, 0) > 1:
+            names.append(f"{base_name}__{int(entry.get('index', len(names)))}")
+        else:
+            names.append(base_name)
+    return names
+
+
+def _align_torsion_metadata_to_labels(torsion_labels: List[str], torsion_metadata: List[Dict]) -> List[Dict]:
+    if len(torsion_metadata) == len(torsion_labels) and all(
+        torsion_metadata[i].get("original_name") == torsion_labels[i] for i in range(len(torsion_labels))
+    ):
+        return torsion_metadata
+    return _fallback_torsion_metadata_from_labels(torsion_labels)
+
+
+def _level_summary_from_metadata(metadata: List[Dict]) -> Dict:
+    family_summary = summarize_torsion_metadata(metadata)
+    glycosidic = [entry for entry in metadata if entry.get("family") == "glycosidic"]
+    non_glycosidic = [entry for entry in metadata if entry.get("family") != "glycosidic"]
+    return {
+        "metadata": metadata,
+        "name_mapping": {entry["original_name"]: entry["canonical_name"] for entry in metadata},
+        "glycosidic": glycosidic,
+        "non_glycosidic": non_glycosidic,
+        "family_summary": family_summary,
+        # Compatibility aliases for older consumers.
+        "other": non_glycosidic,
+        "glycosidic_summary": {
+            "total_torsions": len(metadata),
+            "glycosidic_torsions": len(glycosidic),
+            "other_torsions": len(non_glycosidic),
+            "phi_count": sum(1 for entry in glycosidic if entry.get("subtype") == "phi"),
+            "psi_count": sum(1 for entry in glycosidic if entry.get("subtype") == "psi"),
+            "omega_count": sum(1 for entry in glycosidic if entry.get("subtype") == "omega"),
+        },
+    }
 
 
 def step_store(name: str, frame_data_dir: str, pdb_path: str, mol2_path: str, force: bool = False) -> None:
@@ -263,10 +423,26 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
 
     cluster_out_json = os.path.join(embedding_dir, "clustering_results.json")
     if os.path.exists(cluster_out_json) and not force:
-        logger.info("Clustering step: outputs exist; skipping")
-        # Still update pca.json with current H if not present
-        _update_pca_json(embedding_dir, {"main_clustering": {"H_nats": H}})
-        return H
+        try:
+            cr_existing = load_clustering_results_parquet(embedding_dir)
+            existing_levels = set(cr_existing.levels())
+        except Exception:
+            existing_levels = set()
+
+        if {1, 2, 3}.issubset(existing_levels):
+            logger.info("Clustering step: outputs exist and include level_3; skipping")
+            _update_pca_json(
+                embedding_dir,
+                {
+                    "main_clustering": {"H_nats": H},
+                    "level_3_clustering": {
+                        "selected_n_clusters": int(cr_existing.get_n_clusters(3) or 0),
+                    },
+                },
+            )
+            return H
+
+        logger.info("Clustering step: existing outputs missing level_3; recomputing")
 
     # Extract PCA data
     pca_data = pca_df.select(selected_cols).to_numpy()
@@ -312,10 +488,20 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
         min_coverage_improvement=0.01
     )
 
+    n_frames = int(len(pca_data))
+    n_level_3_target = 512 if n_frames >= 512 else n_frames
+    labels_level_3, n_clusters_level_3 = kcenter_coverage_clustering(
+        pca_data,
+        max_clusters=n_level_3_target,
+        coverage_threshold=0.95,
+        min_coverage_improvement=0.01,
+    )
+
     # Format results and save
     all_levels = {
         1: create_cluster_info_fast(labels_main, pca_df, 1 if n_main == 1 else n_main),
         2: create_cluster_info_fast(labels_cov, pca_df, n_clusters_cov),
+        3: create_cluster_info_fast(labels_level_3, pca_df, n_clusters_level_3),
     }
 
     save_clustering_results(all_levels, output_path=cluster_out_json)
@@ -352,11 +538,17 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
             "coverage_clustering": {
                 "selected_n_clusters": int(n_clusters_cov),
             },
+            "level_3_clustering": {
+                "selected_n_clusters": int(n_clusters_level_3),
+            },
         },
     )
 
     logger.info(f"Saved clustering results to {cluster_out_json} and parquet in {embedding_dir}")
-    logger.info(f"Main clusters: {1 if n_main == 1 else n_main}; Coverage clusters: {n_clusters_cov}")
+    logger.info(
+        f"Main clusters: {1 if n_main == 1 else n_main}; "
+        f"Coverage clusters: {n_clusters_cov}; Level 3 coverage clusters: {n_clusters_level_3}"
+    )
     # Quick read-back and simple diagnostics
     cr = load_clustering_results_parquet(embedding_dir)
     logger.info(f"Cluster reader levels: {cr.levels()}")
@@ -422,6 +614,8 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
             labels = header[1:]
         except Exception:
             labels = []
+        if labels:
+            _load_or_build_torsion_metadata(frame_data_dir, embedding_dir, labels)
         return [], labels
     if Chem is None:
         logger.warning("RDKit not installed; skipping torsion calculation")
@@ -448,6 +642,8 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     
     if not torsion_list:
         logger.info("No rotatable torsions detected; skipping file write")
+        _write_json(os.path.join(embedding_dir, "torsion_metadata.json"), [])
+        _write_json(os.path.join(embedding_dir, "glycosidic_info.json"), [])
         return torsion_list, labels
     
     # Save torparts.npz with same structure as tfindr.py
@@ -478,23 +674,9 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
                 logger.info(f"  written {f+1} frames")
     
     logger.info(f"Wrote torsion angles to {torsion_csv}")
-    
-    # Save glycosidic linkage info
-    glycosidic_path = f"{embedding_dir}/glycosidic_info.json"
-    glycosidic_torsions = []
-    for i, label in enumerate(labels):
-        glycosidic_name = classify_glycosidic_from_name(label)
-        if '_' in glycosidic_name and any(t in glycosidic_name for t in ['phi', 'psi', 'omega']):
-            glycosidic_torsions.append({
-                'index': i,
-                'original_name': label,
-                'glycosidic_name': glycosidic_name,
-                'torsion_indices': torsion_list[i]
-            })
-    
-    with storage.open(glycosidic_path, 'w') as f:
-        json.dump(glycosidic_torsions, f, indent=2)
-    logger.info(f"Saved glycosidic info to {glycosidic_path}")
+
+    metadata = _persist_torsion_annotation_files(frame_data_dir, embedding_dir, torsion_list, labels)
+    logger.info(f"Saved torsion metadata for {len(metadata)} torsions to {embedding_dir}/torsion_metadata.json")
     
     return torsion_list, labels
 
@@ -512,8 +694,19 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
             storage = get_storage_manager()
             with storage.open(stats_path, 'r') as f:
                 existing = json.load(f)
-            tors_ok = isinstance(existing, dict) and existing.get('torsions', {}).get('labels')
-            levels_ok = isinstance(existing, dict) and existing.get('levels')
+            torsions_block = existing.get('torsions', {}) if isinstance(existing, dict) else {}
+            tors_ok = (
+                isinstance(existing, dict)
+                and torsions_block.get('labels')
+                and torsions_block.get('metadata')
+                and torsions_block.get('family_summary')
+            )
+            level_keys = {
+                int(level.get('level'))
+                for level in existing.get('levels', [])
+                if isinstance(level, dict) and level.get('level') is not None
+            } if isinstance(existing, dict) else set()
+            levels_ok = {1, 2, 3}.issubset(level_keys)
             if tors_ok and levels_ok:
                 logger.info("Torsion stats step: torsion_stats.json complete; skipping (use --update to force)")
                 return
@@ -539,49 +732,9 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
     
     # Get torsion labels from CSV columns (excluding 'frame')
     torsion_labels = [c for c in tors_df.columns if c != 'frame']
-    
-    # Perform glycosidic classification based on torsion names
-    name_mapping = {}
-    glycosidic_torsions = []
-    other_torsions = []
-    
-    for i, label in enumerate(torsion_labels):
-        # Parse atom_name_residue_number format (e.g., "C1_2-O3_2-C4_3-C5_3")
-        glycosidic_name = classify_glycosidic_from_name(label)
-        name_mapping[label] = glycosidic_name
-        
-        if '_' in glycosidic_name and any(t in glycosidic_name for t in ['phi', 'psi', 'omega']):
-            # This is a glycosidic torsion
-            parts = glycosidic_name.split('_')
-            if len(parts) == 3 and parts[2] in ['phi', 'psi', 'omega']:
-                glycosidic_torsions.append({
-                    'index': i,
-                    'original_name': label,
-                    'glycosidic_name': glycosidic_name,
-                    'res1': int(parts[0]) if parts[0].isdigit() else parts[0],
-                    'res2': int(parts[1]) if parts[1].isdigit() else parts[1],
-                    'type': parts[2]
-                })
-                continue
-        
-        other_torsions.append({
-            'index': i,
-            'original_name': label,
-            'alternate_name': glycosidic_name,
-            'type': 'other'
-        })
-    
-    # Create glycosidic_info summary
-    glycosidic_info = {
-        'summary': {
-            'total_torsions': len(torsion_labels),
-            'glycosidic_torsions': len(glycosidic_torsions),
-            'other_torsions': len(other_torsions),
-            'phi_count': len([g for g in glycosidic_torsions if g['type'] == 'phi']),
-            'psi_count': len([g for g in glycosidic_torsions if g['type'] == 'psi']),
-            'omega_count': len([g for g in glycosidic_torsions if g['type'] == 'omega'])
-        }
-    }
+
+    torsion_metadata = _load_or_build_torsion_metadata(frame_data_dir, embedding_dir, torsion_labels)
+    torsion_summary = _level_summary_from_metadata(torsion_metadata)
     # Load clustering results
     try:
         cr = load_clustering_results_parquet(embedding_dir)
@@ -708,10 +861,7 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
         'torsions': {
             'labels': torsion_labels,
             'count': len(torsion_labels),
-            'name_mapping': name_mapping,
-            'glycosidic': glycosidic_torsions,
-            'other': other_torsions,
-            'glycosidic_summary': glycosidic_info.get('summary', {})
+            **torsion_summary,
         },
         'levels': levels_summary,
     }
@@ -744,16 +894,29 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
 def step_create_info_json(embedding_dir: str, entropy: float, force: bool = False) -> None:
     """Create info.json by consolidating data from pca.json and torsion_stats.json."""
     info_path = os.path.join(embedding_dir, "info.json")
+    storage = get_storage_manager()
     if os.path.exists(info_path) and not force:
-        logger.info("Create info.json step: info.json exists; skipping (use --update to force)")
-        return
+        try:
+            with storage.open(info_path, 'r') as existing_f:
+                existing = json.load(existing_f)
+            existing_levels = {int(level.get('level')) for level in existing.get('levels', []) if isinstance(level, dict) and level.get('level') is not None}
+            torsions_block = existing.get('torsions', {}) if isinstance(existing, dict) else {}
+            if (
+                int(existing.get('schema_version', 0)) >= 3
+                and {1, 2, 3}.issubset(existing_levels)
+                and torsions_block.get('metadata')
+            ):
+                logger.info("Create info.json step: info.json exists and matches schema v3; skipping")
+                return
+            logger.info("Create info.json step: existing info.json is outdated; regenerating")
+        except Exception:
+            logger.info("Create info.json step: existing info.json unreadable; regenerating")
 
     # Load pca.json data
     pca_json_data = {}
     pca_json_path = os.path.join(embedding_dir, 'pca.json')
     if os.path.exists(pca_json_path):
         try:
-            storage = get_storage_manager()
             with storage.open(pca_json_path, 'r') as pf:
                 pca_json_data = json.load(pf)
             logger.info(f"Loaded pca.json data for info.json")
@@ -777,10 +940,9 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
         'torsions': torsion_stats_data.get('torsions', {}),
         'levels': torsion_stats_data.get('levels', []),
         'pca': pca_json_data,
-        'schema_version': 2, # Incremented version
+        'schema_version': 3,
     }
 
-    storage = get_storage_manager()
     with storage.open(info_path, 'w') as f:
         json.dump(info, f, indent=2)
     logger.info(f"Wrote consolidated data to {info_path}")
@@ -809,16 +971,6 @@ def step_save_representative_structures(
     """
     os.makedirs(out_dir, exist_ok=True)
     
-    # If multi-model files already exist and not forcing, skip
-    if os.path.exists(out_dir) and not force:
-        already = []
-        for root, dirs, files in os.walk(out_dir):
-            if any(fn in files for fn in ("alpha.pdb", "beta.pdb")):
-                already.append(root)
-        if already:
-            logger.info("Multi-model representative structures exist; skipping (use --update to force)")
-            return
-    
     # Load clustering results
     try:
         cr = load_clustering_results_parquet(embedding_dir)
@@ -843,6 +995,9 @@ def step_save_representative_structures(
         # Prepare aggregated alpha/beta files
         alpha_out = os.path.join(level_dir, "alpha.pdb")
         beta_out = os.path.join(level_dir, "beta.pdb")
+        if os.path.exists(alpha_out) and os.path.exists(beta_out) and not force:
+            logger.info(f"Representative structures already exist for level {level}; skipping")
+            continue
         # Write a small header remark to each
         with open(alpha_out, "w") as fa:
             fa.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER ALPHA\n")
@@ -1046,33 +1201,33 @@ def step_export_analysis_data(
     out_dir: str,
     force: bool = False
 ) -> None:
-    """Export key analysis data files to output directory.
-    
-    This step exports:
-    - pca.csv: PCA data with first 3 components only
-    - torsion_glycosidic.csv: Only glycosidic torsions from torsions.csv
-    - Copies torparts.npz and info.json to output directory
-    
-    Parameters:
-        embedding_dir: Directory containing analysis results
-        out_dir: Output directory where files will be exported
-        force: Whether to overwrite existing files
-    """
+    """Export analysis files used by downstream static and ML consumers."""
+    import csv
+
     os.makedirs(out_dir, exist_ok=True)
-    
-    # Define output paths
+    storage = get_storage_manager()
+
     pca_out_path = os.path.join(out_dir, "pca.csv")
     torsion_glycosidic_out_path = os.path.join(out_dir, "torsion_glycosidic.csv")
+    torsion_all_out_path = os.path.join(out_dir, "torsion_all.csv")
     torparts_out_path = os.path.join(out_dir, "torparts.npz")
     info_out_path = os.path.join(out_dir, "info.json")
-    
+
     files_created = 0
     files_skipped = 0
-    
-    # 1. Export PCA data with first 3 components and cluster assignments
+
     pca_source_path = os.path.join(embedding_dir, "pca_conformation_landscape.parquet")
-    clustering_results_path = os.path.join(embedding_dir, "clustering_results.json")
-    
+    torsion_source_path = os.path.join(embedding_dir, "torsions.csv")
+    info_source_path = os.path.join(embedding_dir, "info.json")
+    torparts_source_path = os.path.join(embedding_dir, "torparts.npz")
+
+    cr = None
+    try:
+        cr = load_clustering_results_parquet(embedding_dir)
+    except Exception as exc:
+        logger.warning(f"Could not load clustering results for export: {exc}")
+
+    # 1. Export PCA data with first 3 components and level_1 cluster assignments.
     if os.path.exists(pca_source_path):
         if os.path.exists(pca_out_path) and not force:
             logger.info("pca.csv exists; skipping (use --update to force)")
@@ -1080,30 +1235,21 @@ def step_export_analysis_data(
         else:
             try:
                 pca_df = _read_parquet_robust(pca_source_path)
-                # Select only first 3 PCA components
                 pca_cols = ["frame", "PC1", "PC2", "PC3"]
                 available_cols = [col for col in pca_cols if col in pca_df.columns]
-                
                 if available_cols:
                     pca_export_df = pca_df.select(available_cols)
-                    
-                    # Add cluster column from main clustering (level 1)
-                    try:
-                        cr = load_clustering_results_parquet(embedding_dir)
-                        # Get cluster assignments for all frames from level 1 (main clustering)
+                    if cr is not None:
                         frame_to_cluster = {}
-                        for cluster_id in cr.clusters(1):
-                            members = cr.members(1, int(cluster_id))
-                            for frame in members:
-                                frame_to_cluster[int(frame)] = int(cluster_id)
-                        
-                        # Add cluster column to pca_export_df
-                        cluster_column = [frame_to_cluster.get(f, -1) for f in pca_export_df['frame'].to_list()]
-                        pca_export_df = pca_export_df.with_columns(pl.Series("cluster", cluster_column))
-                        logger.info(f"Added cluster assignments to PCA export")
-                    except Exception as exc:
-                        logger.warning(f"Could not add cluster column to PCA export: {exc}")
-                    
+                        try:
+                            for cluster_id in cr.clusters(1):
+                                for frame in cr.members(1, int(cluster_id)):
+                                    frame_to_cluster[int(frame)] = int(cluster_id)
+                            pca_export_df = pca_export_df.with_columns(
+                                pl.Series("cluster", [frame_to_cluster.get(int(f), -1) for f in pca_export_df["frame"].to_list()])
+                            )
+                        except Exception as exc:
+                            logger.warning(f"Could not add level_1 cluster column to PCA export: {exc}")
                     pca_export_df.write_csv(pca_out_path)
                     logger.info(f"Exported PCA data with {len(available_cols)} components to {pca_out_path}")
                     files_created += 1
@@ -1113,112 +1259,171 @@ def step_export_analysis_data(
                 logger.warning(f"Failed to export PCA data: {exc}")
     else:
         logger.warning(f"PCA source file not found: {pca_source_path}")
-    
-    # 2. Export glycosidic torsions only
-    torsion_source_path = os.path.join(embedding_dir, "torsions.csv")
-    info_source_path = os.path.join(embedding_dir, "info.json")
-    
-    if os.path.exists(torsion_source_path) and os.path.exists(info_source_path):
-        if os.path.exists(torsion_glycosidic_out_path) and not force:
-            logger.info("torsion_glycosidic.csv exists; skipping (use --update to force)")
-            files_skipped += 1
-        else:
-            try:
-                # Load info.json to get glycosidic torsion information
-                storage = get_storage_manager()
-                with storage.open(info_source_path, 'r') as f:
-                    info_data = json.load(f)
 
-                glycosidic_torsions = info_data.get('torsions', {}).get('glycosidic', [])
+    # 2. Export torsion tables.
+    if os.path.exists(torsion_source_path):
+        try:
+            info_data = _load_json_if_exists(info_source_path, {})
+            torsions_block = info_data.get("torsions", {}) if isinstance(info_data, dict) else {}
 
-                if glycosidic_torsions:
-                    # Map original_name -> glycosidic_name (fallback to name_mapping)
-                    name_mapping = info_data.get('torsions', {}).get('name_mapping', {})
+            with storage.open(torsion_source_path, "r") as fin:
+                reader = csv.reader(fin)
+                header = next(reader)
+                if not header or header[0] != "frame":
+                    raise ValueError("torsions.csv is missing the frame column")
 
-                    # Get cluster information from clustering results
-                    frame_to_cluster = {}
-                    cluster_representatives = {}  # cluster_id -> representative_frame
-                    try:
-                        cr = load_clustering_results_parquet(embedding_dir)
-                        # Get cluster assignments for all frames from level 1 (main clustering)
-                        for cluster_id in cr.clusters(1):
-                            members = cr.members(1, int(cluster_id))
-                            for frame in members:
-                                frame_to_cluster[int(frame)] = int(cluster_id)
-                        
-                        # Get representative frames for each cluster
-                        reps_df = cr.representatives(1)
+                torsion_labels = header[1:]
+                raw_metadata = torsions_block.get("metadata") or _load_json_if_exists(
+                    os.path.join(embedding_dir, "torsion_metadata.json"),
+                    [],
+                )
+                torsion_metadata = _align_torsion_metadata_to_labels(torsion_labels, raw_metadata)
+                export_names = _canonical_torsion_export_names(torsion_metadata)
+
+                levels_to_export = [1, 2, 3]
+                frame_to_cluster_by_level: Dict[int, Dict[int, int]] = {}
+                representative_by_level: Dict[int, Dict[int, int]] = {}
+                reps_rows_by_level: Dict[int, List[Dict]] = {}
+                representative_frames = set()
+
+                if cr is not None:
+                    for level in levels_to_export:
+                        try:
+                            reps_df = cr.representatives(level)
+                        except Exception:
+                            reps_df = None
+                        if reps_df is None or reps_df.height == 0:
+                            continue
+
+                        level_map: Dict[int, int] = {}
+                        try:
+                            for cluster_id in cr.clusters(level):
+                                for frame in cr.members(level, int(cluster_id)):
+                                    level_map[int(frame)] = int(cluster_id)
+                        except Exception as exc:
+                            logger.warning(f"Could not read members for level {level}: {exc}")
+                        frame_to_cluster_by_level[level] = level_map
+
+                        rep_map: Dict[int, int] = {}
+                        rep_rows: List[Dict] = []
                         for row in reps_df.iter_rows(named=True):
-                            cid = int(row['cluster_id'])
-                            rep_idx = row.get('representative_idx')
+                            rep_rows.append(row)
+                            rep_idx = row.get("representative_idx")
                             if rep_idx is not None:
-                                cluster_representatives[cid] = int(rep_idx)
-                        
-                        logger.info(f"Loaded cluster information: {len(frame_to_cluster)} frames, {len(cluster_representatives)} representatives")
-                    except Exception as exc:
-                        logger.warning(f"Could not load cluster information for torsion export: {exc}")
+                                rep_map[int(row["cluster_id"])] = int(rep_idx)
+                                representative_frames.add(int(rep_idx))
+                        representative_by_level[level] = rep_map
+                        reps_rows_by_level[level] = rep_rows
 
-                    # Instead of loading the entire CSV with Polars (which can fail
-                    # on very wide files or cause memory/parse issues), stream the
-                    # CSV: read the header, find column indices, then write a new
-                    # CSV with only the requested columns.
-                    import csv
+                frame_rows_for_reps: Dict[int, List[str]] = {}
+                glycosidic_indices: List[int] = [
+                    int(entry["index"]) for entry in torsion_metadata if entry.get("family") == "glycosidic"
+                ]
+                glycosidic_names: List[str] = [export_names[idx] for idx in glycosidic_indices]
 
-                    storage = get_storage_manager()
-                    with storage.open(torsion_source_path, 'r') as fin:
-                        reader = csv.reader(fin)
-                        header = next(reader)
-                        col_to_idx = {col: i for i, col in enumerate(header)}
+                should_write_all = force or not os.path.exists(torsion_all_out_path)
+                should_write_gly = force or not os.path.exists(torsion_glycosidic_out_path)
 
-                        # Determine which glycosidic columns are present
-                        selected_indices = []
-                        out_header = ['frame']
-                        for tor in glycosidic_torsions:
-                            original_name = tor.get('original_name')
-                            gly_name = tor.get('glycosidic_name') or name_mapping.get(original_name)
-                            if original_name in col_to_idx:
-                                selected_indices.append(col_to_idx[original_name])
-                                out_header.append(gly_name)
-                        
-                        # Add cluster and center columns to header
-                        out_header.extend(['cluster', 'center'])
+                all_writer = None
+                gly_writer = None
+                all_file = None
+                gly_file = None
+                try:
+                    if should_write_all:
+                        all_file = storage.open(torsion_all_out_path, "w")
+                        all_writer = csv.writer(all_file)
+                        all_header = ["frame", *export_names]
+                        for level in levels_to_export:
+                            all_header.extend([f"level_{level}_cluster", f"level_{level}_center"])
+                        all_writer.writerow(all_header)
+                    else:
+                        logger.info("torsion_all.csv exists; skipping (use --update to force)")
+                        files_skipped += 1
 
-                        if selected_indices:
-                            # Stream rows and write selected columns to output CSV
-                            with storage.open(torsion_glycosidic_out_path, 'w') as fout:
-                                writer = csv.writer(fout)
-                                writer.writerow(out_header)
-                                for row in reader:
-                                    # frame is always first column (index 0)
-                                    frame_num = int(row[0])
-                                    out_row = [row[0]] + [row[idx] for idx in selected_indices]
-                                    
-                                    # Add cluster assignment
-                                    cluster_id = frame_to_cluster.get(frame_num, -1)
-                                    out_row.append(str(cluster_id))
-                                    
-                                    # Add center column: cluster_id if this frame is a representative, empty otherwise
-                                    is_representative = cluster_id in cluster_representatives and cluster_representatives[cluster_id] == frame_num
-                                    out_row.append(str(cluster_id) if is_representative else '')
-                                    
-                                    writer.writerow(out_row)
+                    if should_write_gly:
+                        gly_file = storage.open(torsion_glycosidic_out_path, "w")
+                        gly_writer = csv.writer(gly_file)
+                        gly_writer.writerow(["frame", *glycosidic_names, "cluster", "center"])
+                    else:
+                        logger.info("torsion_glycosidic.csv exists; skipping (use --update to force)")
+                        files_skipped += 1
 
-                            logger.info(f"Exported {len(selected_indices)} glycosidic torsions with cluster info to {torsion_glycosidic_out_path}")
-                            files_created += 1
-                        else:
-                            logger.warning("No glycosidic torsions found to export (none present in CSV header)")
-                else:
-                    logger.warning("No glycosidic torsions identified in info.json")
-            except Exception as exc:
-                logger.warning(f"Failed to export glycosidic torsions: {exc}")
+                    for row in reader:
+                        frame_num = int(row[0])
+                        torsion_values = row[1:]
+
+                        if all_writer is not None:
+                            out_row = [row[0], *torsion_values]
+                            for level in levels_to_export:
+                                cluster_id = frame_to_cluster_by_level.get(level, {}).get(frame_num, -1)
+                                is_center = representative_by_level.get(level, {}).get(cluster_id) == frame_num
+                                out_row.extend([str(cluster_id), str(cluster_id) if is_center and cluster_id != -1 else ""])
+                            all_writer.writerow(out_row)
+
+                        if gly_writer is not None and glycosidic_indices:
+                            cluster_id = frame_to_cluster_by_level.get(1, {}).get(frame_num, -1)
+                            is_center = representative_by_level.get(1, {}).get(cluster_id) == frame_num
+                            gly_writer.writerow(
+                                [
+                                    row[0],
+                                    *[torsion_values[idx] for idx in glycosidic_indices],
+                                    str(cluster_id),
+                                    str(cluster_id) if is_center and cluster_id != -1 else "",
+                                ]
+                            )
+
+                        if frame_num in representative_frames:
+                            frame_rows_for_reps[frame_num] = torsion_values
+                finally:
+                    if all_file is not None:
+                        all_file.close()
+                    if gly_file is not None:
+                        gly_file.close()
+
+                if should_write_all:
+                    logger.info(f"Exported all torsions with cluster assignments to {torsion_all_out_path}")
+                    files_created += 1
+                if should_write_gly:
+                    logger.info(f"Exported glycosidic torsions to {torsion_glycosidic_out_path}")
+                    files_created += 1
+
+                for level in levels_to_export:
+                    reps_out_path = os.path.join(out_dir, f"torsion_level_{level}_reps.csv")
+                    rep_rows = reps_rows_by_level.get(level, [])
+                    if not rep_rows:
+                        continue
+                    if os.path.exists(reps_out_path) and not force:
+                        logger.info(f"torsion_level_{level}_reps.csv exists; skipping (use --update to force)")
+                        files_skipped += 1
+                        continue
+
+                    with storage.open(reps_out_path, "w") as fout:
+                        writer = csv.writer(fout)
+                        writer.writerow(["frame", "cluster_id", "cluster_size_pct", *export_names])
+                        for rep in rep_rows:
+                            rep_idx = rep.get("representative_idx")
+                            if rep_idx is None:
+                                continue
+                            frame_num = int(rep_idx)
+                            torsion_values = frame_rows_for_reps.get(frame_num)
+                            if torsion_values is None:
+                                continue
+                            writer.writerow([
+                                frame_num,
+                                int(rep["cluster_id"]),
+                                float(rep.get("cluster_size_pct") or 0.0),
+                                *torsion_values,
+                            ])
+                    logger.info(f"Exported representative torsions for level {level} to {reps_out_path}")
+                    files_created += 1
+            if not glycosidic_indices:
+                logger.warning("No glycosidic torsions identified for torsion_glycosidic.csv")
+        except Exception as exc:
+            logger.warning(f"Failed to export torsion tables: {exc}")
     else:
-        if not os.path.exists(torsion_source_path):
-            logger.warning(f"Torsions source file not found: {torsion_source_path}")
-        if not os.path.exists(info_source_path):
-            logger.warning(f"Info source file not found: {info_source_path}")
-    
+        logger.warning(f"Torsions source file not found: {torsion_source_path}")
+
     # 3. Copy torparts.npz
-    torparts_source_path = os.path.join(embedding_dir, "torparts.npz")
     if os.path.exists(torparts_source_path):
         if os.path.exists(torparts_out_path) and not force:
             logger.info("torparts.npz exists; skipping (use --update to force)")
@@ -1232,7 +1437,7 @@ def step_export_analysis_data(
                 logger.warning(f"Failed to copy torparts.npz: {exc}")
     else:
         logger.warning(f"torparts.npz source file not found: {torparts_source_path}")
-    
+
     # 4. Copy info.json
     if os.path.exists(info_source_path):
         if os.path.exists(info_out_path) and not force:
@@ -1247,7 +1452,7 @@ def step_export_analysis_data(
                 logger.warning(f"Failed to copy info.json: {exc}")
     else:
         logger.warning(f"info.json source file not found: {info_source_path}")
-    
+
     logger.info(f"Data export: {files_created} files created, {files_skipped} files skipped")
 
 

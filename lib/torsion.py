@@ -16,8 +16,9 @@ or network visualization code remains in the notebook / higher-level modules.
 """
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import os
+import re
 
 import numpy as np
 from lib.storage import get_storage_manager
@@ -41,6 +42,9 @@ __all__ = [
 	"set_torsion_values",
 	"generate_wiggles",
 	"get_glycan_torsions_enhanced",
+	"annotate_torsion",
+	"build_torsion_metadata",
+	"summarize_torsion_metadata",
 	"classify_glycosidic_from_name",
 	"circular_stats",
 	"save_torparts_npz",
@@ -258,6 +262,75 @@ def describe_torsions(mol: object, torsion_list: Sequence[Torsion], conf_id: int
 	return [f"{lab}: {val:.2f} deg" for lab, val in zip(labels, values)]
 
 
+def _sanitize_torsion_token(value: Any) -> str:
+	text = "NA" if value is None else str(value).strip()
+	if not text:
+		text = "NA"
+	text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+	text = text.strip("_")
+	return text or "NA"
+
+
+def _torsion_label_parts_from_name(torsion_name: str) -> Optional[List[Tuple[str, int]]]:
+	parts = torsion_name.split('-')
+	if len(parts) != 4:
+		return None
+	parsed: List[Tuple[str, int]] = []
+	for part in parts:
+		if '_' not in part:
+			return None
+		atom_name, res_id = part.rsplit('_', 1)
+		try:
+			parsed.append((atom_name, int(res_id)))
+		except ValueError:
+			return None
+	return parsed
+
+
+def _classify_glycosidic_from_parts(atom_names: Sequence[str], residue_ids: Sequence[int]) -> Optional[str]:
+	if len(atom_names) != 4 or len(residue_ids) != 4:
+		return None
+	atom1, atom2, atom3, atom4 = atom_names
+	res1, res2, res3, res4 = residue_ids
+
+	if (
+		atom1 == "O5"
+		and atom2 == "C1"
+		and atom3.startswith("O")
+		and atom3 != "O5"
+		and atom4.startswith("C")
+		and res1 == res2
+		and res3 == res4
+		and res1 != res3
+	):
+		return f"{res1}_{res3}_phi"
+
+	if (
+		atom1 == "C1"
+		and atom2.startswith("O")
+		and atom2 != "O5"
+		and atom3.startswith("C")
+		and atom4.startswith(("C", "O"))
+		and res1 == res2
+		and res2 != res3
+		and res3 == res4
+	):
+		return f"{res1}_{res3}_psi"
+
+	if (
+		atom1.startswith("O")
+		and atom1 != "O5"
+		and atom2 == "C6"
+		and atom3 == "C5"
+		and atom4 == "O5"
+		and res2 == res3 == res4
+		and res1 != res2
+	):
+		return f"{res1}_{res2}_omega"
+
+	return None
+
+
 def classify_glycosidic_from_name(torsion_name: str) -> str:
 	"""Classify a torsion as glycosidic (phi/psi/omega) based on atom names and positions.
 	
@@ -315,6 +388,188 @@ def classify_glycosidic_from_name(torsion_name: str) -> str:
 		
 	except Exception:
 		return f"other_{torsion_name}"
+
+
+def classify_glycosidic_from_name(torsion_name: str) -> str:
+	"""Classify a torsion as glycosidic (phi/psi/omega) based on atom names and positions."""
+	try:
+		parts = _torsion_label_parts_from_name(torsion_name)
+		if not parts:
+			return f"other_{torsion_name}"
+
+		atom_names = [atom_name for atom_name, _ in parts]
+		residue_ids = [res_id for _, res_id in parts]
+
+		forward = _classify_glycosidic_from_parts(atom_names, residue_ids)
+		if forward:
+			return forward
+
+		reverse = _classify_glycosidic_from_parts(atom_names[::-1], residue_ids[::-1])
+		if reverse:
+			return reverse
+
+		return f"other_{torsion_name}"
+	except Exception:
+		return f"other_{torsion_name}"
+
+
+def _torsion_atom_metadata(
+	torsion: Torsion,
+	atoms_df,
+) -> tuple[List[int], List[str], List[int], List[str]]:
+	atom_indices = [int(i) for i in torsion]
+	atom_names_col = atoms_df["name"].to_list() if "name" in atoms_df.columns else [f"X{i}" for i in range(len(atoms_df))]
+	residue_ids_col = atoms_df["res_id"].to_list() if "res_id" in atoms_df.columns else [1] * len(atoms_df)
+	residue_names_col = atoms_df["res_name"].to_list() if "res_name" in atoms_df.columns else ["UNK"] * len(atoms_df)
+
+	atom_names = [str(atom_names_col[i]) for i in atom_indices]
+	residue_ids = [int(residue_ids_col[i]) for i in atom_indices]
+	residue_names = [str(residue_names_col[i]) for i in atom_indices]
+	return atom_indices, atom_names, residue_ids, residue_names
+
+
+def _make_original_torsion_name(atom_names: Sequence[str], residue_ids: Sequence[int]) -> str:
+	return "-".join(f"{atom_name}_{res_id}" for atom_name, res_id in zip(atom_names, residue_ids))
+
+
+def _canonicalize_non_glycosidic_orientation(
+	atom_names: Sequence[str],
+	residue_ids: Sequence[int],
+	residue_names: Sequence[str],
+) -> tuple[List[str], List[int], List[str]]:
+	forward = [
+		f"c0_{residue_ids[1]}_{_sanitize_torsion_token(residue_names[1])}_{_sanitize_torsion_token(atom_names[1])}",
+		f"c1_{residue_ids[2]}_{_sanitize_torsion_token(residue_names[2])}_{_sanitize_torsion_token(atom_names[2])}",
+		f"f0_{residue_ids[0]}_{_sanitize_torsion_token(residue_names[0])}_{_sanitize_torsion_token(atom_names[0])}",
+		f"f1_{residue_ids[3]}_{_sanitize_torsion_token(residue_names[3])}_{_sanitize_torsion_token(atom_names[3])}",
+	]
+	reverse = [
+		f"c0_{residue_ids[2]}_{_sanitize_torsion_token(residue_names[2])}_{_sanitize_torsion_token(atom_names[2])}",
+		f"c1_{residue_ids[1]}_{_sanitize_torsion_token(residue_names[1])}_{_sanitize_torsion_token(atom_names[1])}",
+		f"f0_{residue_ids[3]}_{_sanitize_torsion_token(residue_names[3])}_{_sanitize_torsion_token(atom_names[3])}",
+		f"f1_{residue_ids[0]}_{_sanitize_torsion_token(residue_names[0])}_{_sanitize_torsion_token(atom_names[0])}",
+	]
+	if tuple(reverse) < tuple(forward):
+		return list(atom_names[::-1]), list(residue_ids[::-1]), list(residue_names[::-1])
+	return list(atom_names), list(residue_ids), list(residue_names)
+
+
+def _infer_non_glycosidic_identity(
+	atom_names: Sequence[str],
+	residue_ids: Sequence[int],
+	residue_names: Sequence[str],
+) -> tuple[str, str, Optional[str]]:
+	center_pair = tuple(atom_names[1:3])
+	center_pair_set = frozenset(center_pair)
+	same_central_residue = residue_ids[1] == residue_ids[2]
+
+	if same_central_residue:
+		if center_pair_set == frozenset({"C5", "C6"}) and {"C4", "O6"}.issubset(set(atom_names)):
+			return "residue_local", "exocyclic_c6", "exocyclic_c6"
+		if center_pair_set == frozenset({"C2", "N2"}):
+			return "residue_local", "n_acetyl_linker", "n_acetyl"
+		if center_pair_set == frozenset({"N2", "C7"}):
+			return "residue_local", "n_acetyl_amide", "n_acetyl"
+		if center_pair_set == frozenset({"C7", "C8"}):
+			return "residue_local", "n_acetyl_methyl", "n_acetyl"
+		return "residue_local", f"bond_{_sanitize_torsion_token(atom_names[1])}_{_sanitize_torsion_token(atom_names[2])}", None
+
+	return "inter_residue", f"bond_{_sanitize_torsion_token(atom_names[1])}_{_sanitize_torsion_token(atom_names[2])}", None
+
+
+def _build_non_glycosidic_canonical_name(
+	atom_names: Sequence[str],
+	residue_ids: Sequence[int],
+	residue_names: Sequence[str],
+) -> str:
+	atom_names, residue_ids, residue_names = _canonicalize_non_glycosidic_orientation(atom_names, residue_ids, residue_names)
+	center_left = f"r{residue_ids[1]}_{_sanitize_torsion_token(residue_names[1])}_{_sanitize_torsion_token(atom_names[1])}"
+	center_right = f"r{residue_ids[2]}_{_sanitize_torsion_token(residue_names[2])}_{_sanitize_torsion_token(atom_names[2])}"
+	flank_left = f"r{residue_ids[0]}_{_sanitize_torsion_token(residue_names[0])}_{_sanitize_torsion_token(atom_names[0])}"
+	flank_right = f"r{residue_ids[3]}_{_sanitize_torsion_token(residue_names[3])}_{_sanitize_torsion_token(atom_names[3])}"
+	return f"{center_left}__{center_right}__{flank_left}__{flank_right}"
+
+
+def annotate_torsion(
+	torsion: Torsion,
+	atoms_df,
+	index: int,
+	original_name: Optional[str] = None,
+) -> Dict[str, Any]:
+	"""Build stable metadata for a torsion definition."""
+	atom_indices, atom_names, residue_ids, residue_names = _torsion_atom_metadata(torsion, atoms_df)
+	original_name = original_name or _make_original_torsion_name(atom_names, residue_ids)
+
+	glycosidic_name = classify_glycosidic_from_name(original_name)
+	if glycosidic_name and not glycosidic_name.startswith("other_"):
+		subtype = glycosidic_name.rsplit("_", 1)[-1]
+		return {
+			"index": int(index),
+			"original_name": original_name,
+			"canonical_name": glycosidic_name,
+			"family": "glycosidic",
+			"subtype": subtype,
+			"common_name": subtype,
+			"atom_indices": atom_indices,
+			"atom_names": atom_names,
+			"residue_ids": residue_ids,
+			"residue_names": residue_names,
+			"central_bond_atoms": [atom_names[1], atom_names[2]],
+			"central_bond_residues": [residue_ids[1], residue_ids[2]],
+			"glycosidic_name": glycosidic_name,
+		}
+
+	family, subtype, common_name = _infer_non_glycosidic_identity(atom_names, residue_ids, residue_names)
+	canonical_name = _build_non_glycosidic_canonical_name(atom_names, residue_ids, residue_names)
+	return {
+		"index": int(index),
+		"original_name": original_name,
+		"canonical_name": canonical_name,
+		"family": family,
+		"subtype": subtype,
+		"common_name": common_name,
+		"atom_indices": atom_indices,
+		"atom_names": atom_names,
+		"residue_ids": residue_ids,
+		"residue_names": residue_names,
+		"central_bond_atoms": [atom_names[1], atom_names[2]],
+		"central_bond_residues": [residue_ids[1], residue_ids[2]],
+	}
+
+
+def build_torsion_metadata(
+	torsion_list: Sequence[Torsion],
+	atoms_df,
+	original_names: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+	metadata: List[Dict[str, Any]] = []
+	for index, torsion in enumerate(torsion_list):
+		original_name = original_names[index] if original_names and index < len(original_names) else None
+		metadata.append(annotate_torsion(torsion, atoms_df=atoms_df, index=index, original_name=original_name))
+	return metadata
+
+
+def summarize_torsion_metadata(metadata: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+	by_family: Dict[str, int] = {}
+	by_subtype: Dict[str, int] = {}
+	by_common_name: Dict[str, int] = {}
+	for entry in metadata:
+		family = str(entry.get("family") or "unknown")
+		subtype = str(entry.get("subtype") or "unknown")
+		common_name = entry.get("common_name")
+		by_family[family] = by_family.get(family, 0) + 1
+		by_subtype[subtype] = by_subtype.get(subtype, 0) + 1
+		if common_name:
+			by_common_name[str(common_name)] = by_common_name.get(str(common_name), 0) + 1
+
+	return {
+		"total": len(metadata),
+		"glycosidic": sum(1 for entry in metadata if entry.get("family") == "glycosidic"),
+		"non_glycosidic": sum(1 for entry in metadata if entry.get("family") != "glycosidic"),
+		"by_family": dict(sorted(by_family.items())),
+		"by_subtype": dict(sorted(by_subtype.items())),
+		"by_common_name": dict(sorted(by_common_name.items())),
+	}
 
 
 def circular_stats(deg_values: np.ndarray) -> dict:
