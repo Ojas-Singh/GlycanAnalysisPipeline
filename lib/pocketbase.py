@@ -20,6 +20,12 @@ GLYCAN_COLLECTION = "glycans"
 COLLECTION = SUBMISSION_COLLECTION
 
 
+def _get_env_token() -> str:
+    """Resolve the PocketBase token from supported environment variables."""
+    return (os.environ.get("POCKETBASE_TOKEN", "").strip()
+            or os.environ.get("POCKETBASE_ADMIN_TOKEN", "").strip())
+
+
 def _safe_float(value: Any) -> Optional[float]:
     """Convert a value to float, returning None on failure."""
     if value is None or value == "":
@@ -34,8 +40,8 @@ class PocketBaseClient:
     """Reusable PocketBase API client with in-memory caching."""
 
     def __init__(self, base_url: str = None, token: str = None):
-        self.base_url = (base_url or os.environ.get("POCKETBASE_URL", "")).rstrip("/")
-        self.token = token or os.environ.get("POCKETBASE_ADMIN_TOKEN", "")
+        self.base_url = (base_url or os.environ.get("POCKETBASE_URL", "")).strip().rstrip("/")
+        self.token = (token or _get_env_token()).strip()
         self._available: Optional[bool] = None
         self._cache_by_id: Dict[str, Any] = {}
         self._cache_by_name: Dict[str, Any] = {}
@@ -190,6 +196,50 @@ class PocketBaseClient:
             self._glycan_cache_by_id[result["glycoshape_id"]] = result
         return result
 
+    def update_submission_record(
+        self,
+        record_id: str,
+        payload: Dict[str, Any],
+    ) -> Optional[dict]:
+        """Patch a glycan_submission record and refresh in-memory caches."""
+        if not record_id:
+            raise ValueError("record_id is required to update a submission record")
+
+        result = self.request(
+            "patch",
+            f"/api/collections/{SUBMISSION_COLLECTION}/records/{record_id}",
+            json=payload,
+        )
+
+        glycoshape_id = str(result.get("glycoshape_id") or "").strip()
+        glycam_name = str(result.get("glycam_name") or "").strip()
+        if glycoshape_id:
+            self._cache_by_id[glycoshape_id] = result
+        if glycam_name:
+            self._cache_by_name[glycam_name] = result
+        return result
+
+    def update_submission_log_tail(
+        self,
+        log_tail: str,
+        glycoshape_id: str = "",
+        glycam_name: str = "",
+    ) -> Optional[dict]:
+        """Patch ``log_tail`` on the matching glycan_submission record."""
+        record = None
+
+        glycoshape_id = str(glycoshape_id or "").strip()
+        glycam_name = str(glycam_name or "").strip()
+
+        if glycoshape_id:
+            record = self.get_record_by_glycoshape_id(glycoshape_id, collection=SUBMISSION_COLLECTION)
+        if record is None and glycam_name:
+            record = self.get_record_by_glycam_name(glycam_name, collection=SUBMISSION_COLLECTION)
+        if record is None:
+            return None
+
+        return self.update_submission_record(record["id"], {"log_tail": log_tail})
+
 
 def _normalize_string_list(values: Any) -> List[str]:
     if not isinstance(values, list):
@@ -282,6 +332,27 @@ def extract_inventory_metadata(pb_record: dict) -> dict:
         "comments": pb_record.get("comments", ""),
         "glytoucan_id": pb_record.get("glytoucan_id", ""),
     }
+
+
+def extract_md_info(pb_record: dict) -> tuple:
+    """Transform a PocketBase submission record into ``name_utils.get_md_info`` shape."""
+    metadata = extract_inventory_metadata(pb_record)
+
+    def _as_optional_str(value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        return str(value)
+
+    return (
+        _as_optional_str(metadata.get("ID")),
+        _as_optional_str(metadata.get("length")),
+        _as_optional_str(metadata.get("package")),
+        _as_optional_str(metadata.get("forcefield")),
+        _as_optional_str(metadata.get("temperature")),
+        _as_optional_str(metadata.get("pressure")),
+        _as_optional_str(metadata.get("salt")),
+        _as_optional_str(metadata.get("email")),
+    )
 
 
 def extract_search_enrichment(

@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 class GlycoShapeBaker:
     """Main class for creating GlycoShape database archives and files."""
+    ARCHIVE_OUTPUT_LEVELS = ("level_1",)
     
     def __init__(self, database_dir: Union[str, Path]):
         """Initialize the baker with database directory.
@@ -80,18 +81,23 @@ class GlycoShapeBaker:
                                 arcname = format_dir + '/' + str(file.relative_to(format_path))
                                 zf.write(file, arcname)
                 
-                # Preserve every output/level_* directory in the archive.
+                # Only include the representative archive-ready outputs.
                 output_dir = glycan_dir / "output"
-                level_dirs = sorted([path for path in output_dir.glob("level_*") if path.is_dir()]) if output_dir.exists() else []
+                level_dirs = (
+                    [output_dir / level_name for level_name in self.ARCHIVE_OUTPUT_LEVELS if (output_dir / level_name).is_dir()]
+                    if output_dir.exists()
+                    else []
+                )
                 if level_dirs:
                     for level_dir in level_dirs:
-                        for file in level_dir.rglob('*'):
+                        for file in sorted(level_dir.rglob('*')):
                             if file.is_file():
-                                arcname = str(Path("output") / file.relative_to(output_dir))
+                                arcname = str(file.relative_to(level_dir))
                                 zf.write(file, arcname)
                                 self.logger.debug(f"Added {arcname} to archive")
                 else:
-                    self.logger.warning(f"No output/level_* directories found in {glycan_dir}")
+                    expected_levels = ", ".join(self.ARCHIVE_OUTPUT_LEVELS)
+                    self.logger.warning(f"No archive output levels ({expected_levels}) found in {glycan_dir}")
                             
             self.logger.info(f"Successfully created archive for {glycan_id}")
             return True

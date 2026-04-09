@@ -11,6 +11,7 @@ from lib.storage import get_storage_manager
 
 from typing import Optional
 
+import io
 import numpy as np
 import polars as pl
 import joblib  # type: ignore
@@ -76,25 +77,45 @@ import json
 import time
 
 
+def _path_exists(path: str) -> bool:
+	"""Return True when a path exists locally or via the active storage backend."""
+	if os.path.exists(path):
+		return True
+	storage = get_storage_manager()
+	return storage.exists(path)
+
+
 def _read_parquet_robust(path: str):
 	"""Try pyarrow first (avoids glob issues), then fall back to Polars."""
-	if not os.path.exists(path):
+	storage = get_storage_manager()
+	if os.path.exists(path):
+		try:
+			import pyarrow.parquet as pq  # type: ignore
+			table = pq.read_table(path)
+			return pl.from_arrow(table)
+		except Exception:
+			try:
+				import glob
+				return pl.read_parquet(glob.escape(path))
+			except Exception:
+				return pl.read_parquet(path)
+	if not storage.exists(path):
 		raise FileNotFoundError(path)
+	raw = storage.read_binary(path)
 	try:
 		import pyarrow.parquet as pq  # type: ignore
-		table = pq.read_table(path)
+		table = pq.read_table(io.BytesIO(raw))
 		return pl.from_arrow(table)
 	except Exception:
-		try:
-			import glob
-			return pl.read_parquet(glob.escape(path))
-		except Exception:
-			return pl.read_parquet(path)
+		return pl.read_parquet(io.BytesIO(raw))
 
 def _read_csv_robust(path: str, **kwargs):
 	"""Read CSV robustly, handling special characters in paths (like square brackets)."""
-	if not os.path.exists(path):
+	storage = get_storage_manager()
+	if not _path_exists(path):
 		raise FileNotFoundError(path)
+	if not os.path.exists(path):
+		return pl.read_csv(io.BytesIO(storage.read_binary(path)), **kwargs)
 	try:
 		# Try with glob.escape first to handle special characters
 		import glob
@@ -1227,7 +1248,7 @@ def load_clustering_results_parquet(output_dir: str) -> ClusteringResults:
 			levels = []
 			# Best-effort infer levels from cluster_summary.parquet if present
 			summary_path = os.path.join(output_dir, 'cluster_summary.parquet')
-			if os.path.exists(summary_path):
+			if _path_exists(summary_path):
 				sdf = _read_parquet_robust(summary_path)
 				if 'level' in sdf.columns:
 					levels = sorted(set(int(x) for x in sdf['level'].to_list()))
@@ -1238,7 +1259,7 @@ def load_clustering_results_parquet(output_dir: str) -> ClusteringResults:
 			meta = {
 				'levels': levels,
 				'level_to_n_clusters': {},
-				'has_members': os.path.exists(os.path.join(output_dir, 'cluster_members.parquet')),
+				'has_members': _path_exists(os.path.join(output_dir, 'cluster_members.parquet')),
 				'format_version': 2,
 			}
 			with storage.open(meta_path, 'w') as f:
@@ -1252,7 +1273,7 @@ def load_clustering_results_parquet(output_dir: str) -> ClusteringResults:
 	logger.info(f"Loading clustering results from {output_dir}, metadata: {meta}")
 	
 	summary_path = os.path.join(output_dir, 'cluster_summary.parquet')
-	if not os.path.exists(summary_path):
+	if not _path_exists(summary_path):
 		raise FileNotFoundError(f'cluster_summary.parquet missing in {output_dir}')
 	
 	summary_df = _read_parquet_robust(summary_path)
@@ -1266,7 +1287,7 @@ def load_clustering_results_parquet(output_dir: str) -> ClusteringResults:
 	members_df = None
 	if meta.get('has_members'):
 		members_path = os.path.join(output_dir, 'cluster_members.parquet')
-		if os.path.exists(members_path):
+		if _path_exists(members_path):
 			members_df = _read_parquet_robust(members_path)
 			logger.info(f"Loaded members DataFrame with shape {members_df.shape}")
 		else:

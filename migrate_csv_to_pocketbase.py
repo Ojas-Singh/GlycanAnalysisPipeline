@@ -10,7 +10,7 @@ Usage:
 
 Or via environment variables:
     POCKETBASE_URL=http://localhost:8090 \
-    POCKETBASE_ADMIN_TOKEN=<token> \
+    POCKETBASE_TOKEN=<token> \
     GLYCOSHAPE_INVENTORY_CSV=../GlycoShape_Inventory.csv \
     python migrate_csv_to_pocketbase.py
 """
@@ -102,14 +102,14 @@ def main():
 
     args = parse_args()
     pb_url = args.pocketbase_url or os.environ.get("POCKETBASE_URL")
-    token = args.token or os.environ.get("POCKETBASE_ADMIN_TOKEN")
+    token = args.token or os.environ.get("POCKETBASE_TOKEN") or os.environ.get("POCKETBASE_ADMIN_TOKEN")
     csv_path = args.csv or os.environ.get("GLYCOSHAPE_INVENTORY_CSV", "../GlycoShape_Inventory.csv")
 
     if not pb_url:
         print("ERROR: --pocketbase-url or POCKETBASE_URL required")
         sys.exit(1)
     if not token:
-        print("ERROR: --token or POCKETBASE_ADMIN_TOKEN required")
+        print("ERROR: --token or POCKETBASE_TOKEN or POCKETBASE_ADMIN_TOKEN required")
         sys.exit(1)
     if not csv_path:
         print("ERROR: --csv or GLYCOSHAPE_INVENTORY_CSV required")

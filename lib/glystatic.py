@@ -55,6 +55,11 @@ def get_glycan_metadata(glycam_name: str) -> dict:
     return _get_metadata_from_csv(glycam_name)
 
 
+def get_glycan_metadata_from_inventory(glycam_name: str) -> dict:
+    """Backward-compatible wrapper for submission metadata lookup."""
+    return get_glycan_metadata(glycam_name)
+
+
 def _get_metadata_from_csv(glycam_name: str) -> dict:
     """Get glycan metadata from the inventory CSV file (fallback).
 

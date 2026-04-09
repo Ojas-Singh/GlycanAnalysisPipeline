@@ -844,11 +844,16 @@ def plot_torsion_distribution(
 	except ImportError as e:
 		raise ImportError("Plotting requires pandas, seaborn, and matplotlib") from e
 	
-	if not os.path.exists(torsion_csv_path):
+	storage = get_storage_manager()
+	if not (os.path.exists(torsion_csv_path) or storage.exists(torsion_csv_path)):
 		raise FileNotFoundError(f"Torsion CSV file not found: {torsion_csv_path}")
 	
 	# Read torsion data
-	data = pd.read_csv(torsion_csv_path)
+	if os.path.exists(torsion_csv_path):
+		data = pd.read_csv(torsion_csv_path)
+	else:
+		with storage.open(torsion_csv_path, 'r') as fh:
+			data = pd.read_csv(fh)
 	if 'frame' not in data.columns:
 		raise ValueError("Torsions CSV must contain 'frame' column")
 	
@@ -857,7 +862,6 @@ def plot_torsion_distribution(
 	glycosidic_original_names = set()
 	name_mapping = {}
 	
-	storage = get_storage_manager()
 	if storage.exists(info_json_path):
 		try:
 			with storage.open(info_json_path, 'r') as f:
@@ -885,7 +889,11 @@ def plot_torsion_distribution(
 				torsion_cols.append(col)
 	
 	if not torsion_cols:
-		raise ValueError("No glycosidic torsion columns found in CSV")
+		# Monosaccharides and some edge cases may not have glycosidic torsions.
+		# Fall back to plotting all available torsions so the static tree is still complete.
+		torsion_cols = [col for col in data.columns if col != 'frame']
+		if not torsion_cols:
+			raise ValueError("No torsion columns found in CSV")
 	
 	# Replace Greek letter names for better display
 	display_names = {}

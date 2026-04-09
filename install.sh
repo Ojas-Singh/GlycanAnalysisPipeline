@@ -1,6 +1,38 @@
 #!/bin/bash
 
-exec > >(tee last_run.log) 2>&1
+resolve_log_path() {
+    if [[ -n "$GLYCOSHAPE_GAP_LOG" ]]; then
+        printf '%s\n' "$GLYCOSHAPE_GAP_LOG"
+        return
+    fi
+
+    if [[ -f ".env" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            line=${line#export }
+
+            if [[ "$line" != GLYCOSHAPE_GAP_LOG=* ]]; then
+                continue
+            fi
+
+            value=${line#*=}
+            value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ "$value" =~ ^\".*\"$ || "$value" =~ ^\'.*\'$ ]]; then
+                value=${value:1:${#value}-2}
+            fi
+
+            printf '%s\n' "$value"
+            return
+        done < .env
+    fi
+
+    printf '%s\n' "last_run.log"
+}
+
+LOG_PATH="$(resolve_log_path)"
+mkdir -p "$(dirname "$LOG_PATH")"
+exec > >(tee "$LOG_PATH") 2>&1
 
 # GlycanAnalysisPipeline Installation Script
 # Uses Python 3.10 and uv for dependency management
@@ -291,10 +323,16 @@ REQUIRED_VARS=(
     "GLYCOSHAPE_DATA_DIR"
     "GLYCOSHAPE_PROCESS_DIR" 
     "GLYCOSHAPE_OUTPUT_DIR"
-    "GLYCOSHAPE_INVENTORY_PATH"
     "GLYTOUCAN_CONTRIBUTOR_ID"
     "GLYTOUCAN_API_KEY"
 )
+
+POCKETBASE_EFFECTIVE_TOKEN="${POCKETBASE_TOKEN:-${POCKETBASE_ADMIN_TOKEN:-}}"
+if [[ -z "$POCKETBASE_URL" || -z "$POCKETBASE_EFFECTIVE_TOKEN" ]]; then
+    REQUIRED_VARS+=("GLYCOSHAPE_INVENTORY_PATH")
+else
+    echo "PocketBase submission metadata enabled via POCKETBASE_URL and token."
+fi
 
 MISSING_VARS=()
 for var in "${REQUIRED_VARS[@]}"; do

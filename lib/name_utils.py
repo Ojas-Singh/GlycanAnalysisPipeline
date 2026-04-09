@@ -5,9 +5,9 @@ import shutil
 import requests
 import collections
 import polars as pl
-import pyarrow.csv as pacsv
 import math
 from pathlib import Path
+from io import BytesIO
 from lib.storage import get_storage_manager
 from glypy.io import iupac as glypy_iupac
 
@@ -328,28 +328,53 @@ def get_md_info(glycan: str) -> tuple:
     Returns:
         Tuple of (ID, length, package, FF, temp, pressure, salt, contributor)
     """
+    if config.use_pocketbase:
+        try:
+            from lib.pocketbase import extract_md_info, get_pocketbase_client
+
+            client = get_pocketbase_client()
+            if client.is_available():
+                record = client.get_record_by_glycam_name(glycan)
+                if record is not None:
+                    logger.info(f"Loaded MD info for {glycan} from PocketBase")
+                    return extract_md_info(record)
+                logger.warning(f"No PocketBase submission metadata found for {glycan}; falling back to CSV")
+            else:
+                logger.warning("PocketBase is configured but unavailable; falling back to CSV")
+        except Exception as e:
+            logger.warning(f"Failed to load MD info for {glycan} from PocketBase: {e}")
+
     # Cache the inventory DataFrame
     if not hasattr(get_md_info, '_inventory_df'):
         try:
-            latest_inventory = Path(config.inventory_path)
-            if not latest_inventory.exists():
-                logger.error(f"Inventory file not found: {latest_inventory}")
-                return 0, 0, 0, 0, 0, 0, 0, "0"
+            storage_manager = get_storage_manager()
+            inv_path = str(config.inventory_path)
+            if not storage_manager.exists(inv_path):
+                candidates = []
+                try:
+                    for obj in storage_manager.list_files("", "*"):
+                        name = obj.as_posix() if hasattr(obj, 'as_posix') else str(obj)
+                        if name.lower().endswith("glycoshape_inventory.csv"):
+                            candidates.append(name)
+                except Exception:
+                    pass
 
-            # Read CSV using pyarrow for performance and compatibility, then convert to Polars
-            try:
-                table = pacsv.read_csv(str(latest_inventory))
-                df = pl.from_arrow(table)
-            except Exception:
-                # Fall back to Polars CSV reader if pyarrow fails for any reason
-                df = pl.read_csv(str(latest_inventory))
+                if candidates:
+                    candidates.sort(key=lambda s: len(s))
+                    inv_path = candidates[0]
+                else:
+                    logger.error(f"Inventory file not found: {inv_path}")
+                    return 0, 0, 0, 0, 0, 0, 0, "0"
+
+            csv_bytes = storage_manager.read_binary(inv_path)
+            df = pl.read_csv(BytesIO(csv_bytes))
 
             # Keep only rows with a non-null Timestamp
             if 'Timestamp' in df.columns:
                 df = df.filter(pl.col('Timestamp').is_not_null())
 
             get_md_info._inventory_df = df
-            logger.info(f"Loaded inventory from {latest_inventory}")
+            logger.info(f"Loaded inventory from {inv_path}")
         except Exception as e:
             logger.error(f"Failed to load inventory: {str(e)}")
             return 0, 0, 0, 0, 0, 0, 0, "0"

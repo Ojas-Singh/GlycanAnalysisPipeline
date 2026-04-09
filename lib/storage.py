@@ -640,24 +640,16 @@ class StorageManager:
                 return True
         except Exception:
             pass
-        # In Oracle mode, prioritize Oracle for inventory CSV
+        # In Oracle mode, always prefer fresh local staged files first, then fall back to remote.
         if self._is_oracle:
-            path_str = str(path).lower()
-            if 'inventory' in path_str and path_str.endswith('.csv'):
-                # For inventory CSV, check Oracle first
-                return self.backend.exists(path)
-            # For output/static prefixes, prefer remote check to avoid missing remote-only content
-            if self._is_output_prefix(path):
-                try:
-                    return self.backend.exists(path)
-                except Exception:
-                    return False
-            # For other files, prefer local staged files first, then fall back to remote
             try:
                 if self._local_backend.exists(path):
                     return True
             except Exception:
                 pass
+            path_str = str(path).lower()
+            if 'inventory' in path_str and path_str.endswith('.csv'):
+                return self.backend.exists(path)
             return self.backend.exists(path)
         return self.backend.exists(path)
     
@@ -691,12 +683,6 @@ class StorageManager:
             pass
         # In Oracle mode, prefer local staged dirs first, then fall back to remote
         if self._is_oracle:
-            # Output/static prefixes should query remote first
-            if self._is_output_prefix(path):
-                try:
-                    return self.backend.is_dir(path)
-                except Exception:
-                    return False
             try:
                 if self._local_backend.is_dir(path):
                     return True
@@ -768,15 +754,13 @@ class StorageManager:
                 return self._local_backend.read_text(pstr, encoding)
         except Exception:
             pass
-        # For Oracle mode, prioritize remote reads for process directories and inventory CSV
+        # In Oracle mode, prefer freshly staged local files, then fall back to remote.
         if self._is_oracle:
+            if self._local_backend.exists(path):
+                return self._local_backend.read_text(path, encoding)
             path_str = str(path)
             if self._is_process_prefix(path_str) or self._is_output_prefix(path_str) or ('inventory' in path_str.lower() and path_str.lower().endswith('.csv')):
-                # For process directories and inventory CSV, read from Oracle bucket first
                 return self.backend.read_text(path, encoding)
-            # For other directories, prefer local staged file
-            elif self._local_backend.exists(path):
-                return self._local_backend.read_text(path, encoding)
         return self.backend.read_text(path, encoding)
     
     def read_binary(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> bytes:
@@ -788,15 +772,13 @@ class StorageManager:
                 return self._local_backend.read_binary(pstr)
         except Exception:
             pass
-        # For Oracle mode, prioritize remote reads for process directories and inventory CSV
+        # In Oracle mode, prefer freshly staged local files, then fall back to remote.
         if self._is_oracle:
+            if self._local_backend.exists(path):
+                return self._local_backend.read_binary(path)
             path_str = str(path)
             if self._is_process_prefix(path_str) or self._is_output_prefix(path_str) or ('inventory' in path_str.lower() and path_str.lower().endswith('.csv')):
-                # For process directories and inventory CSV, read from Oracle bucket first
                 return self.backend.read_binary(path)
-            # For other directories, prefer local staged file
-            elif self._local_backend.exists(path):
-                return self._local_backend.read_binary(path)
         return self.backend.read_binary(path)
     
     def write_text(self, path: Union[str, Path], content: str, base_dir: Optional[Union[str, Path]] = None, encoding: str = "utf-8") -> None:

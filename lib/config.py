@@ -106,9 +106,10 @@ contributor_id = os.environ.get("GLYTOUCAN_CONTRIBUTOR_ID", "dummy_contributor_i
 api_key = os.environ.get("GLYTOUCAN_API_KEY", "dummy_glytoucan_api")
 
 # PocketBase configuration (optional - replaces CSV inventory when configured)
-pocketbase_url = os.environ.get("POCKETBASE_URL", "")
-pocketbase_admin_token = os.environ.get("POCKETBASE_ADMIN_TOKEN", "")
-use_pocketbase = bool(pocketbase_url and pocketbase_admin_token)
+pocketbase_url = os.environ.get("POCKETBASE_URL", "").strip()
+pocketbase_admin_token = os.environ.get("POCKETBASE_ADMIN_TOKEN", "").strip()
+pocketbase_token = (os.environ.get("POCKETBASE_TOKEN", "").strip() or pocketbase_admin_token)
+use_pocketbase = bool(pocketbase_url and pocketbase_token)
 
 
 def get_storage_info() -> dict:

@@ -50,9 +50,13 @@ export GLYCOSHAPE_DB_UPDATE=True
 export GLYTOUCAN_CONTRIBUTOR_ID=your_contributor_id
 export GLYTOUCAN_API_KEY=your_api_key
 export GLYCOSHAPE_RDF_DIR=/path/to/glycoshape/rdf
+export POCKETBASE_URL=http://localhost:8090
+export POCKETBASE_TOKEN=your_pocketbase_token
 ```
 
 Ensure the required directories and files exist, or modify the paths as needed.
+
+When `POCKETBASE_URL` and either `POCKETBASE_TOKEN` or `POCKETBASE_ADMIN_TOKEN` are set, the pipeline uses PocketBase `glycan_submission` records as the submission metadata source for `glystatic` and related metadata helpers. The CSV inventory remains the fallback when PocketBase is unset, unavailable, or missing a record.
 
 ## Running 🚀
 

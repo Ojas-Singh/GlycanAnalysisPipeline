@@ -20,6 +20,7 @@ Usage: run this script directly. Example:
 
 from pathlib import Path
 import argparse
+import io
 import os
 import sys
 import logging
@@ -72,20 +73,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 
+def _path_exists(path: str) -> bool:
+    """Return True when a path exists locally or via the active storage backend."""
+    if os.path.exists(path):
+        return True
+    storage = get_storage_manager()
+    return storage.exists(path)
+
+
 def _read_parquet_robust(path: str):
     """Try pyarrow first (avoids glob issues), then fall back to Polars."""
-    if not os.path.exists(path):
+    storage = get_storage_manager()
+    if os.path.exists(path):
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+            table = pq.read_table(path)
+            return pl.from_arrow(table)
+        except Exception:
+            try:
+                import glob
+                return pl.read_parquet(glob.escape(path))
+            except Exception:
+                return pl.read_parquet(path)
+    if not storage.exists(path):
         raise FileNotFoundError(path)
+    raw = storage.read_binary(path)
     try:
         import pyarrow.parquet as pq  # type: ignore
-        table = pq.read_table(path)
+        table = pq.read_table(io.BytesIO(raw))
         return pl.from_arrow(table)
     except Exception:
-        try:
-            import glob
-            return pl.read_parquet(glob.escape(path))
-        except Exception:
-            return pl.read_parquet(path)
+        return pl.read_parquet(io.BytesIO(raw))
 
 
 def _update_pca_json(embedding_dir: str, updates: Dict) -> None:
@@ -325,7 +343,7 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
     """Compute conformation landscape and PCA, save parquet. Returns pca file path."""
     os.makedirs(embedding_dir, exist_ok=True)
     pca_path = os.path.join(embedding_dir, "pca_conformation_landscape.parquet")
-    if os.path.exists(pca_path) and not force:
+    if _path_exists(pca_path) and not force:
         logger.info("PCA step: pca file exists; skipping (use --update to force)")
         return pca_path
 
@@ -422,7 +440,7 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
     logger.info(f"Entropy (nats): {H}")
 
     cluster_out_json = os.path.join(embedding_dir, "clustering_results.json")
-    if os.path.exists(cluster_out_json) and not force:
+    if _path_exists(cluster_out_json) and not force:
         try:
             cr_existing = load_clustering_results_parquet(embedding_dir)
             existing_levels = set(cr_existing.levels())
@@ -689,7 +707,7 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
     """
     stats_path = os.path.join(embedding_dir, "torsion_stats.json")
     # If file exists but appears incomplete (empty torsions/levels), recompute
-    if os.path.exists(stats_path) and not force:
+    if _path_exists(stats_path) and not force:
         try:
             storage = get_storage_manager()
             with storage.open(stats_path, 'r') as f:
@@ -716,7 +734,7 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
             # Fall through to recompute
             pass
     torsion_csv = os.path.join(embedding_dir, "torsions.csv")
-    if not os.path.exists(torsion_csv):
+    if not _path_exists(torsion_csv):
         logger.warning("torsions.csv not found; skipping cluster torsion stats")
         # Create an empty file to mark step as complete
         storage = get_storage_manager()
@@ -749,7 +767,7 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
     pca_df = None
     try:
         pca_path = os.path.join(embedding_dir, "pca_conformation_landscape.parquet")
-        if os.path.exists(pca_path):
+        if _path_exists(pca_path):
             pca_df = _read_parquet_robust(pca_path)
         else:
             logger.debug(f"PCA parquet not found at {pca_path}; per-cluster entropies will be skipped")
@@ -875,7 +893,7 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
     try:
         meta_path = os.path.join(embedding_dir, 'metadata.json')
         meta = {}
-        if os.path.exists(meta_path):
+        if _path_exists(meta_path):
             try:
                 storage = get_storage_manager()
                 with storage.open(meta_path, 'r') as mf:
@@ -895,7 +913,7 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
     """Create info.json by consolidating data from pca.json and torsion_stats.json."""
     info_path = os.path.join(embedding_dir, "info.json")
     storage = get_storage_manager()
-    if os.path.exists(info_path) and not force:
+    if _path_exists(info_path) and not force:
         try:
             with storage.open(info_path, 'r') as existing_f:
                 existing = json.load(existing_f)
@@ -915,7 +933,7 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
     # Load pca.json data
     pca_json_data = {}
     pca_json_path = os.path.join(embedding_dir, 'pca.json')
-    if os.path.exists(pca_json_path):
+    if _path_exists(pca_json_path):
         try:
             with storage.open(pca_json_path, 'r') as pf:
                 pca_json_data = json.load(pf)
@@ -926,7 +944,7 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
     # Load torsion_stats.json data
     torsion_stats_data = {}
     torsion_stats_path = os.path.join(embedding_dir, 'torsion_stats.json')
-    if os.path.exists(torsion_stats_path):
+    if _path_exists(torsion_stats_path):
         try:
             with storage.open(torsion_stats_path, 'r') as tsf:
                 torsion_stats_data = json.load(tsf)
@@ -1138,7 +1156,7 @@ def step_plot_torsion_distributions(
     """
     # Check for required files
     torsion_csv_path = os.path.join(embedding_dir, "torsions.csv")
-    if not os.path.exists(torsion_csv_path):
+    if not _path_exists(torsion_csv_path):
         logger.warning("torsions.csv not found; skipping distribution plots")
         return
     
@@ -1155,14 +1173,14 @@ def step_plot_torsion_distributions(
     
     for level in cr.levels():
         level_dir = os.path.join(out_dir, f"level_{level}")
-        if not os.path.exists(level_dir):
+        if not _path_exists(level_dir):
             logger.warning(f"Level directory {level_dir} does not exist; skipping distribution plot")
             continue
         
         dist_plot_path = os.path.join(level_dir, "dist.svg")
         
         # Check if plot already exists and force is not set
-        if os.path.exists(dist_plot_path) and not force:
+        if _path_exists(dist_plot_path) and not force:
             logger.info(f"Distribution plot exists for level {level}; skipping (use --update to force)")
             plots_skipped += 1
             continue
@@ -1228,8 +1246,8 @@ def step_export_analysis_data(
         logger.warning(f"Could not load clustering results for export: {exc}")
 
     # 1. Export PCA data with first 3 components and level_1 cluster assignments.
-    if os.path.exists(pca_source_path):
-        if os.path.exists(pca_out_path) and not force:
+    if _path_exists(pca_source_path):
+        if _has_required_csv_headers(pca_out_path, {"frame", "PC1", "PC2", "PC3", "cluster"}) and not force:
             logger.info("pca.csv exists; skipping (use --update to force)")
             files_skipped += 1
         else:
@@ -1261,7 +1279,7 @@ def step_export_analysis_data(
         logger.warning(f"PCA source file not found: {pca_source_path}")
 
     # 2. Export torsion tables.
-    if os.path.exists(torsion_source_path):
+    if _path_exists(torsion_source_path):
         try:
             info_data = _load_json_if_exists(info_source_path, {})
             torsions_block = info_data.get("torsions", {}) if isinstance(info_data, dict) else {}
@@ -1321,29 +1339,45 @@ def step_export_analysis_data(
                 ]
                 glycosidic_names: List[str] = [export_names[idx] for idx in glycosidic_indices]
 
-                should_write_all = force or not os.path.exists(torsion_all_out_path)
-                should_write_gly = force or not os.path.exists(torsion_glycosidic_out_path)
+                should_write_all = force or not _path_exists(torsion_all_out_path)
+                should_write_gly = force or not _path_exists(torsion_glycosidic_out_path)
 
                 all_writer = None
                 gly_writer = None
                 all_file = None
                 gly_file = None
                 try:
-                    if should_write_all:
+                    if should_write_all or not _has_required_csv_headers(
+                        torsion_all_out_path,
+                        {
+                            "frame",
+                            "level_1_cluster",
+                            "level_1_center",
+                            "level_2_cluster",
+                            "level_2_center",
+                            "level_3_cluster",
+                            "level_3_center",
+                        },
+                    ):
                         all_file = storage.open(torsion_all_out_path, "w")
                         all_writer = csv.writer(all_file)
                         all_header = ["frame", *export_names]
                         for level in levels_to_export:
                             all_header.extend([f"level_{level}_cluster", f"level_{level}_center"])
                         all_writer.writerow(all_header)
+                        should_write_all = True
                     else:
                         logger.info("torsion_all.csv exists; skipping (use --update to force)")
                         files_skipped += 1
 
-                    if should_write_gly:
+                    if should_write_gly or not _has_required_csv_headers(
+                        torsion_glycosidic_out_path,
+                        {"frame", "cluster", "center"},
+                    ):
                         gly_file = storage.open(torsion_glycosidic_out_path, "w")
                         gly_writer = csv.writer(gly_file)
                         gly_writer.writerow(["frame", *glycosidic_names, "cluster", "center"])
+                        should_write_gly = True
                     else:
                         logger.info("torsion_glycosidic.csv exists; skipping (use --update to force)")
                         files_skipped += 1
@@ -1392,7 +1426,7 @@ def step_export_analysis_data(
                     rep_rows = reps_rows_by_level.get(level, [])
                     if not rep_rows:
                         continue
-                    if os.path.exists(reps_out_path) and not force:
+                    if _has_required_csv_headers(reps_out_path, {"frame", "cluster_id", "cluster_size_pct"}) and not force:
                         logger.info(f"torsion_level_{level}_reps.csv exists; skipping (use --update to force)")
                         files_skipped += 1
                         continue
@@ -1424,13 +1458,13 @@ def step_export_analysis_data(
         logger.warning(f"Torsions source file not found: {torsion_source_path}")
 
     # 3. Copy torparts.npz
-    if os.path.exists(torparts_source_path):
-        if os.path.exists(torparts_out_path) and not force:
+    if _path_exists(torparts_source_path):
+        if _path_exists(torparts_out_path) and not force:
             logger.info("torparts.npz exists; skipping (use --update to force)")
             files_skipped += 1
         else:
             try:
-                shutil.copy2(torparts_source_path, torparts_out_path)
+                storage.write_binary(torparts_out_path, storage.read_binary(torparts_source_path))
                 logger.info(f"Copied torparts.npz to {torparts_out_path}")
                 files_created += 1
             except Exception as exc:
@@ -1439,13 +1473,13 @@ def step_export_analysis_data(
         logger.warning(f"torparts.npz source file not found: {torparts_source_path}")
 
     # 4. Copy info.json
-    if os.path.exists(info_source_path):
-        if os.path.exists(info_out_path) and not force:
+    if _path_exists(info_source_path):
+        if _has_current_output_info_json(info_out_path) and not force:
             logger.info("info.json exists; skipping (use --update to force)")
             files_skipped += 1
         else:
             try:
-                shutil.copy2(info_source_path, info_out_path)
+                storage.write_binary(info_out_path, storage.read_binary(info_source_path))
                 logger.info(f"Copied info.json to {info_out_path}")
                 files_created += 1
             except Exception as exc:
@@ -1454,6 +1488,151 @@ def step_export_analysis_data(
         logger.warning(f"info.json source file not found: {info_source_path}")
 
     logger.info(f"Data export: {files_created} files created, {files_skipped} files skipped")
+
+
+REQUIRED_CLUSTER_LEVELS = (1, 2, 3)
+
+
+def _read_csv_header(path: str) -> List[str]:
+    import csv
+
+    if not _path_exists(path):
+        return []
+    storage = get_storage_manager()
+    try:
+        with storage.open(path, "r") as fh:
+            reader = csv.reader(fh)
+            return [str(value) for value in next(reader, [])]
+    except Exception:
+        return []
+
+
+def _has_required_csv_headers(path: str, required_headers: set[str]) -> bool:
+    header = set(_read_csv_header(path))
+    return bool(header) and required_headers.issubset(header)
+
+
+def _has_complete_clustering_outputs(embedding_dir: str) -> bool:
+    storage = get_storage_manager()
+    metadata_path = os.path.join(embedding_dir, "metadata.json")
+    summary_path = os.path.join(embedding_dir, "cluster_summary.parquet")
+    members_path = os.path.join(embedding_dir, "cluster_members.parquet")
+
+    if not storage.exists(metadata_path) or not storage.exists(summary_path) or not storage.exists(members_path):
+        return False
+
+    metadata = _load_json_if_exists(metadata_path, {})
+    levels = set()
+    for level in metadata.get("levels", []) if isinstance(metadata, dict) else []:
+        try:
+            levels.add(int(level))
+        except Exception:
+            continue
+
+    return set(REQUIRED_CLUSTER_LEVELS).issubset(levels)
+
+
+def _has_complete_torsion_stats(embedding_dir: str) -> bool:
+    stats_path = os.path.join(embedding_dir, "torsion_stats.json")
+    stats = _load_json_if_exists(stats_path, {})
+    torsions_block = stats.get("torsions", {}) if isinstance(stats, dict) else {}
+    level_keys = {
+        int(level.get("level"))
+        for level in stats.get("levels", [])
+        if isinstance(level, dict) and level.get("level") is not None
+    } if isinstance(stats, dict) else set()
+
+    return bool(
+        torsions_block.get("labels")
+        and torsions_block.get("metadata")
+        and torsions_block.get("family_summary")
+        and set(REQUIRED_CLUSTER_LEVELS).issubset(level_keys)
+    )
+
+
+def _has_current_info_json(embedding_dir: str) -> bool:
+    info_path = os.path.join(embedding_dir, "info.json")
+    return _has_current_output_info_json(info_path)
+
+
+def _has_current_output_info_json(info_path: str) -> bool:
+    info = _load_json_if_exists(info_path, {})
+    levels = {
+        int(level.get("level"))
+        for level in info.get("levels", [])
+        if isinstance(level, dict) and level.get("level") is not None
+    } if isinstance(info, dict) else set()
+    torsions_block = info.get("torsions", {}) if isinstance(info, dict) else {}
+
+    return bool(
+        int(info.get("schema_version", 0)) >= 3
+        and set(REQUIRED_CLUSTER_LEVELS).issubset(levels)
+        and torsions_block.get("metadata")
+    )
+
+
+def _has_complete_structure_outputs(out_dir: str) -> bool:
+    for level in REQUIRED_CLUSTER_LEVELS:
+        for file_name in ("alpha.pdb", "beta.pdb"):
+            if not _path_exists(os.path.join(out_dir, f"level_{level}", file_name)):
+                return False
+    return True
+
+
+def _has_complete_plot_outputs(out_dir: str) -> bool:
+    for level in REQUIRED_CLUSTER_LEVELS:
+        if not _path_exists(os.path.join(out_dir, f"level_{level}", "dist.svg")):
+            return False
+    return True
+
+
+def _has_complete_export_outputs(embedding_dir: str, out_dir: str) -> bool:
+    storage = get_storage_manager()
+
+    pca_out_path = os.path.join(out_dir, "pca.csv")
+    if not _has_required_csv_headers(pca_out_path, {"frame", "PC1", "PC2", "PC3", "cluster"}):
+        return False
+
+    info_out_path = os.path.join(out_dir, "info.json")
+    if not _has_current_output_info_json(info_out_path):
+        return False
+
+    torsion_source_path = os.path.join(embedding_dir, "torsions.csv")
+    if not storage.exists(torsion_source_path):
+        return True
+
+    torsion_all_out_path = os.path.join(out_dir, "torsion_all.csv")
+    torsion_glycosidic_out_path = os.path.join(out_dir, "torsion_glycosidic.csv")
+    torparts_out_path = os.path.join(out_dir, "torparts.npz")
+
+    required_paths = [
+        torsion_all_out_path,
+        torsion_glycosidic_out_path,
+        torparts_out_path,
+    ]
+    required_paths.extend(os.path.join(out_dir, f"torsion_level_{level}_reps.csv") for level in REQUIRED_CLUSTER_LEVELS)
+
+    if not all(_path_exists(path) for path in required_paths):
+        return False
+
+    if not _has_required_csv_headers(
+        torsion_all_out_path,
+        {
+            "frame",
+            "level_1_cluster",
+            "level_1_center",
+            "level_2_cluster",
+            "level_2_center",
+            "level_3_cluster",
+            "level_3_center",
+        },
+    ):
+        return False
+
+    if not _has_required_csv_headers(torsion_glycosidic_out_path, {"frame", "cluster", "center"}):
+        return False
+
+    return True
 
 
 class GlycanAnalysisPipeline:
@@ -1744,14 +1923,20 @@ class GlycanAnalysisPipeline:
         steps_to_check = {
             'store': os.path.join(paths['frame_data_dir'], 'atoms.parquet'),
             'pca': os.path.join(paths['embedding_dir'], 'pca_conformation_landscape.parquet'),
-            'clustering': os.path.join(paths['embedding_dir'], 'clustering_results.json'),
-            'torsions': os.path.join(paths['embedding_dir'], 'torsions.csv'),
-            'cluster_stats': os.path.join(paths['embedding_dir'], 'info.json'),
-            'structures': paths['out_dir'],
-            'export': os.path.join(paths['out_dir'], 'pca.csv')
         }
         for step, check_path in steps_to_check.items():
             status['steps_status'][step] = storage.exists(check_path)
+
+        status['steps_status']['torsions'] = (
+            storage.exists(os.path.join(paths['embedding_dir'], 'torsions.csv'))
+            and storage.exists(os.path.join(paths['embedding_dir'], 'torparts.npz'))
+        )
+        status['steps_status']['clustering'] = _has_complete_clustering_outputs(paths['embedding_dir'])
+        status['steps_status']['cluster_stats'] = _has_complete_torsion_stats(paths['embedding_dir'])
+        status['steps_status']['create_info'] = _has_current_info_json(paths['embedding_dir'])
+        status['steps_status']['structures'] = _has_complete_structure_outputs(paths['out_dir'])
+        status['steps_status']['plots'] = _has_complete_plot_outputs(paths['out_dir'])
+        status['steps_status']['export'] = _has_complete_export_outputs(paths['embedding_dir'], paths['out_dir'])
             
         return status
 
