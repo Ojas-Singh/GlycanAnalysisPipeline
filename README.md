@@ -70,6 +70,29 @@ Run using install.sh as it will save log in last_run.log
 ./install.sh --run
 ```
 
+## Boot Autostart
+
+To run the pipeline automatically on system boot with `systemd`:
+
+```bash
+chmod +x /home/opc/GlycanAnalysisPipeline/boot-run.sh
+sudo install -D -m 0644 /home/opc/GlycanAnalysisPipeline/systemd/glycan-analysis-pipeline.service /etc/systemd/system/glycan-analysis-pipeline.service
+sudo systemctl daemon-reload
+sudo systemctl enable glycan-analysis-pipeline.service
+```
+
+The service runs `./install.sh --run` as the `opc` user after networking is available.
+
+If `POWEROFF=true` is set in `.env`, the instance will power off after a successful pipeline run.
+
+To disable boot autostart later:
+
+```bash
+sudo systemctl disable glycan-analysis-pipeline.service
+sudo rm -f /etc/systemd/system/glycan-analysis-pipeline.service
+sudo systemctl daemon-reload
+```
+
 ## SPARQL Endpoint 🕸️
 
 ```bash
@@ -102,4 +125,3 @@ All data are freely available for academic use under the Creative Commons Attrib
 Callum M. Ives, Ojas Singh, Silvia D’Andrea, Carl A. Fogarty, Aoife M. Harbison, Akash Satheesan, Beatrice Tropea & Elisa Fadda. Restoring Protein Glycosylation with GlycoShape. Nature Methods (2024). https://doi.org/10.1038/s41592-024-02464-7
 
 Preferred short citation: Ives CM, Singh O, et al., Nat Methods (2024).
-

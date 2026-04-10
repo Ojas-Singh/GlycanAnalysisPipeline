@@ -311,6 +311,42 @@ load_dotenv() {
 # Load .env file if present
 load_dotenv
 
+request_instance_poweroff() {
+    echo "POWEROFF=true detected. Requesting instance shutdown..."
+
+    run_power_command() {
+        if command -v sudo >/dev/null 2>&1 && [[ "$EUID" -ne 0 ]]; then
+            sudo "$@"
+        else
+            "$@"
+        fi
+    }
+
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "Using systemctl poweroff..."
+        run_power_command systemctl poweroff
+        return 0
+    fi
+
+    if command -v shutdown >/dev/null 2>&1; then
+        echo "Using shutdown -h now..."
+        run_power_command shutdown -h now
+        return 0
+    fi
+
+    if command -v oci >/dev/null 2>&1; then
+        echo "Falling back to OCI SOFTSTOP..."
+        oci compute instance action \
+          --instance-id "$(curl -fsS -H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id)" \
+          --action SOFTSTOP \
+          --auth instance_principal
+        return 0
+    fi
+
+    echo "No supported poweroff method found."
+    return 1
+}
+
 # Check if environment variables are set
 echo "Checking environment variables..."
 
@@ -378,14 +414,8 @@ if python main.py; then
     
     # Check for POWEROFF environment variable
     if [[ "${POWEROFF,,}" == "true" ]]; then
-        echo "POWEROFF=true detected. Shutting down the instance via OCI..."
-        if command -v oci &> /dev/null; then
-            oci compute instance action \
-              --instance-id "$(curl -s -H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id)" \
-              --action SOFTSTOP \
-              --auth instance_principal
-        else
-            echo "oci command not found. Cannot shut down instance automatically."
+        if ! request_instance_poweroff; then
+            echo "Automatic shutdown failed."
         fi
     fi
 else

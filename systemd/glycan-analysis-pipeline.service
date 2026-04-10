@@ -1,0 +1,17 @@
+[Unit]
+Description=Run GlycanAnalysisPipeline at boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/opc/GlycanAnalysisPipeline
+Environment=HOME=/home/opc
+Environment=PATH=/home/opc/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/opc/GlycanAnalysisPipeline/boot-run.sh
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

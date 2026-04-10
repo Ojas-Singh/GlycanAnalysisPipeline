@@ -265,6 +265,46 @@ class GlycanPipelineRunner:
 
         return None
 
+    def _sync_remote_static_output_to_local(self, remote_dir: str, glycan_name: str) -> Optional[str]:
+        """Mirror a validated Oracle static GS directory into the local output directory."""
+        if not config.use_oracle_storage:
+            return remote_dir
+
+        remote_key = self._normalize_storage_key(remote_dir)
+        remote_base = f"{self._remote_output_base()}/"
+        if not remote_key.startswith(remote_base):
+            return remote_dir
+
+        gs_name = Path(remote_key).name
+        local_dir = Path(str(self.output_dir)) / gs_name
+
+        try:
+            objects = self.storage.backend.list_files(remote_key, "*")
+        except Exception as exc:
+            logger.warning(f"Failed to list remote static output for {glycan_name} in {remote_key}: {exc}")
+            return remote_dir
+
+        if not objects:
+            return remote_dir
+
+        local_dir.mkdir(parents=True, exist_ok=True)
+        prefix = f"{remote_key}/"
+
+        for obj in objects:
+            obj_key = self._normalize_storage_key(obj)
+            if not obj_key.startswith(prefix):
+                continue
+            rel_path = obj_key[len(prefix):]
+            if not rel_path:
+                continue
+            target_path = local_dir / rel_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            content = self.storage.backend.read_binary(obj_key)
+            target_path.write_bytes(content)
+
+        logger.info(f"Synchronized Oracle static output for {glycan_name}: {remote_key} -> {local_dir}")
+        return str(local_dir)
+
     def _get_required_v2_steps(self) -> List[str]:
         """Return the set of v2 steps required for a complete run."""
         steps = ["store", "pca", "clustering", "create_info", "structures", "export"]
@@ -875,6 +915,16 @@ class GlycanPipelineRunner:
                 for err in validation_errors:
                     logger.warning(f"  - {err}")
                 return False
+
+            if config.use_oracle_storage:
+                local_synced_dir = self._sync_remote_static_output_to_local(matching_key, glycan_name)
+                local_validation_errors = self._validate_glystatic_output_dir(local_synced_dir, glycan_name=glycan_name)
+                if local_validation_errors:
+                    logger.warning(f"Local static output validation failed for {glycan_name} in {local_synced_dir}. Issues:")
+                    for err in local_validation_errors:
+                        logger.warning(f"  - {err}")
+                    return False
+                self._cache_static_output_dir(glycan_name, local_synced_dir)
 
             logger.debug(f"Glystatic completion validated in {matching_key} for {glycan_name}")
             return True

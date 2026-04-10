@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 from typing import Union, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Base path where the script is located
 base_dir = Path(__file__).resolve().parent.parent
@@ -64,11 +67,38 @@ oracle_par_url = os.environ.get("GLYCOSHAPE_ORACLE_PAR_URL")
 use_oracle_storage = oracle_par_url is not None and oracle_par_url.strip() != ""
 
 if use_oracle_storage:
+    def _resolve_oracle_local_output_dir() -> str:
+        requested_output_dir = os.environ.get("GLYCOSHAPE_OUTPUT_DIR", "static").strip()
+        if not requested_output_dir:
+            return "static"
+
+        candidate = Path(requested_output_dir)
+        if not candidate.is_absolute():
+            return requested_output_dir
+
+        probe_parent = candidate if candidate.exists() else candidate.parent
+        try:
+            probe_parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        if os.access(probe_parent, os.W_OK):
+            return str(candidate)
+
+        fallback = base_dir / "static"
+        logger.warning(
+            "Oracle storage is enabled but GLYCOSHAPE_OUTPUT_DIR=%s is not writable; "
+            "falling back to local staging at %s",
+            requested_output_dir,
+            fallback,
+        )
+        return str(fallback)
+
     # Oracle Cloud Object Storage mode
     # Paths in Oracle mode are subfolders within the bucket
     data_dir = os.environ.get("GLYCOSHAPE_DATA_DIR", "data")
     process_dir = os.environ.get("GLYCOSHAPE_PROCESS_DIR", "process") 
-    output_dir = os.environ.get("GLYCOSHAPE_OUTPUT_DIR", "static")
+    output_dir = _resolve_oracle_local_output_dir()
     rdf_path = os.environ.get("GLYCOSHAPE_RDF_DIR", "rdf")
     inventory_path = os.environ.get("GLYCOSHAPE_INVENTORY_PATH", "GlycoShape_Inventory.csv")
 else:
