@@ -1229,9 +1229,7 @@ def emit_multimodel_pdbs(
                         per_meta: list[tuple[str | None, float | None]] = []
                         for c in level.get("clusters", []) or []:
                             rep = c.get("representative_idx")
-                            which = c.get("pdb_files", {}) if isinstance(c.get("pdb_files"), dict) else {}
-                            has = which.get(anomer)
-                            if rep is not None and has:
+                            if rep is not None:
                                 try:
                                     frames.append(int(rep))
                                     cid = str(c.get("cluster_id")) if c.get("cluster_id") is not None else None

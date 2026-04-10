@@ -172,8 +172,7 @@ def load_info_json(folder_path) -> dict:
 
 
 def extract_cluster_data(info_data: dict, folder_path: str) -> dict:
-    """Extract cluster data from info.json and organize by levels."""
-    storage = get_storage_manager()
+    """Extract cluster data directly from info.json without probing remote per-cluster files."""
     cluster_data = {
         "entropy_nats": info_data.get("entropy_nats"),
         "torsions": info_data.get("torsions", {}),
@@ -195,28 +194,6 @@ def extract_cluster_data(info_data: dict, folder_path: str) -> dict:
                 "members_count": cluster["members_count"],
                 "torsion_stats": cluster.get("torsion_stats", {})
             }
-            
-            # Add PDB file paths for alpha and beta anomers
-            level_dir = f"{folder_path}/output/level_{level_num}"
-            alpha_dir = f"{level_dir}/alpha"
-            beta_dir = f"{level_dir}/beta"
-            
-            cluster_info["pdb_files"] = {
-                "alpha": None,
-                "beta": None
-            }
-            
-            # Find corresponding PDB files
-            if storage.exists(alpha_dir):
-                alpha_files = [p for p in storage.list_files(alpha_dir, f"cluster_{cluster['cluster_id']}_*.pdb")]
-                if alpha_files:
-                    cluster_info["pdb_files"]["alpha"] = str(alpha_files[0])
-                    
-            if storage.exists(beta_dir):
-                beta_files = [p for p in storage.list_files(beta_dir, f"cluster_{cluster['cluster_id']}_*.pdb")]
-                if beta_files:
-                    cluster_info["pdb_files"]["beta"] = str(beta_files[0])
-            
             clusters.append(cluster_info)
         
         cluster_data["levels"][f"level_{level_num}"] = {
@@ -337,7 +314,7 @@ def save_glycan_data(glycan_data: dict, output_dir, filename: str) -> None:
         raise
 
 
-def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -> None:
+def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -> dict:
     """
     Process a single glycan folder and generate static data.
     
@@ -505,7 +482,6 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         # Extract cluster-level summaries for static JSON.
         level_1_main_clusters = {}
         level_2_coverage_clusters = {}
-        level_3_clusters = {}
         cluster_levels = {}
         torsion_summary = {}
         
@@ -559,8 +535,6 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                     level_1_main_clusters = dict(cluster_pct_map)
                 elif level_key == "level_2":  # Coverage clustering
                     level_2_coverage_clusters = dict(cluster_pct_map)
-                elif level_key == "level_3":
-                    level_3_clusters = dict(cluster_pct_map)
         
         # Build glycan data structure
         glycan_data = {
@@ -591,7 +565,6 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 "entropy": cluster_data.get("entropy_nats"),
                 "clusters": level_1_main_clusters,
                 "coverage_clusters": level_2_coverage_clusters,
-                "level_3_clusters": level_3_clusters,
                 "cluster_levels": cluster_levels,
                 "torsion_summary": torsion_summary,
                 "silhouette_scores": silhouette_scores,
@@ -673,6 +646,11 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 storage.write_binary(f"{output_subdir}/{file_name}", content)
         
         logger.info(f"Successfully processed {glycam_name} -> {final_output_dir}")
+        return {
+            "glycoshape_id": ID,
+            "final_output_dir": str(final_output_dir),
+            "local_output_dir": str(final_output_dir),
+        }
         
     except Exception as e:
         logger.error(f"Failed to process glycan data for {glycam_name}: {e}")

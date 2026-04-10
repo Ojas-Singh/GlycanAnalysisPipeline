@@ -77,6 +77,12 @@ import json
 import time
 
 
+def _default_parallel_jobs() -> int:
+	"""Return a bounded default worker count for wall-clock oriented runs."""
+	cpu_total = os.cpu_count() or 1
+	return max(1, min(8, cpu_total - 1 if cpu_total > 1 else 1))
+
+
 def _path_exists(path: str) -> bool:
 	"""Return True when a path exists locally or via the active storage backend."""
 	if os.path.exists(path):
@@ -778,6 +784,9 @@ def create_cluster_info_fast(
     n_jobs: Optional[int] = None,  # Changed: None defaults to min(4, cpu_count())
     min_cluster_size_for_kde: int = 5,  # Raised default for more fallbacks on slow CPUs
     enable_profiling: bool = False,  # New: Optional timing for bottlenecks
+    *,
+    pca_data_scaled: Optional[np.ndarray] = None,
+    cluster_member_indices: Optional[dict[int, np.ndarray]] = None,
 ) -> list:
     """
     Fast version of create_cluster_info using parallel processing for cluster representative computation.
@@ -819,45 +828,52 @@ def create_cluster_info_fast(
 
     # Set n_jobs intelligently for low-core (AMD OCI)
     if n_jobs is None:
-        n_jobs = min(4, multiprocessing.cpu_count())
+        n_jobs = _default_parallel_jobs()
     logger.info(f"Using n_jobs={n_jobs} for parallel cluster processing (detected {multiprocessing.cpu_count()} cores)")
 
     reps = []
 
+    if cluster_member_indices is None:
+        cluster_member_indices = {
+            int(cluster_id): np.where(labels == cluster_id)[0]
+            for cluster_id in range(n_clusters)
+        }
+
     # Collect cluster sizes and sort by decreasing size (unchanged)
     cluster_sizes = []
     for cluster_id in range(n_clusters):
-        indices = np.where(labels == cluster_id)[0]
+        indices = cluster_member_indices.get(int(cluster_id), np.array([], dtype=int))
         cluster_sizes.append((cluster_id, len(indices)))
 
     cluster_sizes.sort(key=lambda x: x[1], reverse=True)
-    old_to_new_id = {old_id: new_id for new_id, (old_id, _) in enumerate(cluster_sizes)}
 
-    # Extract PCA component columns (unchanged)
-    pc_cols = [col for col in pca_df.columns if col.startswith('PC') and col[2:].isdigit()]
-    if not pc_cols:
-        logger.warning("No PC columns found; using simple fallback.")
-        # Fallback to original simple approach (unchanged)
-        for new_cluster_id, (old_cluster_id, _) in enumerate(cluster_sizes):
-            indices = np.where(labels == old_cluster_id)[0]
-            if len(indices) > 0:
-                cluster_size_pct = 100.0 * len(indices) / len(labels)
-                rep_idx = int(indices[0])  # Assume frame == index for speed
-                reps.append({
-                    'cluster_id': int(new_cluster_id),
-                    'representative_idx': rep_idx,
-                    'cluster_size_pct': float(cluster_size_pct),
-                    'n_points': len(indices),
-                    'n_clusters': int(n_clusters),
-                    'members': indices.tolist(),
-                    'has_kde_center': False
-                })
-        return reps
+    if pca_data_scaled is None:
+        # Extract PCA component columns (unchanged)
+        pc_cols = [col for col in pca_df.columns if col.startswith('PC') and col[2:].isdigit()]
+        if not pc_cols:
+            logger.warning("No PC columns found; using simple fallback.")
+            # Fallback to original simple approach (unchanged)
+            for new_cluster_id, (old_cluster_id, _) in enumerate(cluster_sizes):
+                indices = cluster_member_indices.get(int(old_cluster_id), np.array([], dtype=int))
+                if len(indices) > 0:
+                    cluster_size_pct = 100.0 * len(indices) / len(labels)
+                    rep_idx = int(indices[0])  # Assume frame == index for speed
+                    reps.append({
+                        'cluster_id': int(new_cluster_id),
+                        'representative_idx': rep_idx,
+                        'cluster_size_pct': float(cluster_size_pct),
+                        'n_points': len(indices),
+                        'n_clusters': int(n_clusters),
+                        'members': indices.tolist(),
+                        'has_kde_center': False
+                    })
+            return reps
 
-    # Extract and pre-standardize PCA data once (global scaling for consistency, unchanged)
-    pca_data = pca_df.select(pc_cols).to_numpy().astype(float)
-    scaler = StandardScaler()
-    pca_data_scaled = scaler.fit_transform(pca_data)
+        # Extract and pre-standardize PCA data once (global scaling for consistency, unchanged)
+        pca_data = pca_df.select(pc_cols).to_numpy().astype(float)
+        scaler = StandardScaler()
+        pca_data_scaled = scaler.fit_transform(pca_data)
+
     n_total = len(labels)
     logger.info(f"Pre-standardized PCA data: shape {pca_data_scaled.shape}")
 
@@ -867,7 +883,7 @@ def create_cluster_info_fast(
         Optimized: Lighter CV for small clusters, faster minimize.
         """
         new_cluster_id, (old_cluster_id, size) = args
-        indices = np.where(labels == old_cluster_id)[0]
+        indices = cluster_member_indices.get(int(old_cluster_id), np.array([], dtype=int))
         if len(indices) == 0:
             return None
 
@@ -959,13 +975,14 @@ def create_cluster_info_fast(
 
     # Parallel processing: Use backend='threading' if multiprocessing overhead is high on AMD OCI
     cluster_args = [(new_id, entry) for new_id, entry in enumerate(cluster_sizes)]
+    parallel_backend = 'threading' if os.name == 'nt' else 'loky'
     if n_jobs == 1:
         # Sequential for debugging
-        reps_list = [process_cluster((arg, enable_profiling), enable_profiling) for arg in cluster_args]
+        reps_list = [process_cluster(arg, enable_profiling) for arg in cluster_args]
     else:
         # Partial for profiling flag
         process_with_profile = partial(process_cluster, enable_profiling_local=enable_profiling)
-        reps_list = Parallel(n_jobs=n_jobs, backend='loky', verbose=0 if not enable_profiling else 1)(
+        reps_list = Parallel(n_jobs=n_jobs, backend=parallel_backend, prefer='threads' if parallel_backend == 'threading' else None, verbose=0 if not enable_profiling else 1)(
             delayed(process_with_profile)(arg) for arg in cluster_args
         )
 
@@ -1119,6 +1136,13 @@ class ClusteringResults:
 			self._level_to_nclusters = {int(r['level']): int(r['n_clusters']) for r in self.summary.select(['level','n_clusters']).unique().iter_rows(named=True)}
 		else:
 			self._level_to_nclusters = {}
+		self._representatives_cache: dict[int, pl.DataFrame] = {}
+		self._members_lookup: dict[tuple[int, int], list[int]] = {}
+		if self._members is not None and self._members.height > 0:
+			for row in self._members.iter_rows(named=True):
+				level = int(row.get('level', row.get('n_clusters', -1)))
+				cluster_id = int(row['cluster_id'])
+				self._members_lookup.setdefault((level, cluster_id), []).append(int(row['member_idx']))
 
 	def levels(self) -> list[int]:
 		"""Return sequential levels (1,2,3...)."""
@@ -1136,12 +1160,16 @@ class ClusteringResults:
 		not, it will fall back to interpreting the provided `level` as the actual
 		number of clusters (backwards compatibility).
 		"""
+		lvl = int(level)
+		if lvl in self._representatives_cache:
+			return self._representatives_cache[lvl]
 		logger.info(f"Getting representatives for level {level}")
 		if 'level' in self.summary.columns:
-			result = self.summary.filter(pl.col('level') == int(level))
+			result = self.summary.filter(pl.col('level') == lvl)
 		else:
 			# legacy behavior: filter by n_clusters
-			result = self.summary.filter(pl.col('n_clusters') == int(level))
+			result = self.summary.filter(pl.col('n_clusters') == lvl)
+		self._representatives_cache[lvl] = result
 		return result
 
 	def clusters(self, level: int) -> list[int]:
@@ -1203,6 +1231,9 @@ class ClusteringResults:
 	def members(self, level: int, cluster_id: int) -> list[int]:
 		if self._members is None:
 			raise ValueError('No membership data stored.')
+		key = (int(level), int(cluster_id))
+		if key in self._members_lookup:
+			return list(self._members_lookup[key])
 		return self.members_df(level).filter(pl.col('cluster_id') == cluster_id)['member_idx'].to_list()
 
 	def representative_indices(self, level: int) -> list[int]:

@@ -25,6 +25,7 @@ import os
 import sys
 import logging
 import shutil
+import time
 from typing import Dict, List, Tuple, Optional
 import polars as pl
 import numpy as np
@@ -42,6 +43,7 @@ from lib.embedding import (
     save_clustering_results_parquet,
     load_clustering_results_parquet,
     _read_csv_robust,
+    StandardScaler,
     gmm_optimize_silhouette,
     gmm_optimize_glycosidic_deviation,
     kcenter_coverage_clustering,
@@ -424,7 +426,19 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
     return pca_path
 
 
-def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) -> float:
+def _build_cluster_member_lookup(labels: np.ndarray, n_clusters: int) -> Dict[int, np.ndarray]:
+    return {
+        int(cluster_id): np.flatnonzero(labels == cluster_id)
+        for cluster_id in range(int(n_clusters))
+    }
+
+
+def _build_frame_row_lookup(df: pl.DataFrame, frame_col: str = "frame") -> tuple[np.ndarray, Dict[int, int]]:
+    frames = np.asarray(df[frame_col].to_list(), dtype=int)
+    return frames, {int(frame): idx for idx, frame in enumerate(frames.tolist())}
+
+
+def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, return_context: bool = False):
     """Run two-level clustering:
        - main: H_nats-guided target (1–8) with local silhouette refinement; save silhouettes to pca.json
        - coverage: linear H_nats -> [10..128] via k-center.
@@ -433,6 +447,20 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
     """
     pca_df = _read_parquet_robust(pca_path)
     selected_cols = [f"PC{i}" for i in range(1, 4)]
+    all_pc_cols = [col for col in pca_df.columns if col.startswith("PC") and col[2:].isdigit()]
+    pca_data_scaled = None
+    if all_pc_cols:
+        try:
+            pca_all = pca_df.select(all_pc_cols).to_numpy().astype(float)
+            if StandardScaler is not None:
+                pca_data_scaled = StandardScaler().fit_transform(pca_all)
+            else:
+                mean = pca_all.mean(axis=0, keepdims=True)
+                std = pca_all.std(axis=0, keepdims=True)
+                std[std == 0] = 1.0
+                pca_data_scaled = (pca_all - mean) / std
+        except Exception as exc:
+            logger.warning(f"Could not pre-standardize PCA data for representatives: {exc}")
 
     logger.info("Estimating conformational entropy (kNN)")
     H = float(knn_conformational_entropy(pca_df, k=5, n_components=3))
@@ -458,6 +486,8 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
                     },
                 },
             )
+            if return_context:
+                return H, {"cr": cr_existing, "pca_df": pca_df}
             return H
 
         logger.info("Clustering step: existing outputs missing level_3; recomputing")
@@ -515,11 +545,33 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
         min_coverage_improvement=0.01,
     )
 
+    main_member_lookup = _build_cluster_member_lookup(labels_main, 1 if n_main == 1 else n_main)
+    cov_member_lookup = _build_cluster_member_lookup(labels_cov, n_clusters_cov)
+    level3_member_lookup = _build_cluster_member_lookup(labels_level_3, n_clusters_level_3)
+
     # Format results and save
     all_levels = {
-        1: create_cluster_info_fast(labels_main, pca_df, 1 if n_main == 1 else n_main),
-        2: create_cluster_info_fast(labels_cov, pca_df, n_clusters_cov),
-        3: create_cluster_info_fast(labels_level_3, pca_df, n_clusters_level_3),
+        1: create_cluster_info_fast(
+            labels_main,
+            pca_df,
+            1 if n_main == 1 else n_main,
+            pca_data_scaled=pca_data_scaled,
+            cluster_member_indices=main_member_lookup,
+        ),
+        2: create_cluster_info_fast(
+            labels_cov,
+            pca_df,
+            n_clusters_cov,
+            pca_data_scaled=pca_data_scaled,
+            cluster_member_indices=cov_member_lookup,
+        ),
+        3: create_cluster_info_fast(
+            labels_level_3,
+            pca_df,
+            n_clusters_level_3,
+            pca_data_scaled=pca_data_scaled,
+            cluster_member_indices=level3_member_lookup,
+        ),
     }
 
     save_clustering_results(all_levels, output_path=cluster_out_json)
@@ -570,6 +622,8 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False) 
     # Quick read-back and simple diagnostics
     cr = load_clustering_results_parquet(embedding_dir)
     logger.info(f"Cluster reader levels: {cr.levels()}")
+    if return_context:
+        return H, {"cr": cr, "pca_df": pca_df}
     return H
 
 
@@ -699,7 +753,15 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     return torsion_list, labels
 
 
-def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: bool = False) -> None:
+def step_cluster_torsion_stats(
+    frame_data_dir: str,
+    embedding_dir: str,
+    force: bool = False,
+    *,
+    cr=None,
+    tors_df: Optional[pl.DataFrame] = None,
+    pca_df: Optional[pl.DataFrame] = None,
+) -> None:
     """Compute torsion stats per cluster and write torsion_stats.json in embedding_dir.
 
     Expects torsions.csv (skip silently if missing) and clustering parquet outputs.
@@ -743,7 +805,8 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
         return
     
     # Load torsions table and extract column names
-    tors_df = _read_csv_robust(torsion_csv)
+    if tors_df is None:
+        tors_df = _read_csv_robust(torsion_csv)
     if 'frame' not in tors_df.columns:
         logger.warning("torsions.csv missing 'frame' column; aborting stats step")
         return
@@ -754,28 +817,32 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
     torsion_metadata = _load_or_build_torsion_metadata(frame_data_dir, embedding_dir, torsion_labels)
     torsion_summary = _level_summary_from_metadata(torsion_metadata)
     # Load clustering results
-    try:
-        cr = load_clustering_results_parquet(embedding_dir)
-    except Exception as exc:
-        logger.warning(f"Could not load clustering results: {exc}; skipping stats")
-        return
+    if cr is None:
+        try:
+            cr = load_clustering_results_parquet(embedding_dir)
+        except Exception as exc:
+            logger.warning(f"Could not load clustering results: {exc}; skipping stats")
+            return
     levels_summary = []
     angle_cols = [c for c in tors_df.columns if c != 'frame']
-    frame_to_row = {int(f): i for i, f in enumerate(tors_df['frame'].to_list())}
+    torsion_matrix = tors_df.select(angle_cols).to_numpy().astype(float) if angle_cols else np.empty((tors_df.height, 0), dtype=float)
+    _, frame_to_row = _build_frame_row_lookup(tors_df)
 
     # Try to load PCA dataframe for entropy calculations
-    pca_df = None
-    try:
-        pca_path = os.path.join(embedding_dir, "pca_conformation_landscape.parquet")
-        if _path_exists(pca_path):
-            pca_df = _read_parquet_robust(pca_path)
-        else:
-            logger.debug(f"PCA parquet not found at {pca_path}; per-cluster entropies will be skipped")
-    except Exception as exc:
-        logger.debug(f"Failed to read PCA parquet for entropy calc: {exc}")
+    if pca_df is None:
+        try:
+            pca_path = os.path.join(embedding_dir, "pca_conformation_landscape.parquet")
+            if _path_exists(pca_path):
+                pca_df = _read_parquet_robust(pca_path)
+            else:
+                logger.debug(f"PCA parquet not found at {pca_path}; per-cluster entropies will be skipped")
+        except Exception as exc:
+            logger.debug(f"Failed to read PCA parquet for entropy calc: {exc}")
 
     # Choose PCA component columns consistently with global entropy calc (first 3 PCs)
     entropy_pc_cols: List[str] = []
+    pca_entropy_matrix: Optional[np.ndarray] = None
+    pca_frame_to_row: Dict[int, int] = {}
     if pca_df is not None:
         preferred = ["PC1", "PC2", "PC3"]
         entropy_pc_cols = [c for c in preferred if c in pca_df.columns]
@@ -793,6 +860,14 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
                 entropy_pc_cols = [c for _, c in pc_nums[:3]]
             except Exception:
                 entropy_pc_cols = []
+        if entropy_pc_cols and "frame" in pca_df.columns:
+            try:
+                pca_entropy_matrix = pca_df.select(entropy_pc_cols).to_numpy().astype(float)
+                _, pca_frame_to_row = _build_frame_row_lookup(pca_df)
+            except Exception as exc:
+                logger.debug(f"Failed to prepare PCA matrix for entropy calc: {exc}")
+                pca_entropy_matrix = None
+                pca_frame_to_row = {}
 
     level_entropy_map = {}
     for level in cr.levels():
@@ -811,18 +886,22 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
                 pass
             cluster_stats = {}
             if members:
-                member_rows = tors_df.filter(pl.col('frame').is_in(members))
-                for col in angle_cols:
-                    vals = member_rows[col].to_numpy().astype(float)
-                    cluster_stats[col] = circular_stats(vals)
+                member_row_indices = [frame_to_row[m] for m in members if m in frame_to_row]
+                if member_row_indices:
+                    member_angles = torsion_matrix[np.asarray(member_row_indices, dtype=int)]
+                    for col_idx, col in enumerate(angle_cols):
+                        cluster_stats[col] = circular_stats(member_angles[:, col_idx].astype(float, copy=False))
 
             # Compute per-cluster conformational entropy (nats) using PCA rows for member frames
             cluster_entropy = None
-            if pca_df is not None and members and entropy_pc_cols:
+            if pca_entropy_matrix is not None and members and entropy_pc_cols:
                 try:
-                    # Select PCA rows where 'frame' in members
-                    cluster_pca = pca_df.filter(pl.col('frame').is_in(members))
-                    if cluster_pca.height > 1:
+                    cluster_pca_indices = [pca_frame_to_row[m] for m in members if m in pca_frame_to_row]
+                    if len(cluster_pca_indices) > 1:
+                        cluster_pca_np = pca_entropy_matrix[np.asarray(cluster_pca_indices, dtype=int)]
+                        cluster_pca = pl.DataFrame(
+                            {col: cluster_pca_np[:, idx] for idx, col in enumerate(entropy_pc_cols)}
+                        )
                         # Use same target k as global (5), clipped to N-1
                         k_eff = min(5, max(1, cluster_pca.height - 1))
                         h_val = knn_conformational_entropy(
@@ -839,15 +918,12 @@ def step_cluster_torsion_stats(frame_data_dir: str, embedding_dir: str, force: b
                     logger.debug(f"Could not compute entropy for level {level} cluster {cid}: {exc}")
 
             # Representative torsions
-            rep_angles = {}
             if rep_idx is not None and rep_idx in frame_to_row:
-                rep_row = tors_df.filter(pl.col('frame') == int(rep_idx)).to_dicts()
-                if rep_row:
-                    rep_row = rep_row[0]
-                    for col in angle_cols:
-                        if col not in cluster_stats:
-                            cluster_stats[col] = circular_stats(np.array([], dtype=float))
-                        cluster_stats[col]['representative_angle_deg'] = float(rep_row[col])
+                rep_values = torsion_matrix[frame_to_row[int(rep_idx)]]
+                for col_idx, col in enumerate(angle_cols):
+                    if col not in cluster_stats:
+                        cluster_stats[col] = circular_stats(np.array([], dtype=float))
+                    cluster_stats[col]['representative_angle_deg'] = float(rep_values[col_idx])
 
             clusters_out.append({
                 'cluster_id': cid,
@@ -965,7 +1041,113 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
         json.dump(info, f, indent=2)
     logger.info(f"Wrote consolidated data to {info_path}")
 
+def _aligned_frame_xyz_cached(
+    coords,
+    atoms_df: pl.DataFrame,
+    reference_xyz: np.ndarray,
+    frame_idx: int,
+    cache: Dict[int, np.ndarray],
+    residue_range: tuple[int, int] = (1, 5),
+) -> np.ndarray:
+    cached = cache.get(int(frame_idx))
+    if cached is not None:
+        return cached.copy()
+    xyz = np.asarray(coords[int(frame_idx)], dtype=float).copy()
+    if int(frame_idx) != 0:
+        xyz, _ = glypdbio.align_structures_by_residues(
+            reference_xyz,
+            xyz,
+            atoms_df,
+            atoms_df,
+            residue_range,
+            True,
+        )
+        xyz = np.asarray(xyz, dtype=float)
+    cache[int(frame_idx)] = xyz
+    return xyz.copy()
 
+
+def _flip_anomer_model(
+    xyz: np.ndarray,
+    atom_names: List[str],
+    residue_ids: List[int],
+    base_res_names: List[str],
+) -> tuple[np.ndarray, List[str]]:
+    xyz_out = np.asarray(xyz, dtype=float).copy()
+    res_names = list(base_res_names)
+    try:
+        idx_C1 = next((i for i, (name, res_id) in enumerate(zip(atom_names, residue_ids)) if name == "C1" and res_id == 2), None)
+        idx_H1 = next((i for i, (name, res_id) in enumerate(zip(atom_names, residue_ids)) if name == "H1" and res_id == 2), None)
+        idx_O1 = next((i for i, (name, res_id) in enumerate(zip(atom_names, residue_ids)) if name == "O1" and res_id == 1), None)
+        idx_HO1 = next((i for i, (name, res_id) in enumerate(zip(atom_names, residue_ids)) if name == "HO1" and res_id == 1), None)
+        if None not in (idx_C1, idx_H1, idx_O1, idx_HO1):
+            C1 = xyz_out[idx_C1]
+            H1 = xyz_out[idx_H1]
+            O1 = xyz_out[idx_O1]
+            HO1 = xyz_out[idx_HO1]
+
+            CO1_vec = O1 - C1
+            CH1_vec = H1 - C1
+            HO1O1_vec = HO1 - O1
+
+            len_C1O1 = float(np.linalg.norm(CO1_vec)) if np.linalg.norm(CO1_vec) > 0 else 1.43
+            len_C1H1 = float(np.linalg.norm(CH1_vec)) if np.linalg.norm(CH1_vec) > 0 else 1.09
+            if np.linalg.norm(CH1_vec) > 0 and np.linalg.norm(CO1_vec) > 0:
+                new_O1 = C1 + (CH1_vec / np.linalg.norm(CH1_vec)) * len_C1O1
+                new_H1 = C1 + (CO1_vec / np.linalg.norm(CO1_vec)) * len_C1H1
+                new_HO1 = new_O1 + HO1O1_vec
+                xyz_out[idx_O1] = new_O1
+                xyz_out[idx_H1] = new_H1
+                xyz_out[idx_HO1] = new_HO1
+
+                try:
+                    res2_name = next(res_names[i] for i, res_id in enumerate(residue_ids) if res_id == 2)
+                    if res2_name and res2_name[-1] in ("A", "B"):
+                        flipped_res2 = res2_name[:-1] + ("B" if res2_name[-1] == "A" else "A")
+                        for i, res_id in enumerate(residue_ids):
+                            if res_id == 2:
+                                res_names[i] = flipped_res2
+                except StopIteration:
+                    pass
+    except Exception:
+        pass
+    return xyz_out, res_names
+
+
+def _write_representative_model(
+    fh,
+    model_index: int,
+    cluster_id: int,
+    cluster_size_pct: Optional[float],
+    xyz: np.ndarray,
+    serials: np.ndarray,
+    atom_names: List[str],
+    res_names: List[str],
+    chain_u8: np.ndarray,
+    residue_ids_np: np.ndarray,
+    elements: List[str],
+    conect_block: str,
+) -> None:
+    fh.write(f"MODEL     {model_index:4d}\n")
+    fh.write(f"REMARK   CLUSTER_ID {cluster_id}\n")
+    try:
+        fh.write(f"REMARK   CLUSTER_POPULATION_PCT {float(cluster_size_pct):.4f}\n")
+    except Exception:
+        pass
+    for atom_idx in range(len(serials)):
+        x, y, z = xyz[atom_idx]
+        fh.write(glypdbio._pdb_atom_line(
+            serial=int(serials[atom_idx]),
+            name=atom_names[atom_idx],
+            res_name=res_names[atom_idx],
+            chain_u8=int(chain_u8[atom_idx]),
+            res_id=int(residue_ids_np[atom_idx]),
+            x=float(x), y=float(y), z=float(z),
+            element=elements[atom_idx],
+        ))
+    if conect_block:
+        fh.write(conect_block)
+    fh.write("ENDMDL\n")
 
 
 def step_save_representative_structures(
@@ -973,7 +1155,9 @@ def step_save_representative_structures(
     embedding_dir: str, 
     out_dir: str, 
     glycam_name: str, 
-    force: bool = False
+    force: bool = False,
+    *,
+    cr=None,
 ) -> None:
     """Save PDB structures of cluster representatives with alpha/beta flipping.
     
@@ -990,11 +1174,12 @@ def step_save_representative_structures(
     os.makedirs(out_dir, exist_ok=True)
     
     # Load clustering results
-    try:
-        cr = load_clustering_results_parquet(embedding_dir)
-    except Exception as exc:
-        logger.warning(f"Could not load clustering results: {exc}; skipping structure generation")
-        return
+    if cr is None:
+        try:
+            cr = load_clustering_results_parquet(embedding_dir)
+        except Exception as exc:
+            logger.warning(f"Could not load clustering results: {exc}; skipping structure generation")
+            return
     
     # Determine current anomer type
     current_anomer = glypdbio.get_anomer(glycam_name)
@@ -1003,8 +1188,28 @@ def step_save_representative_structures(
         current_anomer = "alpha"
     
     logger.info(f"Current structure anomer: {current_anomer}")
+
+    try:
+        atoms = glypdbio.load_atoms(frame_data_dir)
+        bonds = glypdbio.load_bonds(frame_data_dir)
+        coords = glypdbio.load_coords(frame_data_dir)
+    except Exception as exc:
+        logger.warning(f"Could not load trajectory data for representative structures: {exc}")
+        return
+
+    serials = atoms["serial"].to_numpy()
+    atom_names = atoms["name"].to_list()
+    base_res_names = atoms["res_name"].to_list()
+    chain_u8 = atoms["chain_id_u8"].to_numpy()
+    residue_ids_np = atoms["res_id"].to_numpy()
+    residue_ids = [int(x) for x in residue_ids_np.tolist()]
+    elements = atoms["element"].to_list()
+    conect_block = glypdbio._pdb_conect_block(serials, bonds)
+    reference_xyz = np.asarray(coords[0], dtype=float).copy()
+    aligned_cache: Dict[int, np.ndarray] = {0: reference_xyz.copy()}
     
     # Process each clustering level
+    storage = get_storage_manager()
     total_structures = 0
     for level in cr.levels():
         reps_df = cr.representatives(level)
@@ -1016,125 +1221,108 @@ def step_save_representative_structures(
         if os.path.exists(alpha_out) and os.path.exists(beta_out) and not force:
             logger.info(f"Representative structures already exist for level {level}; skipping")
             continue
-        # Write a small header remark to each
-        with open(alpha_out, "w") as fa:
-            fa.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER ALPHA\n")
-        with open(beta_out, "w") as fb:
-            fb.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER BETA\n")
-        
-        # Materialize rows so we can inspect for a cluster-0 representative to use
         rows = list(reps_df.iter_rows(named=True))
+        alpha_model_idx = 0
+        beta_model_idx = 0
+        with storage.open(alpha_out, "w") as alpha_fh, storage.open(beta_out, "w") as beta_fh:
+            alpha_fh.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER ALPHA\n")
+            beta_fh.write(f"REMARK   MULTI-MODEL REPRESENTATIVES LEVEL {level} ANOMER BETA\n")
 
-        # Determine reference frame for alignment: prefer representative of cluster 0 if present
-        reference_frame_idx = 0
-        try:
-            for r in rows:
-                try:
-                    if int(r.get('cluster_id', -1)) == 0 and r.get('representative_idx') is not None:
-                        reference_frame_idx = int(r.get('representative_idx'))
-                        break
-                except Exception:
+            for row in rows:
+                cid = int(row['cluster_id'])
+                rep_idx = row.get('representative_idx')
+                cluster_size_pct = row.get('cluster_size_pct', 0.0)
+
+                if rep_idx is None:
+                    logger.warning(f"No representative index for cluster {cid} at level {level}")
                     continue
-        except Exception:
-            reference_frame_idx = 0
 
-        for row in rows:
-            cid = int(row['cluster_id'])
-            rep_idx = row.get('representative_idx')
-            cluster_size_pct = row.get('cluster_size_pct', 0.0)
-            
-            if rep_idx is None:
-                logger.warning(f"No representative index for cluster {cid} at level {level}")
-                continue
-            
-            rep_frame = int(rep_idx)
-            
-            # Format cluster percentage for display
-            pct_str = f"{cluster_size_pct:.1f}%" if cluster_size_pct is not None else "0.0%"
-            
-            # Append original anomer to the corresponding aggregated file
-            try:
-                title = f"Level {level} Cluster {cid} Representative {rep_frame} ({current_anomer}) - {pct_str}"
-                # Write to a temp file using alignment, then append with normalized MODEL numbering
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w+', suffix='.pdb', delete=False) as tf:
-                    tmp_path = tf.name
-                glypdbio.write_aligned_pdb_for_frame(
-                    frame_data_dir=frame_data_dir,
-                    frame_idx=rep_frame,
-                    reference_frame_idx=0,
-                    path=tmp_path,
-                    title=title,
-                    flip=False,
-                )
-                with open(tmp_path, 'r') as ftmp:
-                    content = ftmp.read().splitlines()
-                os.unlink(tmp_path)
-                # Normalize: replace MODEL number with sequential, strip TITLE, keep ATOM/HETATM/ANISOU/TER and ENDMDL
-                # Determine next model index by counting existing ENDMDL in file
-                def _append_model(out_path: str, lines: list[str], cid: int, pct: float):
-                    try:
-                        with open(out_path, 'r') as fh:
-                            prev = fh.read()
-                        m_idx = prev.count('ENDMDL') + 1
-                    except Exception:
-                        m_idx = 1
-                    with open(out_path, 'a') as fh:
-                        fh.write(f"MODEL     {m_idx:4d}\n")
-                        fh.write(f"REMARK   CLUSTER_ID {cid}\n")
-                        try:
-                            fh.write(f"REMARK   CLUSTER_POPULATION_PCT {float(pct):.4f}\n")
-                        except Exception:
-                            pass
-                        for ln in lines:
-                            if ln.startswith('TITLE'):
-                                continue
-                            if ln.startswith(('ATOM', 'HETATM', 'ANISOU', 'TER')):
-                                fh.write(ln + "\n")
-                        fh.write("ENDMDL\n")
-                if current_anomer == 'alpha':
-                    _append_model(alpha_out, content, cid, cluster_size_pct)
-                else:
-                    _append_model(beta_out, content, cid, cluster_size_pct)
-                total_structures += 1
-            except Exception as exc:
-                logger.warning(f"Failed to append original structure for cluster {cid}: {exc}")
-                continue
+                rep_frame = int(rep_idx)
+                try:
+                    aligned_xyz = _aligned_frame_xyz_cached(
+                        coords,
+                        atoms,
+                        reference_xyz,
+                        rep_frame,
+                        aligned_cache,
+                    )
+                    original_xyz = aligned_xyz.copy()
+                    flipped_xyz, flipped_res_names = _flip_anomer_model(
+                        aligned_xyz,
+                        atom_names,
+                        residue_ids,
+                        base_res_names,
+                    )
 
-            # Append flipped anomer to the other aggregated file
-            flipped_anomer = 'beta' if current_anomer == 'alpha' else 'alpha'
-            try:
-                title = f"Level {level} Cluster {cid} Representative {rep_frame} ({flipped_anomer}) - {pct_str}"
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w+', suffix='.pdb', delete=False) as tf2:
-                    tmp2 = tf2.name
-                glypdbio.write_aligned_pdb_for_frame(
-                    frame_data_dir=frame_data_dir,
-                    frame_idx=rep_frame,
-                    reference_frame_idx=0,
-                    path=tmp2,
-                    title=title,
-                    flip=True,
-                )
-                with open(tmp2, 'r') as f2:
-                    content2 = f2.read().splitlines()
-                os.unlink(tmp2)
-                if flipped_anomer == 'alpha':
-                    _append_model(alpha_out, content2, cid, cluster_size_pct)
-                else:
-                    _append_model(beta_out, content2, cid, cluster_size_pct)
-                total_structures += 1
-            except Exception as exc:
-                logger.warning(f"Failed to append flipped structure for cluster {cid}: {exc}")
-                continue
+                    if current_anomer == 'alpha':
+                        alpha_model_idx += 1
+                        _write_representative_model(
+                            alpha_fh,
+                            alpha_model_idx,
+                            cid,
+                            cluster_size_pct,
+                            original_xyz,
+                            serials,
+                            atom_names,
+                            base_res_names,
+                            chain_u8,
+                            residue_ids_np,
+                            elements,
+                            conect_block,
+                        )
+                        beta_model_idx += 1
+                        _write_representative_model(
+                            beta_fh,
+                            beta_model_idx,
+                            cid,
+                            cluster_size_pct,
+                            flipped_xyz,
+                            serials,
+                            atom_names,
+                            flipped_res_names,
+                            chain_u8,
+                            residue_ids_np,
+                            elements,
+                            conect_block,
+                        )
+                    else:
+                        beta_model_idx += 1
+                        _write_representative_model(
+                            beta_fh,
+                            beta_model_idx,
+                            cid,
+                            cluster_size_pct,
+                            original_xyz,
+                            serials,
+                            atom_names,
+                            base_res_names,
+                            chain_u8,
+                            residue_ids_np,
+                            elements,
+                            conect_block,
+                        )
+                        alpha_model_idx += 1
+                        _write_representative_model(
+                            alpha_fh,
+                            alpha_model_idx,
+                            cid,
+                            cluster_size_pct,
+                            flipped_xyz,
+                            serials,
+                            atom_names,
+                            flipped_res_names,
+                            chain_u8,
+                            residue_ids_np,
+                            elements,
+                            conect_block,
+                        )
+                    total_structures += 2
+                except Exception as exc:
+                    logger.warning(f"Failed to write representative structure for cluster {cid} at level {level}: {exc}")
+                    continue
 
-        # Finalize files with END
-        for outp in (alpha_out, beta_out):
-            try:
-                with open(outp, 'a') as fh:
-                    fh.write('END\n')
-            except Exception:
-                pass
+            alpha_fh.write("END\n")
+            beta_fh.write("END\n")
     
     logger.info(f"Saved {total_structures} representative models across alpha/beta multi-model files in {out_dir}")
 
@@ -1142,7 +1330,9 @@ def step_save_representative_structures(
 def step_plot_torsion_distributions(
     embedding_dir: str,
     out_dir: str,
-    force: bool = False
+    force: bool = False,
+    *,
+    cr=None,
 ) -> None:
     """Create torsion distribution plots for each clustering level.
     
@@ -1161,11 +1351,12 @@ def step_plot_torsion_distributions(
         return
     
     # Load clustering results
-    try:
-        cr = load_clustering_results_parquet(embedding_dir)
-    except Exception as exc:
-        logger.warning(f"Could not load clustering results: {exc}; skipping distribution plots")
-        return
+    if cr is None:
+        try:
+            cr = load_clustering_results_parquet(embedding_dir)
+        except Exception as exc:
+            logger.warning(f"Could not load clustering results: {exc}; skipping distribution plots")
+            return
     
     # Process each clustering level
     plots_created = 0
@@ -1217,7 +1408,10 @@ def step_plot_torsion_distributions(
 def step_export_analysis_data(
     embedding_dir: str,
     out_dir: str,
-    force: bool = False
+    force: bool = False,
+    *,
+    cr=None,
+    pca_df: Optional[pl.DataFrame] = None,
 ) -> None:
     """Export analysis files used by downstream static and ML consumers."""
     import csv
@@ -1239,11 +1433,11 @@ def step_export_analysis_data(
     info_source_path = os.path.join(embedding_dir, "info.json")
     torparts_source_path = os.path.join(embedding_dir, "torparts.npz")
 
-    cr = None
-    try:
-        cr = load_clustering_results_parquet(embedding_dir)
-    except Exception as exc:
-        logger.warning(f"Could not load clustering results for export: {exc}")
+    if cr is None:
+        try:
+            cr = load_clustering_results_parquet(embedding_dir)
+        except Exception as exc:
+            logger.warning(f"Could not load clustering results for export: {exc}")
 
     # 1. Export PCA data with first 3 components and level_1 cluster assignments.
     if _path_exists(pca_source_path):
@@ -1252,7 +1446,8 @@ def step_export_analysis_data(
             files_skipped += 1
         else:
             try:
-                pca_df = _read_parquet_robust(pca_source_path)
+                if pca_df is None:
+                    pca_df = _read_parquet_robust(pca_source_path)
                 pca_cols = ["frame", "PC1", "PC2", "PC3"]
                 available_cols = [col for col in pca_cols if col in pca_df.columns]
                 if available_cols:
@@ -1735,13 +1930,15 @@ class GlycanAnalysisPipeline:
             'steps_completed': [],
             'steps_failed': [],
             'error_message': None,
-            'paths': {}
+            'paths': {},
+            'step_durations_sec': {},
         }
         
         try:
             # Get paths
             paths = self.get_glycan_paths(glycan_name)
             results['paths'] = paths
+            clustering_context: Dict[str, object] = {}
             
             # Validate inputs
             if not self.validate_inputs(paths):
@@ -1753,6 +1950,7 @@ class GlycanAnalysisPipeline:
             # Step 1: Store trajectory data
             try:
                 self.logger.info("Step 1: Processing trajectory data")
+                step_started_at = time.perf_counter()
                 step_store(
                     glycan_name, 
                     paths['frame_data_dir'], 
@@ -1760,6 +1958,8 @@ class GlycanAnalysisPipeline:
                     paths['mol2_path'], 
                     force=force_update
                 )
+                results['step_durations_sec']['store'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 1 completed in {results['step_durations_sec']['store']:.3f}s")
                 results['steps_completed'].append('store')
             except Exception as e:
                 self.logger.error(f"Store step failed: {str(e)}")
@@ -1770,12 +1970,15 @@ class GlycanAnalysisPipeline:
             # Step 2: PCA analysis
             try:
                 self.logger.info("Step 2: PCA analysis")
+                step_started_at = time.perf_counter()
                 pca_path = step_pca(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
                     force=force_update,
                     per_pair_scale=per_pair_scale
                 )
+                results['step_durations_sec']['pca'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 2 completed in {results['step_durations_sec']['pca']:.3f}s")
                 results['steps_completed'].append('pca')
             except Exception as e:
                 self.logger.error(f"PCA step failed: {str(e)}")
@@ -1786,11 +1989,14 @@ class GlycanAnalysisPipeline:
             # Step 3: Torsion analysis (moved before clustering since it's independent)
             try:
                 self.logger.info("Step 3: Torsion analysis")
+                step_started_at = time.perf_counter()
                 torsion_list, torsion_labels = step_torsions(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
                     force=force_update
                 )
+                results['step_durations_sec']['torsions'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 3 completed in {results['step_durations_sec']['torsions']:.3f}s")
                 results['steps_completed'].append('torsions')
             except Exception as e:
                 self.logger.error(f"Torsion step failed: {str(e)}")
@@ -1801,11 +2007,15 @@ class GlycanAnalysisPipeline:
             # Step 4: Clustering analysis
             try:
                 self.logger.info("Step 4: Clustering analysis")
-                entropy = step_clustering_gmm(
+                step_started_at = time.perf_counter()
+                entropy, clustering_context = step_clustering_gmm(
                     paths['embedding_dir'], 
                     pca_path, 
-                    force=force_update
+                    force=force_update,
+                    return_context=True,
                 )
+                results['step_durations_sec']['clustering'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 4 completed in {results['step_durations_sec']['clustering']:.3f}s")
                 results['steps_completed'].append('clustering')
             except Exception as e:
                 self.logger.error(f"Clustering step failed: {str(e)}")
@@ -1816,11 +2026,16 @@ class GlycanAnalysisPipeline:
             # Step 5: Cluster torsion statistics
             try:
                 self.logger.info("Step 5: Torsion statistics")
+                step_started_at = time.perf_counter()
                 step_cluster_torsion_stats(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
-                    force=force_update
+                    force=force_update,
+                    cr=clustering_context.get('cr'),
+                    pca_df=clustering_context.get('pca_df'),
                 )
+                results['step_durations_sec']['torsion_stats'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 5 completed in {results['step_durations_sec']['torsion_stats']:.3f}s")
                 results['steps_completed'].append('torsion_stats')
             except Exception as e:
                 self.logger.error(f"Torsion stats step failed: {str(e)}")
@@ -1831,11 +2046,14 @@ class GlycanAnalysisPipeline:
             # Step 6: Create info.json
             try:
                 self.logger.info("Step 6: Creating info.json")
+                step_started_at = time.perf_counter()
                 step_create_info_json(
                     paths['embedding_dir'], 
                     entropy, 
                     force=force_update
                 )
+                results['step_durations_sec']['create_info'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 6 completed in {results['step_durations_sec']['create_info']:.3f}s")
                 results['steps_completed'].append('create_info')
             except Exception as e:
                 self.logger.error(f"Info.json creation step failed: {str(e)}")
@@ -1846,13 +2064,17 @@ class GlycanAnalysisPipeline:
             # Step 7: Save representative structures
             try:
                 self.logger.info("Step 7: Saving representative structures")
+                step_started_at = time.perf_counter()
                 step_save_representative_structures(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
                     paths['out_dir'], 
                     paths['glycam_name'], 
-                    force=force_update
+                    force=force_update,
+                    cr=clustering_context.get('cr'),
                 )
+                results['step_durations_sec']['structures'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 7 completed in {results['step_durations_sec']['structures']:.3f}s")
                 results['steps_completed'].append('structures')
             except Exception as e:
                 self.logger.error(f"Structure saving step failed: {str(e)}")
@@ -1863,11 +2085,15 @@ class GlycanAnalysisPipeline:
             # Step 8: Create torsion distribution plots
             try:
                 self.logger.info("Step 8: Creating distribution plots")
+                step_started_at = time.perf_counter()
                 step_plot_torsion_distributions(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
-                    force=force_update
+                    force=force_update,
+                    cr=clustering_context.get('cr'),
                 )
+                results['step_durations_sec']['plots'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 8 completed in {results['step_durations_sec']['plots']:.3f}s")
                 results['steps_completed'].append('plots')
             except Exception as e:
                 self.logger.error(f"Plotting step failed: {str(e)}")
@@ -1878,11 +2104,16 @@ class GlycanAnalysisPipeline:
             # Step 9: Export analysis data
             try:
                 self.logger.info("Step 9: Exporting analysis data")
+                step_started_at = time.perf_counter()
                 step_export_analysis_data(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
-                    force=force_update
+                    force=force_update,
+                    cr=clustering_context.get('cr'),
+                    pca_df=clustering_context.get('pca_df'),
                 )
+                results['step_durations_sec']['export'] = round(time.perf_counter() - step_started_at, 3)
+                self.logger.info(f"Step 9 completed in {results['step_durations_sec']['export']:.3f}s")
                 results['steps_completed'].append('export')
             except Exception as e:
                 self.logger.error(f"Export step failed: {str(e)}")
@@ -1894,6 +2125,8 @@ class GlycanAnalysisPipeline:
             # All steps completed successfully
             results['success'] = True
             self.logger.info(f"Successfully completed v2 analysis for {glycan_name}")
+            if results['step_durations_sec']:
+                self.logger.info(f"Step timing summary (s): {results['step_durations_sec']}")
             
         except Exception as e:
             self.logger.error(f"Unexpected error in v2 analysis: {str(e)}")

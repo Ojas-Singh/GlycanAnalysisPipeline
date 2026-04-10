@@ -12,6 +12,7 @@ import io
 import json
 import tempfile
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Union, BinaryIO, TextIO, Optional
@@ -217,20 +218,28 @@ class OracleStorageBackend(StorageBackend):
         """
         # Sanitize PAR URL (remove any whitespace/newlines accidentally copied)
         self.par_url = ''.join(par_url.split()).rstrip('/')
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
         self._verify_par_url()
         # Cache for directory structure since Oracle doesn't provide true directories
         self._dir_cache = {}
         logger.info(f"Initialized OracleStorageBackend with PAR URL: {self.par_url}")
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Issue an HTTP request through a persistent session."""
+        return self._session.request(method, url, **kwargs)
     
     def _verify_par_url(self) -> None:
         """Verify the PAR URL is accessible."""
         try:
-            response = requests.head(self.par_url, timeout=10)
+            response = self._request("head", self.par_url, timeout=10)
             # Some PARs may not allow HEAD on the root; accept common statuses
             if response.status_code not in [200, 204, 403, 404]:
                 # Try a lightweight GET listing as a fallback check
                 try:
-                    r2 = requests.get(self.par_url + "/", params={"limit": 1}, timeout=10)
+                    r2 = self._request("get", self.par_url + "/", params={"limit": 1}, timeout=10)
                     if r2.status_code not in [200, 403, 404]:
                         raise Exception(f"PAR URL returned status {response.status_code}")
                 except Exception:
@@ -259,13 +268,13 @@ class OracleStorageBackend(StorageBackend):
         # First try HEAD request for files
         url = self._get_object_url(path)
         try:
-            response = requests.head(url, timeout=10)
+            response = self._request("head", url, timeout=10)
             if response.status_code == 200:
                 return True
             # Some PARs disallow HEAD; fall back to GET
             if response.status_code in (400, 401, 403, 405):
                 try:
-                    r2 = requests.get(url, timeout=10)
+                    r2 = self._request("get", url, timeout=10)
                     return r2.status_code == 200
                 except Exception:
                     pass
@@ -286,7 +295,7 @@ class OracleStorageBackend(StorageBackend):
         prefix = f"{path_str}/" if path_str else ""
         url = f"{self.par_url}/"
         try:
-            response = requests.get(url, params={"prefix": prefix, "limit": 1}, timeout=10)
+            response = self._request("get", url, params={"prefix": prefix, "limit": 1}, timeout=10)
             if response.status_code != 200:
                 return False
             # Prefer JSON parsing (Oracle native API)
@@ -315,7 +324,7 @@ class OracleStorageBackend(StorageBackend):
         prefix = f"{path_str}/" if path_str else ""
         url = f"{self.par_url}/"
         try:
-            response = requests.get(url, params={"prefix": prefix, "limit": 1000}, timeout=15)
+            response = self._request("get", url, params={"prefix": prefix, "limit": 1000}, timeout=15)
             if response.status_code != 200:
                 return []
 
@@ -362,7 +371,7 @@ class OracleStorageBackend(StorageBackend):
                         "continuation-token": next_marker,
                         "marker": next_marker,
                     })
-                resp = requests.get(url, params=params, timeout=15)
+                resp = self._request("get", url, params=params, timeout=15)
                 if resp.status_code != 200:
                     break
                 next_marker = None
@@ -432,7 +441,7 @@ class OracleStorageBackend(StorageBackend):
         """Write text content to a file."""
         url = self._get_object_url(path)
         try:
-            response = requests.put(url, data=content.encode(encoding), timeout=30)
+            response = self._request("put", url, data=content.encode(encoding), timeout=30)
             response.raise_for_status()
             logger.debug(f"Wrote text to {url}")
         except Exception as e:
@@ -443,7 +452,7 @@ class OracleStorageBackend(StorageBackend):
         """Write binary content to a file."""
         url = self._get_object_url(path)
         try:
-            response = requests.put(url, data=content, timeout=30)
+            response = self._request("put", url, data=content, timeout=30)
             response.raise_for_status()
             logger.debug(f"Wrote binary to {url}")
         except Exception as e:
@@ -454,7 +463,7 @@ class OracleStorageBackend(StorageBackend):
         """Read text content from a file."""
         url = self._get_object_url(path)
         try:
-            response = requests.get(url, timeout=30)
+            response = self._request("get", url, timeout=30)
             response.raise_for_status()
             return response.content.decode(encoding)
         except Exception as e:
@@ -465,7 +474,7 @@ class OracleStorageBackend(StorageBackend):
         """Read binary content from a file."""
         url = self._get_object_url(path)
         try:
-            response = requests.get(url, timeout=30)
+            response = self._request("get", url, timeout=30)
             response.raise_for_status()
             return response.content
         except Exception as e:
@@ -480,7 +489,7 @@ class OracleStorageBackend(StorageBackend):
         """Delete a file."""
         url = self._get_object_url(path)
         try:
-            response = requests.delete(url, timeout=30)
+            response = self._request("delete", url, timeout=30)
             response.raise_for_status()
             logger.debug(f"Deleted {url}")
         except Exception as e:
@@ -823,30 +832,59 @@ class StorageManager:
         if not local_dir.exists():
             logger.debug(f"upload_dir: local path does not exist: {local_dir}")
             return
-        success_count = 0
-        fail_count = 0
-        skip_count = 0
+        upload_jobs = []
         for root, _, files in os.walk(local_dir):
             for fname in files:
                 lpath = Path(root) / fname
                 rel = lpath.relative_to(local_dir).as_posix()
                 rpath = f"{remote_prefix}/{rel}" if remote_prefix else rel
-                try:
-                    # If requested, skip upload when destination already exists
-                    if skip_existing:
-                        try:
-                            if self.backend.exists(rpath):
-                                skip_count += 1
-                                continue
-                        except Exception:
-                            # If existence check fails, fall back to uploading
-                            pass
-                    with open(lpath, 'rb') as f:
-                        data = f.read()
-                    self.backend.write_binary(rpath, data)
+                upload_jobs.append((lpath, rpath))
+
+        success_count = 0
+        fail_count = 0
+        skip_count = 0
+
+        def _upload_one(job: tuple[Path, str]) -> tuple[str, Path, str, Optional[str]]:
+            lpath, rpath = job
+            try:
+                if skip_existing:
+                    try:
+                        if self.backend.exists(rpath):
+                            return ("skipped", lpath, rpath, None)
+                    except Exception:
+                        pass
+                with open(lpath, 'rb') as f:
+                    data = f.read()
+                self.backend.write_binary(rpath, data)
+                return ("uploaded", lpath, rpath, None)
+            except Exception as exc:
+                return ("failed", lpath, rpath, str(exc))
+
+        max_workers = 1
+        if upload_jobs:
+            cpu_count = os.cpu_count() or 4
+            max_workers = max(1, min(8, cpu_count))
+        if isinstance(self.backend, OracleStorageBackend) and len(upload_jobs) > 1 and max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(_upload_one, job): job for job in upload_jobs}
+                for future in as_completed(future_map):
+                    status, lpath, rpath, error = future.result()
+                    if status == "uploaded":
+                        success_count += 1
+                    elif status == "skipped":
+                        skip_count += 1
+                    else:
+                        logger.warning(f"upload_dir: failed to upload {lpath} -> {rpath}: {error}")
+                        fail_count += 1
+        else:
+            for job in upload_jobs:
+                status, lpath, rpath, error = _upload_one(job)
+                if status == "uploaded":
                     success_count += 1
-                except Exception as e:
-                    logger.warning(f"upload_dir: failed to upload {lpath} -> {rpath}: {e}")
+                elif status == "skipped":
+                    skip_count += 1
+                else:
+                    logger.warning(f"upload_dir: failed to upload {lpath} -> {rpath}: {error}")
                     fail_count += 1
         logger.info(f"upload_dir: uploaded {success_count} files to '{remote_prefix}' (skipped {skip_count} existing, {fail_count} failures)")
 

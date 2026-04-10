@@ -16,6 +16,7 @@ import os
 import sys
 import logging
 import argparse
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -146,6 +147,8 @@ class GlycanPipelineRunner:
         # Initialize processors
         self.metadata_processor = GlycanMetadataProcessor(self.output_dir, pb_client=self.pb_client)
         self.baker = GlycoShapeBaker(self.output_dir)
+        self._known_static_output_dirs: Dict[str, str] = {}
+        self._last_glystatic_result: Dict[str, Dict[str, Any]] = {}
     
     def _remote_output_base(self) -> str:
         """Return the remote base prefix for outputs.
@@ -160,6 +163,23 @@ class GlycanPipelineRunner:
         """Normalize local/remote storage paths to a forward-slash string."""
         raw = value.as_posix() if hasattr(value, "as_posix") else str(value)
         return raw.replace("\\", "/").rstrip("/")
+
+    def _cache_static_output_dir(self, glycan_name: str, output_dir: Optional[str]) -> None:
+        if not output_dir:
+            return
+        self._known_static_output_dirs[glycan_name] = output_dir
+
+    def _get_cached_static_output_dir(self, glycan_name: str) -> Optional[str]:
+        candidate = self._known_static_output_dirs.get(glycan_name)
+        if not candidate:
+            last_result = self._last_glystatic_result.get(glycan_name) or {}
+            candidate = str(last_result.get("final_output_dir") or "").strip() or None
+        if not candidate:
+            return None
+        data_json = f"{candidate}/data.json"
+        if self.storage.exists(data_json):
+            return candidate
+        return None
 
     def _load_json_from_storage(self, path: str) -> Optional[Dict[str, Any]]:
         """Read a JSON object from the active storage backend."""
@@ -189,6 +209,10 @@ class GlycanPipelineRunner:
         upload_local_if_oracle: bool = False,
     ) -> Optional[str]:
         """Locate the per-glycan GS output directory for the given glycan name."""
+        cached = self._get_cached_static_output_dir(glycan_name)
+        if cached is not None:
+            return cached
+
         base = self._remote_output_base()
         try:
             candidates = self.storage.list_files(base, "GS*")
@@ -210,6 +234,7 @@ class GlycanPipelineRunner:
             data = self._load_json_from_storage(data_json)
             archetype = data.get("archetype", {}) if isinstance(data, dict) else {}
             if isinstance(archetype, dict) and self._matches_glycan_name(archetype, glycan_name, substring_match=substring_match):
+                self._cache_static_output_dir(glycan_name, key)
                 return key
 
         if config.use_oracle_storage and include_local_oracle_fallback:
@@ -232,8 +257,10 @@ class GlycanPipelineRunner:
                         remote_prefix = f"{self._remote_output_base()}/{data_json.parent.name}"
                         self.storage.upload_dir(data_json.parent, remote_prefix, skip_existing=False)
                         logger.info(f"Uploaded local GS folder to Oracle: {remote_prefix}")
+                        self._cache_static_output_dir(glycan_name, str(data_json.parent))
                         return remote_prefix
 
+                    self._cache_static_output_dir(glycan_name, str(data_json.parent))
                     return str(data_json.parent)
 
         return None
@@ -259,6 +286,10 @@ class GlycanPipelineRunner:
             return []
 
         normalized_output_dir = self._normalize_storage_key(output_dir)
+        local_root = Path(output_dir)
+        if local_root.exists():
+            return sorted(p.relative_to(local_root).as_posix() for p in local_root.rglob("*") if p.is_file())
+
         if config.use_oracle_storage:
             try:
                 objects = self.storage.list_files(normalized_output_dir, "*")
@@ -379,7 +410,7 @@ class GlycanPipelineRunner:
 
         output_dir = self._find_static_output_dir(
             glycan_name,
-            include_local_oracle_fallback=not config.use_oracle_storage,
+            include_local_oracle_fallback=True,
         )
         actual_files = self._collect_static_output_files(output_dir)
         required_files = self._get_log_tail_required_files()
@@ -718,6 +749,12 @@ class GlycanPipelineRunner:
             True if a valid data.json exists with glytoucan ID, False otherwise
         """
         try:
+            cached_dir = self._get_cached_static_output_dir(glycan_name)
+            if cached_dir is not None:
+                validation_errors = self._validate_glystatic_output_dir(cached_dir, glycan_name=glycan_name)
+                if not validation_errors:
+                    return True
+
             # Look for any GS folder that matches this glycan name
             base = self._remote_output_base()
             candidates = self.storage.list_files(base, "GS*")
@@ -752,6 +789,7 @@ class GlycanPipelineRunner:
                 validation_errors = self._validate_glystatic_output_dir(str(candidate), glycan_name=glycan_name)
                 if not validation_errors:
                     glytoucan_id = archetype.get("glytoucan", "").strip()
+                    self._cache_static_output_dir(glycan_name, str(candidate))
                     logger.debug(f"Found complete glystatic output for {glycan_name} in {candidate_name} (GlyTouCan: {glytoucan_id})")
                     return True
             
@@ -776,6 +814,12 @@ class GlycanPipelineRunner:
             True if glystatic processing is complete, False otherwise
         """
         try:
+            cached_dir = self._get_cached_static_output_dir(glycan_name)
+            if cached_dir is not None:
+                validation_errors = self._validate_glystatic_output_dir(cached_dir, glycan_name=glycan_name)
+                if not validation_errors:
+                    return True
+
             # Use storage abstraction to support Oracle and local modes
             storage = self.storage
             # In Oracle, check completion against remote 'static' prefix
@@ -805,6 +849,7 @@ class GlycanPipelineRunner:
                     name_field = archetype.get('name') or archetype.get('glycam', '')
                     if name_field == glycan_name:
                         matching_key = base_key
+                        self._cache_static_output_dir(glycan_name, base_key)
                         break
                 except Exception:
                     continue
@@ -863,15 +908,21 @@ class GlycanPipelineRunner:
             logger.debug(f"Error checking v2 status for {glycan_name}: {str(e)}")
             return False
     
-    def run_glystatic(self, glycan_name: str) -> bool:
+    def run_glystatic(self, glycan_name: str) -> Dict[str, Any]:
         """Run glystatic processing for a single glycan.
         
         Args:
             glycan_name: Name of the glycan directory
             
         Returns:
-            True if successful, False otherwise
+            Dict containing success flag and known output paths/IDs
         """
+        result: Dict[str, Any] = {
+            "success": False,
+            "glycoshape_id": None,
+            "final_output_dir": None,
+            "local_output_dir": None,
+        }
         try:
             output_glycan_dir = f"{self.output_dir}/{glycan_name}"
             
@@ -881,12 +932,24 @@ class GlycanPipelineRunner:
                     # When GLYCOSHAPE_DB_UPDATE is False, use simple check
                     if self.check_glystatic_simple(glycan_name):
                         logger.info(f"Glystatic processing already complete for {glycan_name} (found valid data.json with glytoucan ID), skipping")
-                        return True
+                        cached = self._find_static_output_dir(glycan_name, include_local_oracle_fallback=True)
+                        if cached:
+                            self._cache_static_output_dir(glycan_name, cached)
+                            result["final_output_dir"] = cached
+                            result["local_output_dir"] = cached
+                        result["success"] = True
+                        return result
                 else:
                     # When GLYCOSHAPE_DB_UPDATE is True, use full validation
                     if self.check_glystatic_completion(glycan_name):
                         logger.info(f"Glystatic processing already complete for {glycan_name}, skipping")
-                        return True
+                        cached = self._find_static_output_dir(glycan_name, include_local_oracle_fallback=True)
+                        if cached:
+                            self._cache_static_output_dir(glycan_name, cached)
+                            result["final_output_dir"] = cached
+                            result["local_output_dir"] = cached
+                        result["success"] = True
+                        return result
                 
             logger.info(f"Running glystatic for {glycan_name}")
             
@@ -896,51 +959,40 @@ class GlycanPipelineRunner:
             
             if not self.storage.exists(process_glycan_dir):
                 logger.error(f"Process directory not found: {process_glycan_dir}")
-                return False
+                return result
             
             # Verify that the output subdirectory exists in process_dir
             process_output_dir = f"{process_glycan_dir}/output"
             if not self.storage.exists(process_output_dir):
                 logger.error(f"Output subdirectory not found in process directory: {process_output_dir}")
-                return False
+                return result
             
             # Call glystatic process_glycan function with the process directory as input
             # This tells glystatic to read the intermediate outputs from process_dir/glycan_name/output/
-            glystatic_process_glycan(
+            glystatic_result = glystatic_process_glycan(
                 folder_path=str(process_glycan_dir),  # Pass process_dir/glycan_name/ (contains output/)
                 glycam_name=glycan_name,
                 output_static_dir=str(self.output_dir)  # Final database output location
             )
+            if isinstance(glystatic_result, dict):
+                result.update(glystatic_result)
+            local_output_dir = str(result.get("local_output_dir") or result.get("final_output_dir") or "")
+            final_output_dir = str(result.get("final_output_dir") or local_output_dir or "")
+            if final_output_dir:
+                self._cache_static_output_dir(glycan_name, final_output_dir)
+            self._last_glystatic_result[glycan_name] = dict(result)
 
             # In Oracle mode, immediately upload/update the just-written GS* folder to the bucket
             # before validating (validation reads via remote in Oracle mode).
             if config.use_oracle_storage:
                 try:
-                    # Find the local GS folder for this glycan by matching archetype.name
-                    local_base = Path(str(self.output_dir))
-                    if local_base.exists():
-                        gs_local_dir: Optional[Path] = None
-                        for data_json in local_base.glob("GS*/data.json"):
-                            try:
-                                with open(data_json, 'r', encoding='utf-8') as f:
-                                    d = json.load(f)
-                                arche = d.get('archetype', {}) if isinstance(d, dict) else {}
-                                name_field = arche.get('name') or arche.get('glycam')
-                                if name_field and glycan_name.lower() in str(name_field).lower():
-                                    gs_local_dir = data_json.parent
-                                    break
-                            except Exception:
-                                continue
-                        if gs_local_dir is not None:
-                            # Always upload under 'static/<GSID>' in Oracle
-                            remote_prefix = f"{self._remote_output_base()}/{gs_local_dir.name}"
-                            # Overwrite remote to ensure updates land
-                            self.storage.upload_dir(gs_local_dir, remote_prefix, skip_existing=False)
-                            logger.info(f"Uploaded/updated static outputs to Oracle: {remote_prefix}")
-                        else:
-                            logger.warning(f"Could not locate local GS folder for {glycan_name} to upload")
+                    gs_local_dir = Path(local_output_dir) if local_output_dir else None
+                    if gs_local_dir is not None and gs_local_dir.exists():
+                        remote_prefix = f"{self._remote_output_base()}/{gs_local_dir.name}"
+                        self.storage.upload_dir(gs_local_dir, remote_prefix, skip_existing=False)
+                        logger.info(f"Uploaded/updated static outputs to Oracle: {remote_prefix}")
                     else:
-                        logger.warning(f"Local output base not found for upload: {local_base}")
+                        logger.warning(f"Could not locate local GS folder for {glycan_name} to upload")
                 except Exception as e:
                     logger.warning(f"Failed to upload static outputs for {glycan_name}: {e}")
             
@@ -949,22 +1001,35 @@ class GlycanPipelineRunner:
             # existing `check_glystatic_completion` which searches subfolders
             # for a matching archetype entry. Fall back to the older
             # `validate_output_structure` if needed.
+            if final_output_dir:
+                validation_errors = self._validate_glystatic_output_dir(final_output_dir, glycan_name=glycan_name)
+                if not validation_errors:
+                    result["success"] = True
+                    logger.info(f"Successfully completed glystatic for {glycan_name}")
+                    return result
             if self.check_glystatic_completion(glycan_name):
                 logger.info(f"Successfully completed glystatic for {glycan_name}")
-                return True
+                cached = self._find_static_output_dir(glycan_name, include_local_oracle_fallback=True)
+                if cached:
+                    result["final_output_dir"] = cached
+                    result["local_output_dir"] = cached
+                    self._cache_static_output_dir(glycan_name, cached)
+                result["success"] = True
+                return result
             else:
                 logger.error(f"Glystatic output validation failed for {glycan_name}")
                 # Fallback: check same-named output folder (legacy behavior)
                 if self.validate_output_structure(glycan_name):
                     logger.info(f"Found direct output directory for {glycan_name}; marking as success")
-                    return True
-                return False
+                    result["success"] = True
+                    return result
+                return result
                         
         except Exception as e:
             logger.error(f"Error running glystatic for {glycan_name}: {str(e)}")
-            return False
+            return result
     
-    def run_glymeta(self, glycan_name: str) -> bool:
+    def run_glymeta(self, glycan_name: str, output_dir: Optional[str] = None) -> bool:
         """Run metadata processing for a single glycan.
         
         Args:
@@ -977,14 +1042,17 @@ class GlycanPipelineRunner:
             logger.info(f"Running glymeta for {glycan_name}")
             
             # Locate the glystatic output directory containing data.json for this glycan
-            candidate_dir = self._find_static_output_dir(
-                glycan_name,
-                substring_match=True,
-                include_local_oracle_fallback=not config.use_oracle_storage,
-            )
+            candidate_dir = output_dir or self._get_cached_static_output_dir(glycan_name)
+            if candidate_dir is None:
+                candidate_dir = self._find_static_output_dir(
+                    glycan_name,
+                    substring_match=True,
+                    include_local_oracle_fallback=True,
+                )
             if candidate_dir is None:
                 logger.error(f"data.json not found for {glycan_name}")
                 return False
+            self._cache_static_output_dir(glycan_name, candidate_dir)
             json_path = f"{candidate_dir}/data.json"
                 
             # Update metadata for this specific glycan
@@ -1016,6 +1084,10 @@ class GlycanPipelineRunner:
             # glymeta is best-effort and not part of pipeline success criteria
         }
         glymeta_success: Optional[bool] = None
+        glystatic_result: Dict[str, Any] = {}
+        local_process_dir = os.path.join(str(self.process_dir), glycan_name)
+        should_cleanup_process_dir = False
+        stage_durations: Dict[str, float] = {}
         
         logger.info(f"Starting pipeline for glycan: {glycan_name}")
 
@@ -1027,22 +1099,21 @@ class GlycanPipelineRunner:
                 results["v2"] = True
             else:
                 # Run v2 and upload process dir to Oracle if enabled
+                stage_started_at = time.perf_counter()
                 v2_ok = self.run_v2_analysis(glycan_name)
+                stage_durations["v2"] = round(time.perf_counter() - stage_started_at, 3)
+                logger.info(f"Pipeline stage v2 completed in {stage_durations['v2']:.3f}s")
                 results["v2"] = v2_ok
                 if v2_ok and config.use_oracle_storage:
                     try:
-                        local_process_dir = os.path.join(str(self.process_dir), glycan_name)
                         remote_prefix = f"{self.process_dir}/{glycan_name}"
                         # Overwrite remote process outputs so Oracle always reflects the latest run.
+                        upload_started_at = time.perf_counter()
                         self.storage.upload_dir(local_process_dir, remote_prefix, skip_existing=False)
+                        stage_durations["process_upload"] = round(time.perf_counter() - upload_started_at, 3)
+                        logger.info(f"Pipeline stage process_upload completed in {stage_durations['process_upload']:.3f}s")
                         logger.info(f"Uploaded process outputs to Oracle: {remote_prefix}")
-                        
-                        # Clean up local folder after successful upload
-                        if config.should_cleanup_process_files():
-                            if self.storage.delete_local_directory(local_process_dir):
-                                logger.info(f"Cleaned up local process directory: {local_process_dir}")
-                            else:
-                                logger.warning(f"Failed to clean up local process directory: {local_process_dir}")
+                        should_cleanup_process_dir = config.should_cleanup_process_files()
                     except Exception as e:
                         logger.warning(f"Failed to upload/cleanup process outputs for {glycan_name}: {e}")
                 
@@ -1055,7 +1126,11 @@ class GlycanPipelineRunner:
                 logger.info(f"glystatic already complete for {glycan_name}, skipping")
                 results["glystatic"] = True
             else:
-                results["glystatic"] = self.run_glystatic(glycan_name)
+                stage_started_at = time.perf_counter()
+                glystatic_result = self.run_glystatic(glycan_name)
+                stage_durations["glystatic"] = round(time.perf_counter() - stage_started_at, 3)
+                logger.info(f"Pipeline stage glystatic completed in {stage_durations['glystatic']:.3f}s")
+                results["glystatic"] = bool(glystatic_result.get("success"))
 
             # Post-glystatic upload is handled inside run_glystatic for Oracle mode
             if not results["glystatic"]:
@@ -1064,18 +1139,42 @@ class GlycanPipelineRunner:
                 
             # Step 3: glymeta (best-effort, do not fail the pipeline if it fails)
             try:
-                glymeta_success = self.run_glymeta(glycan_name)
+                stage_started_at = time.perf_counter()
+                glymeta_success = self.run_glymeta(
+                    glycan_name,
+                    output_dir=str(glystatic_result.get("final_output_dir") or "") or None,
+                )
+                stage_durations["glymeta"] = round(time.perf_counter() - stage_started_at, 3)
+                logger.info(f"Pipeline stage glymeta completed in {stage_durations['glymeta']:.3f}s")
             except Exception:
                 # run_glymeta logs its own errors; continue regardless
                 pass
                 
             logger.info(f"Successfully completed pipeline for glycan: {glycan_name}")
+            if stage_durations:
+                logger.info(f"Pipeline timing summary (s): {stage_durations}")
             return results
         finally:
             try:
                 self._write_log_tail_summary(glycan_name, results, glymeta_success)
             except Exception as exc:
                 logger.warning(f"Failed to write PocketBase log_tail summary for {glycan_name}: {exc}")
+            if (
+                config.use_oracle_storage
+                and should_cleanup_process_dir
+                and results.get("v2")
+                and results.get("glystatic")
+            ):
+                try:
+                    cleanup_started_at = time.perf_counter()
+                    if self.storage.delete_local_directory(local_process_dir):
+                        stage_durations["process_cleanup"] = round(time.perf_counter() - cleanup_started_at, 3)
+                        logger.info(f"Pipeline stage process_cleanup completed in {stage_durations['process_cleanup']:.3f}s")
+                        logger.info(f"Cleaned up local process directory: {local_process_dir}")
+                    else:
+                        logger.warning(f"Failed to clean up local process directory: {local_process_dir}")
+                except Exception as exc:
+                    logger.warning(f"Failed to clean up local process directory {local_process_dir}: {exc}")
     
     def run_database_finalization(self) -> bool:
         """Run final database operations.
