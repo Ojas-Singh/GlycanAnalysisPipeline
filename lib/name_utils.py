@@ -2,6 +2,7 @@
 import re
 import sys
 import shutil
+import os
 import requests
 import collections
 import polars as pl
@@ -487,12 +488,20 @@ def glytoucan2glycosmos(glytoucan_id):
 def smiles2wurcs(smiles):
     jar_path = Path(__file__).parent / "MolWURCS.jar"
     print("Using MolWURCS at :",jar_path)
+    env = os.environ.copy()
+    java_home = env.get("JAVA_HOME", "").strip()
+    if java_home:
+        lib_paths = [str(Path(java_home) / "lib"), str(Path(java_home) / "lib" / "server")]
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([*lib_paths, existing]) if existing else ":".join(lib_paths)
+        env["PATH"] = f"{Path(java_home) / 'bin'}:{env.get('PATH', '')}"
     try:
         result = subprocess.run(
             ["java", "-jar", str(jar_path), "--in", "smi", "--out", "wurcs", smiles],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            env=env,
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:

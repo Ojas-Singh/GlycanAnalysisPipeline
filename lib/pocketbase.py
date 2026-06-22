@@ -46,6 +46,7 @@ class PocketBaseClient:
         self._cache_by_id: Dict[str, Any] = {}
         self._cache_by_name: Dict[str, Any] = {}
         self._glycan_cache_by_id: Dict[str, Any] = {}
+        self._prefetched_collections = set()
 
     def is_configured(self) -> bool:
         """Check if PocketBase URL and token are set."""
@@ -91,8 +92,12 @@ class PocketBaseClient:
         if collection == GLYCAN_COLLECTION:
             if gs_id in self._glycan_cache_by_id:
                 return self._glycan_cache_by_id[gs_id]
+            if collection in self._prefetched_collections:
+                return None
         elif gs_id in self._cache_by_id:
             return self._cache_by_id[gs_id]
+        elif collection in self._prefetched_collections:
+            return None
         data = self.request(
             "get",
             f"/api/collections/{collection}/records",
@@ -116,6 +121,8 @@ class PocketBaseClient:
         """Fetch a record by glycam_name, with in-memory cache."""
         if glycam_name in self._cache_by_name:
             return self._cache_by_name[glycam_name]
+        if collection in self._prefetched_collections:
+            return None
         data = self.request(
             "get",
             f"/api/collections/{collection}/records",
@@ -151,6 +158,7 @@ class PocketBaseClient:
             if page >= data.get("totalPages", 1):
                 break
             page += 1
+        self._prefetched_collections.add(collection)
         logger.info("Prefetched %d PocketBase records", total_loaded)
 
     def clear_cache(self):
@@ -158,6 +166,7 @@ class PocketBaseClient:
         self._cache_by_id.clear()
         self._cache_by_name.clear()
         self._glycan_cache_by_id.clear()
+        self._prefetched_collections.clear()
         self._available = None
 
     def upsert_glycan_metadata(self, payload: Dict[str, Any]) -> Optional[dict]:

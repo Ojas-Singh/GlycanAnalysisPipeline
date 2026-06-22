@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/opc/GlycanAnalysisPipeline
-Environment=HOME=/home/opc
-Environment=PATH=/home/opc/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/home/opc/GlycanAnalysisPipeline/boot-run.sh
+WorkingDirectory=/scratch/os1e24/GlycanAnalysisPipeline
+Environment=HOME=/scratch/os1e24
+Environment=PATH=/scratch/os1e24/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/scratch/os1e24/GlycanAnalysisPipeline/boot-run.sh
 StandardOutput=journal
 StandardError=journal
 RemainAfterExit=yes

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Union, BinaryIO, TextIO, Optional
 from urllib.parse import urlparse
 import requests
+from lib import config
 
 logger = logging.getLogger(__name__)
 
@@ -320,34 +321,69 @@ class OracleStorageBackend(StorageBackend):
     
     def list_files(self, path: Union[str, Path], pattern: str = "*") -> list:
         """List objects under a given prefix. Returns a list of object paths (as Path)."""
+        return self.list_files_paginated(path, pattern)
+
+    def list_files_paginated(self, path: Union[str, Path], pattern: str = "*") -> list:
+        """List all objects under a prefix, following Oracle pagination markers."""
         path_str = str(path).replace('\\', '/').rstrip('/')
         prefix = f"{path_str}/" if path_str else ""
         url = f"{self.par_url}/"
+        names = []
+        next_marker = None
         try:
-            response = self._request("get", url, params={"prefix": prefix, "limit": 1000}, timeout=15)
-            if response.status_code != 200:
-                return []
-
-            # Prefer JSON (Oracle native API)
-            try:
-                data = response.json()
-                objs = data.get("objects") or data.get("Objects") or []
-                names = []
-                for obj in objs:
-                    if isinstance(obj, dict):
-                        name = obj.get("name") or obj.get("key") or obj.get("Key")
-                        if name:
-                            names.append(name)
-                return [Path(n) for n in names]
-            except ValueError:
-                # Fallback to XML (S3-compatible API)
-                try:
-                    import xml.etree.ElementTree as ET
-                    root = ET.fromstring(response.text)
-                    names = [el.text for el in root.findall('.//{*}Contents/{*}Key') if el.text]
-                    return [Path(n) for n in names]
-                except Exception:
+            while True:
+                params = {"prefix": prefix, "limit": 1000}
+                if next_marker:
+                    params.update({
+                        "start": next_marker,
+                        "startAfter": next_marker,
+                        "continuation-token": next_marker,
+                        "marker": next_marker,
+                    })
+                response = self._request("get", url, params=params, timeout=15)
+                if response.status_code != 200:
                     return []
+
+                next_marker = None
+                try:
+                    data = response.json()
+                    objs = data.get("objects") or data.get("Objects") or []
+                    for obj in objs:
+                        if isinstance(obj, dict):
+                            name = obj.get("name") or obj.get("key") or obj.get("Key")
+                            if name:
+                                names.append(name)
+                    next_marker = (
+                        data.get("nextStartWith")
+                        or data.get("NextStartWith")
+                        or data.get("nextMarker")
+                        or data.get("NextMarker")
+                        or data.get("nextContinuationToken")
+                        or data.get("NextContinuationToken")
+                    )
+                except ValueError:
+                    # Fallback to XML (S3-compatible API)
+                    next_marker = None
+                    page_names = []
+                    try:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(response.text)
+                        page_names = [el.text for el in root.findall('.//{*}Contents/{*}Key') if el.text]
+                        names.extend(page_names)
+                        is_truncated = root.find('.//{*}IsTruncated')
+                        if is_truncated is not None and is_truncated.text and is_truncated.text.lower() == 'true':
+                            token_el = root.find('.//{*}NextContinuationToken')
+                            marker_el = root.find('.//{*}NextMarker')
+                            token = token_el.text if token_el is not None else None
+                            marker = marker_el.text if marker_el is not None else None
+                            next_marker = token or marker or (page_names[-1] if page_names else None)
+                    except Exception:
+                        return []
+
+                if not next_marker:
+                    break
+
+            return [Path(n) for n in names]
         except Exception as e:
             logger.error(f"Failed to list files in {path}: {e}")
             return []
@@ -721,6 +757,13 @@ class StorageManager:
                 return []
         return self.backend.list_files(path, pattern)
 
+    def list_files_paginated(self, path: Union[str, Path], pattern: str = "*", base_dir: Optional[Union[str, Path]] = None) -> list:
+        """List all files under a directory/prefix when the backend supports pagination."""
+        path = self._wrap_path(path, base_dir)
+        if self._is_oracle and hasattr(self.backend, "list_files_paginated"):
+            return self.backend.list_files_paginated(path, pattern)
+        return self.list_files(path, pattern)
+
     def list_dirs(self, path: Union[str, Path], base_dir: Optional[Union[str, Path]] = None) -> list:
         """List immediate subdirectories for the given path.
 
@@ -860,10 +903,7 @@ class StorageManager:
             except Exception as exc:
                 return ("failed", lpath, rpath, str(exc))
 
-        max_workers = 1
-        if upload_jobs:
-            cpu_count = os.cpu_count() or 4
-            max_workers = max(1, min(8, cpu_count))
+        max_workers = max(1, int(getattr(config, "upload_workers", 1)))
         if isinstance(self.backend, OracleStorageBackend) and len(upload_jobs) > 1 and max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {executor.submit(_upload_one, job): job for job in upload_jobs}

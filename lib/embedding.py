@@ -7,6 +7,7 @@ each frame.
 """
 
 from __future__ import annotations
+import lib.config as config
 from lib.storage import get_storage_manager
 
 from typing import Optional
@@ -79,8 +80,7 @@ import time
 
 def _default_parallel_jobs() -> int:
 	"""Return a bounded default worker count for wall-clock oriented runs."""
-	cpu_total = os.cpu_count() or 1
-	return max(1, min(8, cpu_total - 1 if cpu_total > 1 else 1))
+	return max(1, int(getattr(config, "max_workers", 1)))
 
 
 def _path_exists(path: str) -> bool:
@@ -522,7 +522,7 @@ def create_cluster_info(labels: np.ndarray, pca_df: pl.DataFrame, n_clusters: in
 						grid = GridSearchCV(
 							KernelDensity(kernel='gaussian'),
 							{'bandwidth': np.linspace(0.1, 1.0, 30)},
-							cv=min(5, len(cluster_data_scaled)), n_jobs=-1
+							cv=min(5, len(cluster_data_scaled)), n_jobs=_default_parallel_jobs()
 						)
 						grid.fit(cluster_data_scaled)
 						bandwidth = float(grid.best_params_['bandwidth'])
@@ -1499,4 +1499,3 @@ __all__ = [
 	"knn_conformational_entropy",
 	"_read_csv_robust",
 ]
-

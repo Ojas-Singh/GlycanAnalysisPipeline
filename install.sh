@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 resolve_log_path() {
     if [[ -n "$GLYCOSHAPE_GAP_LOG" ]]; then
         printf '%s\n' "$GLYCOSHAPE_GAP_LOG"
@@ -32,26 +35,78 @@ resolve_log_path() {
 
 LOG_PATH="$(resolve_log_path)"
 mkdir -p "$(dirname "$LOG_PATH")"
-exec > >(tee "$LOG_PATH") 2>&1
+if [[ "${GLYCOSHAPE_NO_TEE:-}" != "1" ]]; then
+    exec > >(tee "$LOG_PATH") 2>&1
+fi
 
 # GlycanAnalysisPipeline Installation Script
 # Uses Python 3.10 and uv for dependency management
 
 # Parse command line arguments
 RUN_MODE=false
+BACKGROUND_MODE=false
+MAIN_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --run)
             RUN_MODE=true
             shift
             ;;
+        --background|--nohup)
+            BACKGROUND_MODE=true
+            shift
+            ;;
+        --)
+            shift
+            MAIN_ARGS=("$@")
+            break
+            ;;
         *)
             echo "Unknown option $1"
-            echo "Usage: $0 [--run]"
+            echo "Usage: $0 [--run] [--background|--nohup] [-- <main.py args>]"
             exit 1
             ;;
     esac
 done
+
+if [[ "$BACKGROUND_MODE" == true ]]; then
+    PID_PATH="$(dirname "$LOG_PATH")/GlycoShape_GAP.pid"
+    RUNNER_PATH="$(dirname "$LOG_PATH")/GlycoShape_GAP.run.sh"
+    CHILD_ARGS=()
+    if [[ "$RUN_MODE" == true ]]; then
+        CHILD_ARGS+=("--run")
+    fi
+    if [[ ${#MAIN_ARGS[@]} -gt 0 ]]; then
+        CHILD_ARGS+=("--" "${MAIN_ARGS[@]}")
+    fi
+
+    : > "$LOG_PATH"
+    {
+        echo "#!/bin/bash"
+        printf 'cd %q\n' "$SCRIPT_DIR"
+        echo "export GLYCOSHAPE_NO_TEE=1"
+        printf 'exec /bin/bash %q' "$SCRIPT_DIR/install.sh"
+        for arg in "${CHILD_ARGS[@]}"; do
+            printf ' %q' "$arg"
+        done
+        printf '\n'
+    } > "$RUNNER_PATH"
+    chmod +x "$RUNNER_PATH"
+
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid "$RUNNER_PATH" >> "$LOG_PATH" 2>&1 &
+    else
+        nohup "$RUNNER_PATH" >> "$LOG_PATH" 2>&1 &
+    fi
+    bg_pid=$!
+    disown "$bg_pid" 2>/dev/null || true
+    printf '%s\n' "$bg_pid" > "$PID_PATH"
+    echo "Started GlycanAnalysisPipeline in background."
+    echo "PID: $bg_pid"
+    echo "PID file: $PID_PATH"
+    echo "Log: $LOG_PATH"
+    exit 0
+fi
 
 # Fix uv installation issues
 export UV_LINK_MODE=copy
@@ -209,62 +264,101 @@ echo "Virtual environment created at .venv"
 
 # Ensure Java is installed (required for running java -jar tools)
 echo "Checking Java installation..."
+export_java_env() {
+    local java_home="$1"
+    export JAVA_HOME="$java_home"
+    export PATH="$JAVA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$JAVA_HOME/lib:$JAVA_HOME/lib/server:${LD_LIBRARY_PATH:-}"
+}
+
+java_works() {
+    local java_bin="$1"
+    [[ -x "$java_bin" ]] && "$java_bin" -version >/dev/null 2>&1
+}
+
 ensure_java() {
     if command -v java >/dev/null 2>&1; then
-        echo "Java detected: $(java -version 2>&1 | head -n 1)"
-        return 0
-    fi
-
-    echo "Java not found. Attempting to install OpenJDK 17 (LTS)..."
-
-    run_install() {
-        # forward all args to the package manager command
-        if command -v sudo >/dev/null 2>&1; then
-            sudo "$@"
+        if [[ -z "${JAVA_HOME:-}" ]]; then
+            local detected_java_bin
+            detected_java_bin="$(command -v java)"
+            if [[ -n "$detected_java_bin" ]]; then
+                detected_java_bin="$(readlink -f "$detected_java_bin" 2>/dev/null || echo "$detected_java_bin")"
+                if [[ "$detected_java_bin" == */bin/java ]]; then
+                    export_java_env "$(cd "$(dirname "$detected_java_bin")/.." && pwd)"
+                fi
+            fi
         else
-            "$@"
+            export_java_env "$JAVA_HOME"
         fi
-    }
-
-    if command -v dnf >/dev/null 2>&1; then
-        # Oracle Linux / RHEL 8/9
-        if ! run_install dnf -y install java-17-openjdk-headless; then
-            echo "Falling back to OpenJDK 11..."
-            run_install dnf -y install java-11-openjdk-headless
+        if java -version >/dev/null 2>&1; then
+            echo "Java detected: $(java -version 2>&1 | head -n 1)"
+            return 0
         fi
-    elif command -v yum >/dev/null 2>&1; then
-        if ! run_install yum -y install java-17-openjdk-headless; then
-            echo "Falling back to OpenJDK 11..."
-            run_install yum -y install java-11-openjdk-headless
-        fi
-    elif command -ve apt-get >/dev/null 2>&1; then
-        run_install apt-get update
-        if ! run_install apt-get -y install openjdk-17-jre-headless; then
-            echo "Falling back to OpenJDK 11..."
-            run_install apt-get -y install openjdk-11-jre-headless
-        fi
-    elif command -v zypper >/dev/null 2>&1; then
-        run_install zypper --non-interactive install java-17-openjdk
-    elif command -v pacman >/dev/null 2>&1; then
-        run_install pacman -Sy --noconfirm jre-openjdk
-    else
-        echo "ERROR: Could not detect a supported package manager to install Java. Please install Java 11+ manually."
-        return 1
+        echo "Detected Java is unusable; installing a local JRE"
     fi
 
-    if command -v java >/dev/null 2>&1; then
-        echo "Java installed: $(java -version 2>&1 | head -n 1)"
-        # Set JAVA_HOME for this session
-        JAVA_BIN=$(readlink -f "$(command -v java)")
-        JAVA_HOME=$(dirname "$(dirname "$JAVA_BIN")")
-        export JAVA_HOME
-        export PATH="$JAVA_HOME/bin:$PATH"
-        echo "JAVA_HOME set to: $JAVA_HOME"
+    local default_java_home="$SCRIPT_DIR/.java"
+    local java_home="${JAVA_HOME:-$default_java_home}"
+    local java_bin="$java_home/bin/java"
+
+    if [[ ! -x "$java_bin" && "$java_home" == "$default_java_home" ]]; then
+        local discovered_java_bin
+        discovered_java_bin="$(find "$default_java_home" -mindepth 2 -maxdepth 3 -path '*/bin/java' -type f -perm -u+x 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$discovered_java_bin" ]]; then
+            java_home="$(cd "$(dirname "$discovered_java_bin")/.." && pwd)"
+            java_bin="$discovered_java_bin"
+        fi
+    fi
+
+    if java_works "$java_bin"; then
+        export_java_env "$java_home"
+        echo "Using locally installed Java at $JAVA_HOME"
         return 0
-    else
-        echo "ERROR: Java installation appears to have failed."
-        return 1
+    elif [[ -x "$java_bin" && "$java_home" == "$default_java_home"* ]]; then
+        echo "Removing incomplete local Java installation at $java_home"
+        rm -rf "$default_java_home"
+        java_home="$default_java_home"
+        java_bin="$java_home/bin/java"
     fi
+
+    if [[ -n "$JAVA_HOME" && ! -w "$java_home" ]]; then
+        echo "Configured JAVA_HOME=$java_home is not writable; falling back to $default_java_home"
+        java_home="$default_java_home"
+        java_bin="$java_home/bin/java"
+    fi
+
+    echo "Java not found. Installing a local JRE under $java_home without sudo..."
+    rm -rf "$java_home"
+    mkdir -p "$java_home"
+    export JAVA_HOME="$java_home"
+
+    local installed_java_home
+    installed_java_home="$(python - <<'PY'
+import os
+import sys
+import ssl
+
+try:
+    import jdk  # type: ignore
+except Exception as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+java_home = os.environ["JAVA_HOME"]
+ssl._create_default_https_context = ssl._create_unverified_context
+installed = jdk.install("17", jre=True, path=java_home)
+print(installed)
+PY
+)"
+
+    if [[ -n "$installed_java_home" && -x "$installed_java_home/bin/java" ]]; then
+        export_java_env "$installed_java_home"
+        echo "Local Java installation ready: $(java -version 2>&1 | head -n 1)"
+        return 0
+    fi
+
+    echo "ERROR: Local Java installation failed."
+    return 1
 }
 
 ensure_java
@@ -310,42 +404,6 @@ load_dotenv() {
 
 # Load .env file if present
 load_dotenv
-
-request_instance_poweroff() {
-    echo "POWEROFF=true detected. Requesting instance shutdown..."
-
-    run_power_command() {
-        if command -v sudo >/dev/null 2>&1 && [[ "$EUID" -ne 0 ]]; then
-            sudo "$@"
-        else
-            "$@"
-        fi
-    }
-
-    if command -v systemctl >/dev/null 2>&1; then
-        echo "Using systemctl poweroff..."
-        run_power_command systemctl poweroff
-        return 0
-    fi
-
-    if command -v shutdown >/dev/null 2>&1; then
-        echo "Using shutdown -h now..."
-        run_power_command shutdown -h now
-        return 0
-    fi
-
-    if command -v oci >/dev/null 2>&1; then
-        echo "Falling back to OCI SOFTSTOP..."
-        oci compute instance action \
-          --instance-id "$(curl -fsS -H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id)" \
-          --action SOFTSTOP \
-          --auth instance_principal
-        return 0
-    fi
-
-    echo "No supported poweroff method found."
-    return 1
-}
 
 # Check if environment variables are set
 echo "Checking environment variables..."
@@ -403,21 +461,14 @@ echo "Running main.py to verify installation..."
 echo "This may take some time depending on your data..."
 
 # Run main.py and capture output
-if python main.py; then
+if python main.py "${MAIN_ARGS[@]}"; then
     echo ""
     echo "✓ Installation verification successful!"
     echo "The pipeline ran successfully."
     echo ""
     echo "To run the pipeline again in the future:"
     echo "1. Activate environment: source .venv/bin/activate"
-    echo "2. Run: python main.py"
-    
-    # Check for POWEROFF environment variable
-    if [[ "${POWEROFF,,}" == "true" ]]; then
-        if ! request_instance_poweroff; then
-            echo "Automatic shutdown failed."
-        fi
-    fi
+    echo "2. Run: python main.py ${MAIN_ARGS[*]}"
 else
     echo ""
     echo "✗ Pipeline run completed with errors."

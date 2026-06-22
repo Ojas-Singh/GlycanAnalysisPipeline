@@ -59,9 +59,39 @@ except Exception:
     # Non-fatal: if loading .env fails, continue with existing environment
     pass
 
+
+def _int_env(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+# Login-node/resource configuration. These values keep the same pipeline
+# methods while bounding local CPU fan-out and in-memory frame buffering.
+max_workers = _int_env("GLYCOSHAPE_MAX_WORKERS", 1)
+store_frames_buffer = _int_env("GLYCOSHAPE_STORE_FRAMES_BUFFER", 128)
+store_frame_chunk = _int_env("GLYCOSHAPE_STORE_FRAME_CHUNK", store_frames_buffer)
+upload_workers = _int_env("GLYCOSHAPE_UPLOAD_WORKERS", 1)
+
+for thread_var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(thread_var, str(max_workers))
+
 # Storage configuration
 # Oracle Cloud Object Storage PAR URL (optional - if provided, uses cloud storage)
 oracle_par_url = os.environ.get("GLYCOSHAPE_ORACLE_PAR_URL")
+oracle_process_prefix = os.environ.get("GLYCOSHAPE_ORACLE_PROCESS_PREFIX", "process").strip() or "process"
+oracle_output_prefix = os.environ.get("GLYCOSHAPE_ORACLE_OUTPUT_PREFIX", "static").strip() or "static"
 
 # Determine storage mode
 use_oracle_storage = oracle_par_url is not None and oracle_par_url.strip() != ""
@@ -97,9 +127,9 @@ if use_oracle_storage:
     # Oracle Cloud Object Storage mode
     # Paths in Oracle mode are subfolders within the bucket
     data_dir = os.environ.get("GLYCOSHAPE_DATA_DIR", "data")
-    process_dir = os.environ.get("GLYCOSHAPE_PROCESS_DIR", "process") 
+    process_dir = os.environ.get("GLYCOSHAPE_PROCESS_DIR", str(base_dir / "process"))
     output_dir = _resolve_oracle_local_output_dir()
-    rdf_path = os.environ.get("GLYCOSHAPE_RDF_DIR", "rdf")
+    rdf_path = os.environ.get("GLYCOSHAPE_RDF_DIR", str(base_dir / "GLYCOSHAPE_RDF"))
     inventory_path = os.environ.get("GLYCOSHAPE_INVENTORY_PATH", "GlycoShape_Inventory.csv")
 else:
     # Local file system mode (existing functionality)
@@ -152,11 +182,17 @@ def get_storage_info() -> dict:
     return {
         "storage_mode": "oracle" if use_oracle_storage else "local",
         "oracle_par_url": oracle_par_url if use_oracle_storage else None,
+        "oracle_process_prefix": oracle_process_prefix if use_oracle_storage else None,
+        "oracle_output_prefix": oracle_output_prefix if use_oracle_storage else None,
         "data_dir": str(data_dir),
         "process_dir": str(process_dir), 
         "output_dir": str(output_dir),
         "rdf_path": str(rdf_path),
-        "inventory_path": str(inventory_path)
+        "inventory_path": str(inventory_path),
+        "max_workers": max_workers,
+        "store_frames_buffer": store_frames_buffer,
+        "store_frame_chunk": store_frame_chunk,
+        "upload_workers": upload_workers,
     }
 
 

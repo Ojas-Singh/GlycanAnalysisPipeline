@@ -336,8 +336,8 @@ def step_store(name: str, frame_data_dir: str, pdb_path: str, mol2_path: str, fo
         frame_data_dir,
         get_connectivity=parse_mol2_bonds(mol2_path),
         connectivity_kind="serial",
-        frames_buffer=1024,
-        frame_chunk=1024,
+        frames_buffer=config.store_frames_buffer,
+        frame_chunk=config.store_frame_chunk,
     )
 
 

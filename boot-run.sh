@@ -2,5 +2,5 @@
 
 set -euo pipefail
 
-cd /home/opc/GlycanAnalysisPipeline
+cd "$(dirname "$0")"
 exec /bin/bash ./install.sh --run

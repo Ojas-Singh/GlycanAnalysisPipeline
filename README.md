@@ -42,66 +42,73 @@ If you prefer manual installation:
 Before running the pipeline, ensure the following environment variables are set up.
 
 ```bash
-export GLYCOSHAPE_DATA_DIR=/path/to/glycoshape/data
-export GLYCOSHAPE_PROCESS_DIR=/path/to/glycoshape/process_dir
-export GLYCOSHAPE_OUTPUT_DIR=/path/to/glycoshape/final_database
+export GLYCOSHAPE_ORACLE_PAR_URL=https://object-storage-par-url/
+export GLYCOSHAPE_ORACLE_PROCESS_PREFIX=process
+export GLYCOSHAPE_ORACLE_OUTPUT_PREFIX=static
+export GLYCOSHAPE_DATA_DIR=data
+export GLYCOSHAPE_PROCESS_DIR=/scratch/os1e24/GlycanAnalysisPipeline/process
+export GLYCOSHAPE_OUTPUT_DIR=/scratch/os1e24/GlycanAnalysisPipeline/static
 export GLYCOSHAPE_INVENTORY_PATH=/path/to/glycoshape/inventory
 export GLYCOSHAPE_DB_UPDATE=True
 export GLYTOUCAN_CONTRIBUTOR_ID=your_contributor_id
 export GLYTOUCAN_API_KEY=your_api_key
-export GLYCOSHAPE_RDF_DIR=/path/to/glycoshape/rdf
+export GLYCOSHAPE_RDF_DIR=/scratch/os1e24/GlycanAnalysisPipeline/GLYCOSHAPE_RDF
+export GLYCOSHAPE_GAP_LOG=/scratch/os1e24/GlycanAnalysisPipeline/logs/GlycoShape_GAP.log
+export GLYCOSHAPE_MAX_WORKERS=1
+export GLYCOSHAPE_UPLOAD_WORKERS=1
+export GLYCOSHAPE_STORE_FRAMES_BUFFER=128
+export GLYCOSHAPE_STORE_FRAME_CHUNK=128
 export POCKETBASE_URL=http://localhost:8090
 export POCKETBASE_TOKEN=your_pocketbase_token
 ```
 
 Ensure the required directories and files exist, or modify the paths as needed.
 
+With `GLYCOSHAPE_ORACLE_PAR_URL` set, the pipeline reads input data from the bucket `data` prefix, stages process files locally under `process/`, writes final static files locally under `static/`, and uploads generated artifacts back to the bucket `process/` and `static/` prefixes. The serving machine should mirror the bucket `static/` prefix independently; this pipeline no longer assumes the serving instance can directly read `GLYCOSHAPE_OUTPUT_DIR`.
+
+For the current login-node limits, keep worker fan-out low. The defaults in `.env` use one worker and smaller frame buffers so PCA, clustering, and uploads run without changing the analysis methods.
+
 When `POCKETBASE_URL` and either `POCKETBASE_TOKEN` or `POCKETBASE_ADMIN_TOKEN` are set, the pipeline uses PocketBase `glycan_submission` records as the submission metadata source for `glystatic` and related metadata helpers. The CSV inventory remains the fallback when PocketBase is unset, unavailable, or missing a record.
 
 ## Running 🚀
 
 ```bash
-python main.py
-```
-or
-
-Run using install.sh as it will save log in last_run.log
-```bash
-./install.sh --run
+python main.py --mode incremental
 ```
 
-## Boot Autostart
+Run modes:
 
-To run the pipeline automatically on system boot with `systemd`:
+- `incremental` (default): new or incomplete glycans run fully; completed glycans skip v2/process/glystatic and only sync static locally when needed.
+- `refresh-static`: completed glycans sync static locally and refresh metadata without process downloads.
+- `fresh`: recomputes v2 and glystatic even when bucket outputs already exist. `--update` is kept as an alias for this mode.
 
-```bash
-chmod +x /home/opc/GlycanAnalysisPipeline/boot-run.sh
-sudo install -D -m 0644 /home/opc/GlycanAnalysisPipeline/systemd/glycan-analysis-pipeline.service /etc/systemd/system/glycan-analysis-pipeline.service
-sudo systemctl daemon-reload
-sudo systemctl enable glycan-analysis-pipeline.service
-```
+## Login Node Run
 
-The service runs `./install.sh --run` as the `opc` user after networking is available.
-
-If `POWEROFF=true` is set in `.env`, the instance will power off after a successful pipeline run.
-
-To disable boot autostart later:
+Run from the checkout on the login node:
 
 ```bash
-sudo systemctl disable glycan-analysis-pipeline.service
-sudo rm -f /etc/systemd/system/glycan-analysis-pipeline.service
-sudo systemctl daemon-reload
+cd /scratch/os1e24/GlycanAnalysisPipeline
+./install.sh --run -- --mode incremental
 ```
+
+To run and safely close SSH:
+
+```bash
+./install.sh --run --background -- --mode incremental
+tail -f logs/GlycoShape_GAP.log
+```
+
+The background launcher writes the process ID to `logs/GlycoShape_GAP.pid`. The old automatic poweroff behavior has been removed.
 
 ## SPARQL Endpoint 🕸️
 
 ```bash
 
-# Set or override the RDF folder (defaults to GLYCOSHAPE_OUTPUT_PATH/GLYCOSHAPE_RDF)
+# Set or override the RDF folder (defaults to GLYCOSHAPE_OUTPUT_DIR/GLYCOSHAPE_RDF)
 export GLYCOSHAPE_RDF_DIR="${GLYCOSHAPE_RDF_DIR:-${GLYCOSHAPE_OUTPUT_DIR}/GLYCOSHAPE_RDF}"
 
 # Load and serve the RDF dataset
-oxigraph load --location "$GLYCOSHAPE_RDF_DIR" --file "$GLYCOSHAPE_OUTPUT_PATH/GLYCOSHAPE_RDF.ttl"
+oxigraph load --location "$GLYCOSHAPE_RDF_DIR" --file "$GLYCOSHAPE_OUTPUT_DIR/GLYCOSHAPE_RDF.ttl"
 oxigraph serve --location "$GLYCOSHAPE_RDF_DIR"
 ```
 
