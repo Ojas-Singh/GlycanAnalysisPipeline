@@ -9,6 +9,7 @@ Provides:
 
 import os
 import logging
+import time
 from typing import Optional, Dict, Any, List
 
 import requests
@@ -47,6 +48,13 @@ class PocketBaseClient:
         self._cache_by_name: Dict[str, Any] = {}
         self._glycan_cache_by_id: Dict[str, Any] = {}
         self._prefetched_collections = set()
+        self.timeout = float(os.environ.get("POCKETBASE_TIMEOUT", "30"))
+        self.retries = max(1, int(os.environ.get("POCKETBASE_RETRIES", "3")))
+        self.retry_backoff = float(os.environ.get("POCKETBASE_RETRY_BACKOFF", "1.5"))
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def is_configured(self) -> bool:
         """Check if PocketBase URL and token are set."""
@@ -60,7 +68,7 @@ class PocketBaseClient:
             self._available = False
             return False
         try:
-            resp = requests.get(f"{self.base_url}/api/health", timeout=5)
+            resp = self.session.get(f"{self.base_url}/api/health", timeout=5)
             self._available = resp.status_code == 200
         except Exception:
             self._available = False
@@ -77,7 +85,45 @@ class PocketBaseClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
-        resp = requests.request(method, url, headers=headers, timeout=15, **kwargs)
+        method_lower = method.lower()
+        retryable_method = method_lower in {"get", "patch", "put", "delete"}
+        retryable_errors = (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        )
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                resp = self.session.request(method, url, headers=headers, timeout=self.timeout, **kwargs)
+                if resp.status_code >= 500 and retryable_method and attempt < self.retries:
+                    logger.warning(
+                        "PocketBase %s %s returned %s; retrying %d/%d",
+                        method_lower.upper(),
+                        path,
+                        resp.status_code,
+                        attempt + 1,
+                        self.retries,
+                    )
+                    time.sleep(self.retry_backoff * attempt)
+                    continue
+                break
+            except retryable_errors as exc:
+                last_error = exc
+                if not retryable_method or attempt >= self.retries:
+                    raise
+                logger.warning(
+                    "PocketBase %s %s failed with %s; retrying %d/%d",
+                    method_lower.upper(),
+                    path,
+                    exc,
+                    attempt + 1,
+                    self.retries,
+                )
+                time.sleep(self.retry_backoff * attempt)
+        else:
+            raise RuntimeError(f"PocketBase request failed: {last_error}")
+
         if resp.status_code >= 400:
             raise RuntimeError(f"PocketBase {resp.status_code}: {resp.text[:300]}")
         return resp.json()

@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Dict, List, Set, Optional, Union
 import re
+from lib import name_utils
 from lib.storage import get_storage_manager
 
 logging.basicConfig(level=logging.INFO)
@@ -580,6 +581,63 @@ class GlycanMetadataProcessor:
         except Exception as e:
             self.logger.warning(f"Failed to upsert glycan metadata for {glycoshape_id}: {e}")
 
+    @staticmethod
+    def _has_value(value) -> bool:
+        text = str(value or "").strip()
+        return bool(text and text.lower() != "null")
+
+    def _repair_missing_glytoucan_ids(self, data: Dict, source_name: str) -> Dict[str, int]:
+        """Fill missing GlyTouCan IDs from existing WURCS values when available."""
+        stats = {
+            "checked": 0,
+            "resolved": 0,
+            "still_missing": 0,
+            "lookup_failed": 0,
+        }
+
+        for entry_type in ("archetype", "alpha", "beta"):
+            entry = data.get(entry_type, {})
+            if not isinstance(entry, dict):
+                continue
+
+            wurcs = str(entry.get("wurcs") or "").strip()
+            if not wurcs or wurcs.lower() == "null":
+                continue
+            if self._has_value(entry.get("glytoucan")):
+                continue
+
+            stats["checked"] += 1
+            try:
+                glytoucan_id = name_utils.wurcs2glytoucan(wurcs)
+            except Exception as exc:
+                stats["lookup_failed"] += 1
+                stats["still_missing"] += 1
+                self.logger.warning(
+                    f"Failed to resolve GlyTouCan ID for {source_name} ({entry_type}): {exc}"
+                )
+                continue
+
+            if self._has_value(glytoucan_id):
+                entry["glytoucan"] = str(glytoucan_id).strip()
+                stats["resolved"] += 1
+                self.logger.info(
+                    f"Resolved GlyTouCan ID for {source_name} ({entry_type}): {entry['glytoucan']}"
+                )
+            else:
+                stats["still_missing"] += 1
+
+        if stats["checked"]:
+            self.logger.info(
+                "GlyTouCan repair for %s: checked=%d, resolved=%d, still_missing=%d, lookup_failed=%d",
+                source_name,
+                stats["checked"],
+                stats["resolved"],
+                stats["still_missing"],
+                stats["lookup_failed"],
+            )
+
+        return stats
+
     def update_glycan_metadata(self, json_file_path: Union[str, Path]) -> bool:
         """Update search metadata for a single glycan JSON file.
         
@@ -606,6 +664,9 @@ class GlycanMetadataProcessor:
             # Get archetype IUPAC for keyword generation
             archetype = data.get("archetype", {})
             iupac_string = archetype.get("iupac")
+
+            # Repair GlyTouCan IDs that may have appeared after static JSON generation.
+            self._repair_missing_glytoucan_ids(data, json_file_path.name)
             
             # Update keywords
             if iupac_string:

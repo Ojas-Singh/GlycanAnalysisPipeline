@@ -575,6 +575,38 @@ class GlycanPipelineRunner:
         logger.info(f"Synchronized Oracle static output for {glycan_name}: {remote_key} -> {local_dir}")
         return str(local_dir)
 
+    def _local_static_output_dir_for_refresh(self, output_dir: str, glycan_name: str) -> str:
+        """Return a local static directory suitable for refresh-static metadata writes."""
+        if not config.use_oracle_storage:
+            return output_dir
+
+        normalized = self._normalize_storage_key(output_dir)
+        if normalized.startswith(f"{self._remote_output_base()}/"):
+            synced = self._sync_remote_static_output_to_local(normalized, glycan_name, force=False)
+            if synced:
+                self._cache_static_output_dir(glycan_name, synced)
+                return synced
+
+        self._cache_static_output_dir(glycan_name, output_dir)
+        return output_dir
+
+    def _upload_local_static_output_if_oracle(self, output_dir: str, glycan_name: str) -> None:
+        """Upload a repaired local GS static directory back to Oracle storage."""
+        if not config.use_oracle_storage:
+            return
+
+        local_dir = Path(str(output_dir))
+        if not local_dir.exists() or not (local_dir / "data.json").exists():
+            logger.debug(f"Skipping Oracle static upload for {glycan_name}; local data.json not found in {local_dir}")
+            return
+
+        remote_prefix = f"{self._remote_output_base()}/{local_dir.name}"
+        try:
+            self.storage.upload_dir(local_dir, remote_prefix, skip_existing=False)
+            logger.info(f"Uploaded refreshed static output to Oracle for {glycan_name}: {remote_prefix}")
+        except Exception as exc:
+            logger.warning(f"Failed to upload refreshed static output for {glycan_name}: {exc}")
+
     def _sync_all_remote_static_to_local(self) -> None:
         """Mirror all remote static GS folders locally for database-wide finalization."""
         if not config.use_oracle_storage:
@@ -596,7 +628,7 @@ class GlycanPipelineRunner:
             archetype = data.get("archetype", {}) if isinstance(data, dict) else {}
             if isinstance(archetype, dict):
                 glycan_name = str(archetype.get("name") or archetype.get("glycam") or "").strip()
-            local_dir = self._sync_remote_static_output_to_local(key, glycan_name or Path(key).name, force=True)
+            local_dir = self._sync_remote_static_output_to_local(key, glycan_name or Path(key).name, force=self.mode != "refresh-static")
             if local_dir:
                 synced += 1
                 if glycan_name:
@@ -1490,6 +1522,7 @@ class GlycanPipelineRunner:
             if candidate_dir is None:
                 logger.error(f"data.json not found for {glycan_name}")
                 return False
+            candidate_dir = self._local_static_output_dir_for_refresh(candidate_dir, glycan_name)
             self._cache_static_output_dir(glycan_name, candidate_dir)
             json_path = f"{candidate_dir}/data.json"
                 
@@ -1497,6 +1530,7 @@ class GlycanPipelineRunner:
             success = self.metadata_processor.update_glycan_metadata(json_path)
             
             if success:
+                self._upload_local_static_output_if_oracle(candidate_dir, glycan_name)
                 logger.info(f"Successfully completed glymeta for {glycan_name}")
             else:
                 logger.error(f"Glymeta processing failed for {glycan_name}")
@@ -1533,7 +1567,10 @@ class GlycanPipelineRunner:
 
         try:
             if not self.force_update:
-                fast_output_dir = self._fast_completed_output_dir(glycan_name, sync_static=False)
+                fast_output_dir = self._fast_completed_output_dir(
+                    glycan_name,
+                    sync_static=self.mode == "refresh-static",
+                )
                 if fast_output_dir is not None:
                     fast_skipped = True
                     results["v2"] = True

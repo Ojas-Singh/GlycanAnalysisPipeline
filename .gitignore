@@ -4,6 +4,9 @@ __pycache__/
 .vscode
 .venv/
 tests/
+!tests/
+tests/*
+!tests/test_glymeta_glytoucan_repair.py
 env/
 dummy_database_process/
 dummy_database_static/
