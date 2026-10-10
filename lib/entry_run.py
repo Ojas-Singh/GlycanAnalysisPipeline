@@ -255,12 +255,15 @@ def describe_input(entry_dir: Path, verify: bool = True) -> Dict[str, Any]:
 
     try:
         inputs = archive.source_inputs(entry_dir)
-        glycam_name, origin, _ = archive.resolve_glycam_name(entry_dir)
     except archive.ArchiveError as exc:
         raise EntryError(
             f"{entry_dir} is neither an archive entry (manifest.json and trajectory.xtc) "
             f"nor a simulation.pdb folder: {exc}"
         ) from exc
+    try:
+        glycam_name, origin, _ = archive.resolve_glycam_name(entry_dir)
+    except archive.ArchiveError as exc:
+        raise EntryError(f"{entry_dir}: {exc}") from exc
     files = {}
     for key in ("pdb", "mol2", "info", "name"):
         path = inputs.get(key)
@@ -291,7 +294,11 @@ def _previous_result(output_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def claim_output(output_dir: Path) -> Optional[Dict[str, Any]]:
-    """The output folder must be new, empty, or hold an earlier result of this tool."""
+    """The output folder must be new, empty, or hold an earlier result of this tool.
+
+    Returns the earlier result, if any. Nothing is created here: the folder
+    is made once the input has been accepted.
+    """
     if output_dir.exists() and not output_dir.is_dir():
         raise EntryError(f"output path is not a folder: {output_dir}")
     previous = _previous_result(output_dir)
@@ -302,7 +309,6 @@ def claim_output(output_dir: Path) -> Optional[Dict[str, Any]]:
             f"output folder {output_dir} is not empty and holds no {RESULT_FILE} of this tool; "
             "choose a new folder (process/, static/ and input/ in it would be replaced)"
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
     return previous
 
 
@@ -488,6 +494,7 @@ def run_entry(
 
     # Everything below is recomputed from the input: an unfinished or
     # outdated result is removed rather than mixed with the new one.
+    output_dir.mkdir(parents=True, exist_ok=True)
     for stale in (process_root, static_dir, output_dir / "input"):
         if stale.exists():
             shutil.rmtree(stale)

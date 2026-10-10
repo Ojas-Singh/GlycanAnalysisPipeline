@@ -251,6 +251,7 @@ def test_output_folder_must_be_new_empty_or_an_earlier_result(inputs, tmp_path, 
     assert "neither an archive entry" in capsys.readouterr().err
     assert entry_run.main([str(inputs["archive"]), str(tmp_path / "out"), "--workers", "1", "--levels", "1,3"]) == 2
     assert "cluster levels must be 1,2 or 1,2,3" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()                # a refused input leaves no result folder behind
 
 
 def test_archive_entry_that_does_not_match_its_manifest_is_refused(inputs, tmp_path, capsys):
@@ -261,7 +262,7 @@ def test_archive_entry_that_does_not_match_its_manifest_is_refused(inputs, tmp_p
     (damaged / "trajectory.xtc").write_bytes(bytes(content))
     assert entry_run.main([str(damaged), str(tmp_path / "out"), "--workers", "1"]) == 2
     assert "trajectory.xtc does not have the SHA-256 of the manifest" in capsys.readouterr().err
-    assert not (tmp_path / "out" / "process").exists()
+    assert not (tmp_path / "out").exists()
 
     (damaged / "trajectory.xtc").write_bytes(bytes(content[:-100]))
     assert entry_run.main([str(damaged), str(tmp_path / "out"), "--workers", "1", "--no-verify-input"]) == 2
