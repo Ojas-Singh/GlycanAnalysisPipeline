@@ -2342,6 +2342,9 @@ class GlycanAnalysisPipeline:
         # Always prefer its explicit name.json metadata, even if the directory
         # itself happens to end in "-OH".
         json_path = os.path.join(input_glycan_dir, "name.json")
+        # An archive entry (lib/archive.py) carries its GLYCAM name in the
+        # manifest and its frames in trajectory.xtc; the store step reads both.
+        archive_inputs = archive.entry_inputs(input_glycan_dir)
         try:
             storage = get_storage_manager()
             with storage.open(json_path, 'r') as f:
@@ -2350,7 +2353,8 @@ class GlycanAnalysisPipeline:
             if not glycam_name:
                 raise ValueError("indexOrderedSequence is empty")
         except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
-            self.logger.warning(f"Could not read a GLYCAM name from {json_path}, using directory name")
+            if archive_inputs is None:
+                self.logger.warning(f"Could not read a GLYCAM name from {json_path}, using directory name")
             glycam_name = glycan_name
         
         # Resolve input file names, supporting alternate names used in Oracle bucket
@@ -2363,9 +2367,6 @@ class GlycanAnalysisPipeline:
         pdb_path = default_pdb if storage.exists(default_pdb) else (alt_pdb if storage.exists(alt_pdb) else default_pdb)
         mol2_path = default_mol2 if storage.exists(default_mol2) else (alt_mol2 if storage.exists(alt_mol2) else default_mol2)
 
-        # An archive entry (lib/archive.py) carries its GLYCAM name in the
-        # manifest and its frames in trajectory.xtc; the store step reads both.
-        archive_inputs = archive.entry_inputs(input_glycan_dir)
         if archive_inputs is not None:
             glycam_name = archive_inputs["glycam_name"]
             pdb_path = archive_inputs["trajectory_path"]

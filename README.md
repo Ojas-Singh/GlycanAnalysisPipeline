@@ -112,7 +112,7 @@ Run modes:
 - `incremental` (default): new or incomplete glycans run fully; completed glycans skip v2/process/glystatic and only sync static locally when needed.
 - `refresh-static`: completed glycans sync static locally and refresh metadata without process downloads.
 - `fresh`: recomputes v2 and glystatic even when bucket outputs already exist. `--update` is kept as an alias for this mode except when `--mode process-only` or `--mode static-only` is explicitly selected.
-- `process-only`: runs local `data/` to local `process/` only, skips glystatic/glymeta/PocketBase/Oracle upload/finalization, and is suitable for Slurm nodes without internet access.
+- `process-only`: runs local `data/` to local `process/` only, skips glystatic/glymeta/PocketBase/Oracle upload/finalization, and is suitable for Slurm nodes without internet access. For a single entry with a self-contained result folder see [One entry on a compute node](#one-entry-on-a-compute-node).
 - `static-only`: rebuilds local `static/` from existing local `process/` outputs, skips already complete GS folders unless `--update` is passed, skips v2/process and Oracle sync/upload, runs glymeta best-effort for rebuilt glycans, and refreshes final database artifacts.
 
 ### Clustering levels
@@ -210,6 +210,93 @@ The login-node scripts are deliberately scoped as follows:
 - `scripts/upload_static_to_oracle.py`: local `static/` → Oracle `static/` only.
 
 Source directory names under `data/` are opaque storage keys and need not be GLYCAM names. When present, `data/<storage-key>/name.json` supplies the authoritative `indexOrderedSequence` used by processing. Use `scripts/upload_data_to_oracle.py --glycan <storage-key> --file name.json` to publish a corrected mapping without re-uploading a simulation PDB.
+
+## One entry on a compute node
+
+After a simulation job has written its trajectories, the same job can analyse
+them on its node, without network access and without any service (no
+PocketBase, no GlyTouCan or format services, no object storage):
+
+```bash
+.venv/bin/python scripts/run_entry.py <entry> <result-folder> [--workers N] [--levels 1,2] [--force]
+```
+
+`<entry>` is an archive entry (`manifest.json`, `trajectory.xtc`,
+`topology.pdb`, `structure.mol2`) or a folder with `simulation.pdb` and
+`structure.mol2`. The files of an archive entry are checked against the sizes
+and SHA-256 of its manifest first (`--no-verify-input` checks sizes only). The
+worker count is `--workers`, else `SLURM_CPUS_PER_TASK`, else
+`GLYCOSHAPE_MAX_WORKERS`, else the cores the process may run on; it sets the
+BLAS/OpenMP threads and the worker processes of the run, whatever the job
+environment says. In a job script:
+
+```bash
+#SBATCH --cpus-per-task=64
+...                                             # the simulation and the conversion to an archive entry
+"$GAP/.venv/bin/python" "$GAP/scripts/run_entry.py" "$ARCHIVE/$FOLDER" "$RESULTS/$FOLDER" || exit 1
+```
+
+`slurm/run_entry_amd.sh` runs it as a job of its own. Exit status: `0` done,
+`1` the analysis failed (the step and the message are printed, and are in
+`result.json` and `run.log`), `2` the input or the result folder cannot be
+used (message printed; nothing is computed).
+
+The result folder is self-contained:
+
+```
+<result-folder>/
+  result.json           status; input (kind, path, atoms, frames, size and SHA-256 of every file; for an
+                        archive entry these are the hashes of its manifest, with the SHA-256 of the
+                        coordinates and of the source simulation.pdb); pipeline (commit, SHA-256 of the
+                        sources, package versions); settings (levels, workers, thresholds); seconds per step;
+                        frame-quality summary (frames read, kept, rejected, bonds recovered); analysis summary
+                        (entropy, clusters, sizes and representative frames per level); size and SHA-256 of
+                        every file produced; what is left to publishing
+  run.log               the log of the run
+  input/                manifest.json, info.json, name.json of the entry (the small files, not the trajectory)
+  process/<folder>/     the processed data: data/, embedding/, output/ exactly as in process/<glycan>/
+  static/               the part of static/GSxxxxx/ that follows from the trajectory alone:
+    output/info.json, torparts.npz
+    output/pca.csv, torsion_glycosidic.csv, torsion_all.csv, torsion_level_1_reps.csv, torsion_level_2_reps.csv
+    output/level_1/, level_2/     dist.svg, GLYCAM/alpha.pdb, GLYCAM/beta.pdb, PDB/alpha.pdb, PDB/beta.pdb
+    landscape/pca_model.joblib, landscape_metadata.json, preprocessing.npz
+```
+
+`result.json` has status `running` while the run is in progress, so a job that
+is killed leaves a folder that says so. Running the command again on a result
+folder returns at once when the result is current (same input files, levels,
+bond threshold and code); otherwise `process/`, `static/` and `input/` in it
+are replaced, never completed. A folder that is not empty and holds no
+`result.json` of this tool is refused.
+
+Deliberately left to publishing, because it needs identifiers, submission
+metadata or the network:
+
+- the GlycoShape ID and with it the folder name `static/GSxxxxx`;
+- `data.json` (names, IUPAC, WURCS, GlyTouCan accessions, composition, motifs,
+  simulation metadata), `glygen.json`, `glycosmos.json`, `snfg.svg`;
+- the GlycoShape `REMARK` block with the GlyTouCan ID and the IUPAC name at
+  the top of the PDB files: the files in `static/output/level_*/` are exactly
+  the published files without that block (their first line is `REMARK
+  GLYCAN MULTI-MODEL PDB ...`);
+- `GLYCOSHAPE.json`, `GlycoShape.zip`, `GLYCOSHAPE_RDF.ttl`,
+  `sync_manifest.json`, and any upload.
+
+Publishing can start from either half of the result: run the static stage on
+the processed data (`python main.py --mode static-only --process-dir
+<result-folder>/process ...`, which writes the same files plus the ones
+above), or copy `static/` to `static/GSxxxxx/` and add the files above.
+`lib/static_ready.py` is the single implementation of the shared files; the
+static stage calls it. The static stage takes the GLYCAM name from the name of
+the process folder, which for an archive entry with a long name is the
+shortened folder name: the name to publish under is `glycam_name` in
+`result.json`.
+
+The analysis of one entry needs memory for one matrix of 8 bytes x frames x
+atom pairs of the PCA landscape (pairs of the heavy atoms outside the reducing
+`ROH`, at most 300 atoms): 18.8 GB for the 159,940 retained frames of a
+329-atom glycan (172 such atoms, 14,706 pairs), 0.8 GB for 50,005 frames of a
+97-atom one (62 atoms, 1,891 pairs). Everything else is small next to it.
 
 ## Raw trajectory archive
 
