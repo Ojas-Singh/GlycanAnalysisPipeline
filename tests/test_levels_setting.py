@@ -293,6 +293,55 @@ def test_legacy_csv_table_is_copied_without_other_levels(tmp_path):
     assert (tmp_path / "static" / "torsion_all.csv").read_bytes() == (folder / "output" / "torsion_all.csv").read_bytes()
 
 
+def test_csv_for_levels():
+    content = (b'frame,phi,level_1_cluster,level_1_center,level_3_cluster,level_3_center,"odd,name"\n'
+               b'0,-65.31234,2,,417,,x\n1,1e-05,0,0,3,3,"a,b"\n')
+    assert static_ready.csv_other_level_columns(content, (1, 2)) == ["level_3_cluster", "level_3_center"]
+    assert static_ready.csv_other_level_columns(content.split(b"\n", 1)[0], (1, 2)) == ["level_3_cluster", "level_3_center"]
+    assert static_ready.csv_other_level_columns(content, (1, 2, 3)) == []
+    reduced = static_ready.csv_for_levels(content, (1, 2))
+    assert reduced == b'frame,phi,level_1_cluster,level_1_center,"odd,name"\n0,-65.31234,2,,x\n1,1e-05,0,0,"a,b"\n'
+    assert static_ready.csv_for_levels(content, (1, 2, 3)) is content           # nothing to leave out: the same bytes
+    assert static_ready.csv_for_levels(reduced, (1, 2)) is reduced
+    with cluster_levels((1, 2)):                                                # the configured levels by default
+        assert static_ready.csv_for_levels(content) == reduced
+    with cluster_levels((1, 2, 3)):
+        assert static_ready.csv_for_levels(content) is content and static_ready.csv_other_level_columns(content) == []
+
+
+def test_info_json_for_levels():
+    info = {"entropy_nats": 1.5, "levels": [{"level": 1, "n": 5}, {"level": 2, "n": 9}, {"level": 3, "n": 512}],
+            "pca": {"main_clustering": {"H_nats": 1e-05}, "level_3_clustering": {"selected_n_clusters": 512}}}
+    content = json.dumps(info).encode()                                         # in any formatting
+    reduced = static_ready.info_json_for_levels(content, (1, 2))
+    assert reduced == json.dumps(static_ready.filter_info_levels(info, (1, 2))[0], indent=2).encode()
+    assert b"level_3" not in reduced and json.loads(reduced)["pca"] == {"main_clustering": {"H_nats": 1e-05}}
+    assert static_ready.info_json_for_levels(content, (1, 2, 3)) is content     # nothing to leave out: the same bytes
+    assert static_ready.info_json_for_levels(reduced, (1, 2)) is reduced
+    with cluster_levels((1, 2)):
+        assert static_ready.info_json_for_levels(content) == reduced
+    with cluster_levels((1, 2, 3)):
+        assert static_ready.info_json_for_levels(content) is content
+    with pytest.raises(ValueError):
+        static_ready.info_json_for_levels(b'{"levels": [', (1, 2))
+
+
+def test_the_writer_of_data_json_is_shared_with_the_static_stage(tmp_path):
+    import numpy as np
+
+    from lib import glystatic
+
+    assert glystatic.save_glycan_data is static_ready.save_glycan_data
+    data = {"archetype": {"ID": "GS00042", "mass": np.float64(180.06), "rot_bonds": np.int64(3), "name": "µ"},
+            "search_meta": {"keywords": []}}
+    static_ready.save_glycan_data(data, str(tmp_path / "GS00042"), "data")
+    written = (tmp_path / "GS00042" / "data.json").read_bytes()
+    assert written == json.dumps({"archetype": {"ID": "GS00042", "mass": 180.06, "rot_bonds": 3, "name": "µ"},
+                                  "search_meta": {"keywords": []}}, indent=4, ensure_ascii=False).encode("utf-8")
+    static_ready.save_glycan_data(json.loads(written), str(tmp_path / "again"), "data")     # what was read is written back
+    assert (tmp_path / "again" / "data.json").read_bytes() == written
+
+
 class OfflineNames:
     """lib.name_utils without its web services: what the static stage gets when nothing resolves."""
 
@@ -369,6 +418,48 @@ def test_static_stage_keeps_level_3_when_configured(runs, tmp_path):
     assert {"output/level_3/GLYCAM/alpha.pdb", "output/level_3/PDB/beta.pdb", "output/torsion_level_3_reps.csv"} <= names
     assert sorted(json.loads((static / "data.json").read_text())["archetype"]["cluster_levels"]) == [
         "level_1", "level_2", "level_3"]
+
+
+@pytest.mark.parametrize("level_3_folder", ["present", "removed"])
+def test_dropping_level_3_from_a_static_folder_gives_the_static_stage_without_it(runs, tmp_path, level_3_folder):
+    """lib/static_levels.py on a static folder with Level 3 against the static stage with levels 1,2."""
+    from lib import static_levels
+
+    with cluster_levels((1, 2, 3)):
+        published = static_stage(runs["with_3"], tmp_path / "published")
+    with cluster_levels((1, 2)):
+        rebuilt = static_stage(runs["with_3"], tmp_path / "rebuilt")           # from the same process folder
+        from_new = static_stage(runs["default"], tmp_path / "from_new")        # from one made without Level 3
+    assert len(files_of(published)) == 30 and len(files_of(rebuilt)) == 24
+    if level_3_folder == "removed":
+        shutil.rmtree(published / "output" / "level_3")
+    before = {name: (content, (published / name).stat().st_mtime_ns) for name, content in files_of(published).items()}
+
+    report = static_levels.drop_levels(
+        tmp_path / "published", tmp_path / "reduced", levels=(1, 2), finalize=False, log=lambda message: None)
+    assert report["ok"], report["error"]
+    reduced = files_of(tmp_path / "reduced" / "GS00042")
+    assert reduced == files_of(rebuilt)                                        # byte for byte, the same 24 files
+    record = report["glycans"]["GS00042"]
+    assert record["rewritten"] == ["data.json", "output/info.json", "output/torsion_all.csv"]
+    assert len(record["kept"]) == 21 and len(record["dropped"]) == (6 if level_3_folder == "present" else 1)
+    assert before == {name: (content, (published / name).stat().st_mtime_ns) for name, content in files_of(published).items()}
+
+    new = files_of(from_new)
+    assert sorted(new) == sorted(reduced)
+    for name in new:
+        if name.endswith("dist.svg"):                                          # ids are salted per figure
+            assert comparable_svg(reduced[name]) == comparable_svg(new[name]), name
+        else:
+            assert reduced[name] == new[name], name
+
+    # then the root files: the folder is complete for the pipeline and accepted by the publisher
+    report = static_levels.drop_levels(tmp_path / "published", tmp_path / "reduced", levels=(1, 2), log=lambda message: None)
+    assert report["ok"] and report["finalized"] and report["totals"]["skipped"] == 1
+    assert report["root"]["checks"]["manifest"]["accepted_by_the_publisher"]
+    final = files_of(tmp_path / "reduced" / "GS00042")
+    assert {name: content for name, content in final.items() if name != "GS00042.zip"} == reduced
+    assert json.loads(files_of(tmp_path / "reduced")["GLYCOSHAPE.json"]) == {"GS00042": json.loads(reduced["data.json"])}
 
 
 def test_completeness_checks_of_the_runner_follow_the_setting(runs, tmp_path):

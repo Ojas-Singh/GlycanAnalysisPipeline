@@ -17,6 +17,10 @@ services (data.json, glygen.json, glycosmos.json, snfg.svg, the identifier
 REMARKs at the top of the PDB files). ``lib.glystatic.process_glycan`` writes
 those around a call to :func:`write_static_ready`; the one-entry mode
 (``lib.entry_run``) stops after it.
+
+``lib.static_levels`` reduces a published static folder to fewer levels with
+the same functions: :func:`info_json_for_levels`, :func:`csv_for_levels` and
+:func:`save_glycan_data`, the writer of ``data.json``.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Optional
 
+import numpy as np
 import pandas as pd
 
 from lib import config, glypdbio
@@ -98,6 +103,17 @@ def filter_info_levels(info: dict, levels: Optional[Iterable[int]] = None) -> tu
     return out, changed
 
 
+def info_json_for_levels(content: bytes, levels: Optional[Iterable[int]] = None) -> bytes:
+    """The bytes of a static ``info.json`` for the given levels, from one that may describe more.
+
+    An ``info.json`` that describes no other level is returned as it is;
+    otherwise it is reduced (:func:`filter_info_levels`) and written the way
+    the process stage writes it. Raises when ``content`` is not JSON.
+    """
+    info, changed = filter_info_levels(json.loads(content), levels)
+    return json.dumps(info, indent=2).encode("utf-8") if changed else content
+
+
 def load_info_json(folder_path) -> dict:
     """Load and parse the info.json file from the output directory."""
     storage = get_storage_manager()
@@ -160,6 +176,25 @@ def _csv_without_columns(content: bytes, dropped: set) -> bytes:
     return out.getvalue().encode("utf-8")
 
 
+def csv_other_level_columns(content: bytes, levels: Optional[Iterable[int]] = None) -> list:
+    """Cluster and center columns of other levels in the header of a CSV table.
+
+    Only the header is read, so the first block of a large file is enough.
+    """
+    header = next(csv.reader(io.StringIO(content[:1 << 20].decode("utf-8", errors="replace"))), [])
+    return _other_level_columns(header, configured_levels() if levels is None else levels)
+
+
+def csv_for_levels(content: bytes, levels: Optional[Iterable[int]] = None) -> bytes:
+    """The bytes of a static CSV table for the given levels, from one that may have more.
+
+    A table without cluster or center columns of other levels is returned as
+    it is; otherwise those columns are left out (:func:`_csv_without_columns`).
+    """
+    dropped = csv_other_level_columns(content, levels)
+    return _csv_without_columns(content, set(dropped)) if dropped else content
+
+
 def copy_or_convert_analysis_table(storage, folder_path: str, output_subdir: str, csv_name: str, parquet_name: str) -> bool:
     """Write a static CSV from a Parquet process export, falling back to legacy CSV copy.
 
@@ -185,10 +220,7 @@ def copy_or_convert_analysis_table(storage, folder_path: str, output_subdir: str
     if storage.exists(csv_src):
         content = storage.read_binary(csv_src)
         try:
-            header = next(csv.reader(io.StringIO(content[:1 << 20].decode("utf-8", errors="replace"))), [])
-            dropped = _other_level_columns(header, levels)
-            if dropped:
-                content = _csv_without_columns(content, set(dropped))
+            content = csv_for_levels(content, levels)
         except Exception as exc:
             logger.warning(f"Could not inspect the columns of {csv_src}: {exc}")
         storage.write_binary(csv_dst, content)
@@ -320,9 +352,7 @@ def copy_analysis_files(folder_path, final_output_dir: str, level_keys: Iterable
                 # An info.json that still describes other levels is reduced
                 # to the configured ones; otherwise it is copied as it is.
                 try:
-                    info, changed = filter_info_levels(json.loads(content))
-                    if changed:
-                        content = json.dumps(info, indent=2).encode("utf-8")
+                    content = info_json_for_levels(content)
                 except Exception as exc:
                     logger.warning(f"Could not reduce the levels of {src_file}: {exc}")
             storage.write_binary(f"{output_subdir}/{file_name}", content)
@@ -338,6 +368,40 @@ def copy_analysis_files(folder_path, final_output_dir: str, level_keys: Iterable
                 content = storage.read_binary(src_file)
                 storage.write_binary(f"{landscape_dst_dir}/{landscape_file}", content)
                 logger.info(f"Copied landscape file: {landscape_file}")
+
+
+def make_serializable(obj):
+    """Recursively convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: make_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_serializable(item) for item in obj]
+    else:
+        return obj
+
+
+def save_glycan_data(glycan_data: dict, output_dir, filename: str) -> None:
+    """Save glycan data as JSON file.
+
+    The writer of ``data.json``, ``glygen.json`` and ``glycosmos.json`` in the
+    static stage (``lib.glystatic.process_glycan``).
+    """
+    try:
+        storage = get_storage_manager()
+        storage.mkdir(output_dir)
+        output_file = f"{output_dir}/{filename}.json"
+        serializable_data = make_serializable(glycan_data)
+        with storage.open(output_file, 'w') as f:
+            json.dump(serializable_data, f, indent=4, ensure_ascii=False)
+        logger.info(f"Saved glycan data to {output_file}")
+
+    except Exception as e:
+        logger.error(f"Failed to save glycan data: {str(e)}")
+        raise
 
 
 def write_static_ready(folder_path, destination, glycam_name: str) -> dict:
