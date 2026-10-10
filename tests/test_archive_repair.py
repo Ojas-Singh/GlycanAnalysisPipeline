@@ -1,4 +1,4 @@
-"""Tests of the converter on damaged sources (``repair`` of lib/archive.py).
+"""Tests of the converter on damaged sources (``repair`` of lib/archive.py, ``--repair`` of the script).
 
 Every trajectory is synthetic and built in the test.  The damage is of the
 kinds found in the raw data: a frame that the file cuts short, in the middle
@@ -17,7 +17,7 @@ import pytest
 from lib import archive
 
 from test_archive import (
-    atom_line, atom_table, make_source, mol2_text, pdb_text, random_coords, read_xtc, snapshot)
+    atom_line, atom_table, make_source, mol2_text, pdb_text, random_coords, read_xtc, run_converter, snapshot)
 
 ATOMS = 12
 FRAMES = 30
@@ -913,6 +913,90 @@ def test_index_lists_repaired_entries(tmp_path):
         "truncated": False, "counts": {"incomplete_frame": 1}}
     assert records["DGalpa1-OH"]["repaired"]["truncated"] is True
     assert index["totals"]["frames"] == 2 * (FRAMES - 1) + 8
+
+
+# ---------------------------------------------------------------------------
+# Converter command line
+# ---------------------------------------------------------------------------
+def test_converter_cli_repairs_only_when_asked(tmp_path):
+    data, target = tmp_path / "data", tmp_path / "archive"
+    _, kept_middle = cut_source(tmp_path, "DGlcpa1-OH")
+    _, kept_end = cut_source(tmp_path, "DGalpa1-OH", at=FRAMES - 1, seed=1, info_json="DGalpa1-OH")
+    whole = random_coords(20, 14, seed=2)
+    make_source(data, "DManpa1-OH", whole)
+    coords, text = regular(seed=5)
+    header, frames, tail = split_frames(text)
+    make_source(data, "DAllpb1-OH", text=join(header, frames[:6] + [frames[6][:3] + frames[6][4:]] + frames[7:], tail))
+    before = snapshot(data)
+
+    # without the option: the regular entry is converted, the others fail and say what to do
+    run = run_converter("--data-dir", data, "--archive-dir", target, "--workers", 2)
+    assert run.returncode == 1
+    report = json.loads((target / "conversion_report.json").read_text())
+    assert report["counts"] == {"converted": 1, "skipped": 0, "failed": 3}
+    assert report["repair"] is False and report["repaired"] == []
+    reasons = {row["source_folder"]: row["reason"] for row in report["failed"]}
+    assert "with repair (--repair of the converter)" in reasons["DGlcpa1-OH"]
+    assert "the file is truncated; with repair (--repair of the converter)" in reasons["DGalpa1-OH"]
+    assert reasons["DAllpb1-OH"] == "frame 6 has 11 atoms, the first frame has 12"
+    plain = snapshot(target / "DManpa1-OH")
+    first_report = (target / "conversion_report.json").read_bytes()
+
+    # with it: the two cut sources are archived, the one that is wrong in another way still fails
+    other_report = tmp_path / "reports" / "repair.json"
+    other_report.parent.mkdir()
+    run = run_converter("--data-dir", data, "--archive-dir", target, "--workers", 2, "--repair", "--report", other_report)
+    assert run.returncode == 1 and snapshot(data) == before
+    assert (target / "conversion_report.json").read_bytes() == first_report       # --report: that one stays
+    report = json.loads(other_report.read_text())
+    assert report["counts"] == {"converted": 2, "skipped": 1, "failed": 1} and report["repair"] is True
+    assert [row["source_folder"] for row in report["failed"]] == ["DAllpb1-OH"]
+    assert snapshot(target / "DManpa1-OH") == plain
+    assert [(row["source_folder"], row["status"], row["frames"], row["frames_in_source"], row["frames_dropped"],
+             row["truncated"], row["counts"]) for row in report["repaired"]] == [
+        ("DGalpa1-OH", "converted", FRAMES - 1, FRAMES, 1, True, {"incomplete_frame": 1}),
+        ("DGlcpa1-OH", "converted", FRAMES - 1, FRAMES, 1, False, {"incomplete_frame": 1})]
+    assert all("repaired" in row for row in report["converted"])
+    assert run.stderr.count("REPAIRED ") == 2 and "REPAIRED DGlcpa1-OH (converted): 29 of 30 frames" in run.stderr
+    assert "2 of them repaired" in run.stdout and "REPAIRED: 29 of 30 frames of the source kept" in run.stdout
+
+    index = json.loads((target / "index.json").read_text())
+    assert index["entries"] == 3 and index["repaired"] == ["DGalpa1-OH", "DGlcpa1-OH"]
+    assert np.array_equal(archive.ArchiveEntry(target / "DGlcpa1-OH").read_frames(unit="milliangstrom"), kept_middle)
+    assert np.array_equal(archive.ArchiveEntry(target / "DGalpa1-OH").read_frames(unit="milliangstrom"), kept_end)
+    assert np.array_equal(archive.ArchiveEntry(target / "DManpa1-OH").read_frames(unit="milliangstrom"), whole)
+    manifest = json.loads((target / "DGalpa1-OH" / "manifest.json").read_text())
+    assert manifest["source_irregularities"]["truncated"] and "info.json" in manifest["files"]
+
+    # a second run skips the repaired entries, with the option or without, and still lists them
+    entries = snapshot(target / "DGlcpa1-OH")
+    for extra in (["--repair"], []):
+        run = run_converter("--data-dir", data, "--archive-dir", target, *extra)
+        report = json.loads((target / "conversion_report.json").read_text())
+        assert run.returncode == 1 and report["counts"] == {"converted": 0, "skipped": 3, "failed": 1}
+        assert [(row["source_folder"], row["status"]) for row in report["repaired"]] == [
+            ("DGalpa1-OH", "skipped"), ("DGlcpa1-OH", "skipped")]
+        assert snapshot(target / "DGlcpa1-OH") == entries
+        assert json.loads((target / "index.json").read_text())["repaired"] == ["DGalpa1-OH", "DGlcpa1-OH"]
+
+    # verification of the archive against the source reads each source as its manifest says
+    run = run_converter("--verify-only", "--data-dir", data, "--archive-dir", target, "--check-frames", -1)
+    assert run.returncode == 0, run.stdout + run.stderr
+    summary = json.loads((target / "verification_report.json").read_text())
+    assert (summary["entries"], summary["ok"], summary["failed"]) == (3, 3, [])
+    assert {row["folder"]: row.get("repaired", False) for row in summary["reports"]} == {
+        "DGalpa1-OH": True, "DGlcpa1-OH": True, "DManpa1-OH": False}
+    assert all(row["mismatched_coordinates"] == 0 for row in summary["reports"])
+
+    # --report moves the verification report too; it does not go into the source or a missing directory
+    stored = (target / "verification_report.json").read_bytes()
+    run = run_converter("--verify-only", "--archive-dir", target, "--report", other_report.with_name("verify.json"))
+    assert run.returncode == 0 and json.loads(other_report.with_name("verify.json").read_text())["ok"] == 3
+    assert (target / "verification_report.json").read_bytes() == stored
+    for place in (data / "report.json", data / "DManpa1-OH" / "report.json", tmp_path / "missing" / "report.json"):
+        run = run_converter("--data-dir", data, "--archive-dir", target, "--report", place)
+        assert run.returncode != 0 and "--report" in run.stderr and not place.exists()
+    assert snapshot(data) == before
 
 
 # ---------------------------------------------------------------------------
