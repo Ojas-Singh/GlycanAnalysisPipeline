@@ -4,6 +4,19 @@ Glycan conformations analysis pipeline for [GlycoShape Database](https://glycosh
 
 <img src="docs/Figure.jpg" alt="Schematic overview of Glycan Analysis Pipeline (GAP) used to build the GlycoShape Glycan Database (GDB). Panel a) Multiple uncorrelated replica molecular dynamics (MD) simulations are performed for each glycan in the GDB, to comprehensively sample its structural dynamics. The resulting MD frames are then transformed into a graph matrix representation, as depicted in Panel b), simplified by flattening the lower half as shown in Panel c). This step enables a dimensionality reduction via principal component analysis (PCA), shown in Panel d). These data are clustered by Gaussian Mixture Model (GMM) and the results of which are displayed in terms of cluster distributions, see Panel e). Panel f) Representative 3D structures for each cluster are selected based on KDE maxima, along with comprehensive torsion angle profiles for the highest populated clusters, showing the wide breadth of the conformational space covered by GAP. Panel g) Structures derived from GAP are clearly presented on the GlycoShape GDB web platform, in addition to biological and chemical information." style="zoom: 33%;" />
 
+## At a glance 🗺️
+
+GAP takes the trajectories of one glycan (all its simulations, dry) and produces a database entry: the conformational landscape (PCA), clusters at two levels of detail with their populations, representative structures (Level 1: the main conformers; Level 2: a finer coverage of the landscape), torsion statistics and the files the GlycoShape website serves.
+
+| Stage | What it does | Where it runs | Section |
+|---|---|---|---|
+| Raw archive | One entry per glycan, named by its GLYCAM name: `trajectory.xtc` at the precision of the source, `topology.pdb`, `structure.mol2`, `manifest.json` with checksums | Anywhere; object storage keeps it under `raw/<GLYCAM name>/` | [Raw trajectory archive](#raw-trajectory-archive) |
+| Analysis of one entry | Store, PCA, clustering, torsions, representative structures; a self-contained result folder with `result.json` | A compute node, without network | [One entry on a compute node](#one-entry-on-a-compute-node) |
+| Whole-database runs | The same analysis over a data directory, then the static folder with identifiers and metadata | Login node and Slurm array | [Running](#running-), [Staged Oracle/Slurm workflow](#staged-oracleslurm-workflow) |
+| Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
+
+Level 3 (a coverage set of up to 512 structures) is no longer produced by default; `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3` brings it back, and folders that still contain it are accepted.
+
 ## Installation 💻
 
 The pipeline uses Python 3.10 and uv (a fast Python package manager) for dependency management.
