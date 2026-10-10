@@ -192,14 +192,20 @@ The raw data can be kept in a compact archive instead of multi-model PDB text. O
 
 - **Coordinates are exact.** They go from the PDB columns to the XTC as integers of 0.001 Å, so the archive holds the digits of the source; `-0.000` is stored as `0.000` and counted in the manifest. Step and time of a frame are its index from 0 (the source has no times). The box of each frame is the `CRYST1` in force at that frame, so a file made of several runs written one after the other keeps the box of each run, and the manifest lists the frame at which each starts (as it does for `END` and other records found between frames). The 1 × 1 × 1 Å placeholder cell that PDB writers emit when there is no box is recorded in the manifest and `topology.pdb` but not written as a box.
 - **Names.** An entry is identified by its full GLYCAM name: `glycam_name` in the manifest and the index, and `raw/<GLYCAM name>/` as object-storage key prefix (`lib.archive.object_key_prefix`). The name comes from `name.json` when the source folder has one, from `info.json` when the folder is named by a GlyTouCan ID, and is the folder name otherwise. `<folder>` is the GLYCAM name when that is a usable directory name (at most 255 bytes, no `/`); otherwise it is the first 200 bytes of the name, `~`, and the first 16 hex digits of the SHA-256 of the name (`lib.archive.entry_folder_name`). Always read the name from `manifest.json`, not from the folder.
+- **Names from outside.** `--names FILE` gives the converter a JSON object of source folder name to GLYCAM name, for example `{"G60371DN": "DNeup5Aca2-3[...]DGlcpNAcb1-OH"}` for a folder whose `info.json` spells the name differently. Such a name takes precedence over `name.json`, `info.json` and the folder name, and the manifest records `"glycam_name_from": "names-file"` (a different name in `name.json` or `info.json` is listed under `warnings`). A folder that is not under `--data-dir` is an error. If the same source folder was converted before under another name, that entry stays and the run ends with a non-zero status (`SUPERSEDED ...` on stderr, `superseded` in the report, and the index reports two entries for one source folder); add `--remove-superseded` to delete it once the new entry is in place. Pass the same `--names` to `--verify-only --data-dir`; without it the name of such an entry is not compared with the source (`glycam_name_checked` is false in the report) and everything else is.
 - **Verification.** Before an entry gets its final name the XTC is read back and every coordinate is compared with the source text; `manifest.json` records the number compared, the number that differ (always 0 for a published entry) and the largest difference in Å between the stored float and the decimal number of the text. A sample of frames (`--check-frames`, default 100) is also re-read from the source with plain `float()` as an independent check. A source that cannot be represented is not converted and is listed in the report: a frame with another atom count or other atom records, a truncated file, a coordinate that the XTC does not return exactly (possible only from 5120 Å on).
 
 ```bash
 # Convert (resumable: entries whose manifest verifies are skipped; the source is only read)
 .venv/bin/python scripts/convert_data_to_archive.py --data-dir data --archive-dir archive --workers 8
 
+# Give a source folder its GLYCAM name from outside and drop the entry it had under the old name
+.venv/bin/python scripts/convert_data_to_archive.py --data-dir data --archive-dir archive \
+  --glycan G60371DN --names names.json --remove-superseded
+
 # One 64-core AMD node; DATA_DIR and ARCHIVE_DIR are at the top of the script.
 # VERIFY=1 runs the verification below instead, with every frame re-read from the source.
+# NAMES_FILE=names.json passes --names.
 mkdir -p logs/slurm && sbatch slurm/convert_data_to_archive_amd.sh
 
 # Verify an archive: files against manifests, and with --data-dir every coordinate against the source
@@ -207,6 +213,87 @@ mkdir -p logs/slurm && sbatch slurm/convert_data_to_archive_amd.sh
 ```
 
 The pipeline reads either layout: point `--data-dir` at the archive and the store step streams frames from `trajectory.xtc` (`lib.glystore.store_from_archive`) with the same result as from `simulation.pdb`; folders with `simulation.pdb` keep working. Archive entries are read from the local filesystem only. In Python, `lib.archive.ArchiveEntry(path).iter_frames(chunk=1024)` yields `(frames, atoms, 3)` float32 arrays in Å, and `lib.archive.verify_entry(path, source_dir)` checks one entry. The XTC is written with MDTraj (`mdtraj==1.10.3` in `requirements.txt`); an existing `.venv` needs `uv pip install -r requirements.txt` once.
+
+## S3 storage (Cloudflare R2)
+
+`GLYCOSHAPE_STORAGE=s3` selects S3-compatible object storage instead of the Oracle PAR bucket. Without it nothing changes: Oracle when `GLYCOSHAPE_ORACLE_PAR_URL` is set, local folders otherwise. `GLYCOSHAPE_STORAGE=local` forces local folders. Put the settings in the environment or in `.env` (not committed); the secret goes to the client only and is never logged. The client is `boto3` (pinned in `requirements.txt`; an existing `.venv` needs `uv pip install -r requirements.txt` once; it adds four packages, 16 MB to download and 31 MB installed, nearly all of it `botocore`).
+
+| Variable | Default | |
+|---|---|---|
+| `GLYCOSHAPE_STORAGE` | unset | `s3`, `oracle` or `local` |
+| `GLYCOSHAPE_S3_ENDPOINT` | required | `https://<account id>.r2.cloudflarestorage.com` |
+| `GLYCOSHAPE_S3_ACCESS_KEY_ID`, `GLYCOSHAPE_S3_SECRET_ACCESS_KEY` | required | an R2 API token that may read and write objects in the buckets below |
+| `GLYCOSHAPE_S3_REGION` | `auto` | |
+| `GLYCOSHAPE_S3_ADDRESSING_STYLE` | `path` | `path`, `virtual` or `auto` |
+| `GLYCOSHAPE_S3_RAW_BUCKET`, `GLYCOSHAPE_S3_RAW_PREFIX` | `glycoshape-archive`, `raw` | archive entries `raw/<GLYCAM name>/...` and `raw/index.json` |
+| `GLYCOSHAPE_S3_PROCESS_BUCKET`, `GLYCOSHAPE_S3_PROCESS_PREFIX` | `glycoshape-archive`, `process` | kept for `process/<GLYCAM name>/...`; no command uploads there yet |
+| `GLYCOSHAPE_S3_STATIC_BUCKET`, `GLYCOSHAPE_S3_STATIC_PREFIX` | `glycoshape-database`, `static` | the published static database |
+| `GLYCOSHAPE_S3_STAGING_PREFIX` | `publish-staging` | in the static bucket, outside the static prefix: where changed files wait during a publish |
+| `GLYCOSHAPE_S3_MAX_ATTEMPTS` | `8` | attempts per request; connection errors, throttling (HTTP 429 included) and 5xx answers are retried with exponential backoff and jitter |
+| `GLYCOSHAPE_S3_MULTIPART_THRESHOLD_MB`, `GLYCOSHAPE_S3_MULTIPART_CHUNK_MB` | `64`, `32` | a larger file is uploaded in parts of this size |
+| `GLYCOSHAPE_S3_TRANSFER_CONCURRENCY` | `4` | parts of one file in transfer at the same time |
+| `GLYCOSHAPE_S3_CHECKSUMS` | `when_required` | `when_supported` lets the client add a CRC32 to every upload, where the service accepts that |
+
+Every object is uploaded with its SHA-256 as metadata (`x-amz-meta-sha256`); "unchanged" below always means that the stored size and this value are those of the local manifest. Files are streamed, never read into memory.
+
+With S3 selected, `main.py` runs `--mode process-only` and `--mode static-only`, on local folders as always, and refuses the modes that read and publish through the storage layer. Use the staged workflow:
+
+```bash
+# Login node: raw entries -> data/ (all entries of raw/index.json, or --glycan '<GLYCAM name>'; repeatable)
+./scripts/run_staged_pipeline.sh download --workers 8
+
+# Login node: submit local data/ -> local process/, as for Oracle
+sbatch slurm/process_only_amd.sh
+
+# Login node, after every task succeeded: local process/ -> local static/, then publish what changed
+./scripts/run_staged_pipeline.sh publish
+.venv/bin/python scripts/static_s3.py check
+```
+
+`run_staged_pipeline.sh` (and `continue_rebuild_after_slurm.sh`, `publish_after_slurm.sh`) ask `lib/config.py` which storage is selected, so the same commands serve Oracle and S3; the compute-node jobs set `GLYCOSHAPE_STORAGE=local`.
+
+### Raw archive: `scripts/archive_s3.py`
+
+```bash
+# Upload an archive directory (the one convert_data_to_archive.py wrote, with its index.json)
+.venv/bin/python scripts/archive_s3.py upload --archive-dir archive --workers 8 --dry-run
+.venv/bin/python scripts/archive_s3.py upload --archive-dir archive --workers 8
+.venv/bin/python scripts/archive_s3.py compare --archive-dir archive        # listing against index.json, any time
+
+# Download: every entry of the stored index, or entries by GLYCAM name
+.venv/bin/python scripts/archive_s3.py download --archive-dir data --workers 8
+.venv/bin/python scripts/archive_s3.py download --archive-dir data --glycan 'DManpa1-2DManpa1-OH'
+```
+
+- **Keys.** `raw/<GLYCAM name>/<file>`, with the name of the entry's `manifest.json`, not of its local folder (which is shortened for long names). `--glycan` takes the GLYCAM name; for `upload` also the entry folder or the source folder.
+- **Upload.** A file is skipped when the stored object is unchanged, hashed before it is sent and refused when it is not what its manifest says. The files of an entry go first and its `manifest.json` last, and when a file of an entry that is already stored has to be replaced, the stored manifest is deleted first; so an entry with a manifest in the storage is complete. Afterwards the listing of `raw/` is compared with `index.json` (keys and sizes) and the stored manifest of every entry with the SHA-256 that the index records; `raw/index.json` is uploaded only when every entry of the index is there. The exit status is non-zero when one of the entries that were to be uploaded failed or is not complete in the storage. `index.json` has to describe the archive: run the converter again after changing an entry.
+- **Download.** Each file is downloaded into `data/.staging/`, hashed and compared with the manifest; the entry folder (`lib.archive.entry_folder_name`) appears only when all of it verified. Without `--glycan` the stored index says which entries there are and pins the manifest of each; an entry named with `--glycan` is verified against its own manifest only, so it can be fetched while the index is still the one of an earlier upload. The folder is an archive entry that `main.py --mode process-only --data-dir data --glycan <folder>` processes; the command prints it. An entry that is already there with the same manifest and whose files verify is skipped (`--trust-local` compares sizes instead of hashing them again). A folder that is not an archive entry is never written into.
+- **Resume** by running the same command again. `--report FILE` writes what was done as JSON. An interrupted multipart upload leaves parts in the bucket that the service removes after its lifecycle period (seven days by default on R2).
+
+### Static database: `scripts/static_s3.py`
+
+```bash
+.venv/bin/python scripts/static_s3.py publish --static-dir static --dry-run   # what would be sent
+.venv/bin/python scripts/static_s3.py publish --static-dir static --workers 16
+.venv/bin/python scripts/static_s3.py check              # read back as the website does: download and hash everything
+.venv/bin/python scripts/static_s3.py check --quick      # sizes and SHA-256 metadata only
+```
+
+The website reads `static/sync_manifest.json` and then downloads the files it lists, comparing size and SHA-256 of each; one mismatch or missing object fails its run (and leaves its own database alone). `publish` therefore sends only what `sync_manifest.json` lists, refuses a manifest the website would refuse (for example one that lists a hidden file) or that does not describe the local files, and works in this order:
+
+1. **New files** (no object under that key) are uploaded to their keys. No published manifest lists them, so no reader fetches them.
+2. **Changed files** are uploaded to `publish-staging/static/<SHA-256>`, outside the published prefix.
+3. Changed files are **copied inside the storage** from the staging prefix onto their keys.
+4. The listing is compared with the manifest and **`sync_manifest.json` is written last**, as one object.
+5. The staging objects are deleted; `--delete-stale` also deletes objects under `static/` that the manifest no longer lists (they are only counted otherwise).
+
+If the upload is interrupted in step 1 or 2, which is where the time goes, the published prefix is exactly what it was: the old manifest and every file it lists. Step 3 cannot be made invisible, because two objects cannot be replaced at once: from the first copy until the manifest is written, the published manifest describes files that have been replaced. A website that already has the published `global_hash` does nothing in that window; one that is behind fails its verification, keeps its database and retries. Run `publish` again after any interruption: it continues from what is stored. Without a published manifest (the first publish) there is no reader, and files are replaced in place.
+
+`publish` exits non-zero when it stopped, and also when the manifest was written but step 5 failed (it says which). `check` exits non-zero and lists the files that are missing or differ. `--quick` trusts the SHA-256 metadata, so it does not notice an object whose content was changed by other means; the full check does.
+
+### Tests
+
+`python -m pytest tests` runs the unit tests of the storage, the transfers and the publish order on an in-memory client. The integration tests need boto3 and a local S3-compatible server and are skipped without one: a MinIO container is started for the session when Docker has a MinIO image (it is removed afterwards and nothing is pulled), and the moto server when `moto[s3]`, `flask` and `flask-cors` are installed. MinIO refuses a key with a segment longer than 255 bytes, so the 267-character GLYCAM name is tested against moto. `GLYCOSHAPE_TEST_S3_ENDPOINT`, `GLYCOSHAPE_TEST_S3_ACCESS_KEY_ID` and `GLYCOSHAPE_TEST_S3_SECRET_ACCESS_KEY` name another throwaway server instead (see `tests/conftest.py`).
 
 ## Login Node Run
 

@@ -38,6 +38,7 @@ echo "----------------------------------------------------------------"
 export REPO_ROOT DATA_DIR PROCESS_DIR LOG_DIR VENV_PYTHON
 export FRAME_CHUNK FRAMES_BUFFER JOBS_PER_NODE SHARD_COUNT
 export GLYCOSHAPE_ORACLE_PAR_URL=""
+export GLYCOSHAPE_STORAGE=local
 export GLYCOSHAPE_MAX_WORKERS=1
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1

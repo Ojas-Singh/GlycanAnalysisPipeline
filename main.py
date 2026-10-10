@@ -2429,6 +2429,8 @@ def main():
 
     if args.mode in ("process-only", "static-only"):
         os.environ.pop("GLYCOSHAPE_ORACLE_PAR_URL", None)
+        os.environ["GLYCOSHAPE_STORAGE"] = "local"
+        config.storage_backend = "local"
         config.oracle_par_url = None
         config.use_oracle_storage = False
         config.data_dir = Path(args.data_dir or config.data_dir)
@@ -2445,6 +2447,15 @@ def main():
             logger.info("Process-only mode enabled: using local storage and skipping static/network phases")
         else:
             logger.info("Static-only mode enabled: using local storage and skipping v2/Oracle sync/upload")
+    elif config.storage_backend == "s3":
+        # The modes that read and publish through the storage layer know the
+        # Oracle layout only: raw archive entries are read from local folders,
+        # and static output must be published manifest-last (scripts/static_s3.py).
+        logger.error(
+            "GLYCOSHAPE_STORAGE=s3 supports --mode process-only and --mode static-only (local folders); "
+            "use scripts/run_staged_pipeline.sh download and publish to transfer"
+        )
+        sys.exit(2)
 
     # Initialize storage based on configuration
     if not config.initialize_storage():

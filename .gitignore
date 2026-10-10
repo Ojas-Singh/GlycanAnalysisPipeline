@@ -17,6 +17,13 @@ tests/*
 !tests/test_glystatic_output_safety.py
 !tests/test_archive.py
 !tests/test_archive_store.py
+!tests/conftest.py
+!tests/s3_fakes.py
+!tests/test_s3_storage.py
+!tests/test_archive_transfer.py
+!tests/test_static_publish.py
+!tests/test_s3_integration.py
+!tests/test_staged_workflow.py
 env/
 dummy_database_process/
 dummy_database_static/

@@ -4,6 +4,7 @@ Storage abstraction layer for local and Oracle Cloud Object Storage.
 Provides unified interface for file operations with support for:
 - Local file system (existing functionality)  
 - Oracle Cloud Object Storage via Pre-Authenticated Request (PAR) URLs
+- S3-compatible object storage such as Cloudflare R2 (GLYCOSHAPE_STORAGE=s3)
 - Fallback and compatibility between storage backends
 """
 
@@ -12,10 +13,16 @@ import io
 import json
 import tempfile
 import logging
+import fnmatch
+import hashlib
+import mimetypes
+import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Union, BinaryIO, TextIO, Optional
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Tuple, Union, BinaryIO, TextIO, Optional
 from urllib.parse import urlparse
 import requests
 from lib import config
@@ -567,6 +574,635 @@ class OracleBinaryBuffer(io.BytesIO):
         super().close()
 
 
+# ---------------------------------------------------------------------------
+# S3-compatible object storage (Cloudflare R2, MinIO, AWS S3)
+# ---------------------------------------------------------------------------
+#: User metadata key (``x-amz-meta-sha256``) that carries the SHA-256 of an
+#: object.  Transfers skip an object whose size and this value match.
+SHA256_METADATA_KEY = "sha256"
+#: Longest object key, in bytes of UTF-8, that S3 and R2 accept.
+S3_MAX_KEY_BYTES = 1024
+
+_TRANSIENT_ERROR_NAMES = frozenset({
+    "ConnectionError", "TimeoutError", "ReadTimeoutError", "ConnectTimeoutError",
+    "IncompleteRead", "IncompleteReadError", "ResponseStreamingError", "ProtocolError",
+})
+
+
+def file_sha256(path: Union[str, Path], chunk: int = 4 << 20) -> Tuple[int, str]:
+    """Size and SHA-256 (hexadecimal) of a local file, read in blocks."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(chunk), b""):
+            digest.update(block)
+            size += len(block)
+    return size, digest.hexdigest()
+
+
+def parallel_map(function: Callable[[Any], Any], items: Any, workers: int) -> Iterator[Any]:
+    """Results of ``function(item)`` on ``workers`` threads, in the order they complete.
+
+    An exception of a call is raised to the caller.  Calls that have not
+    started are cancelled then, and when the caller stops early (Ctrl-C);
+    the calls that are running are waited for, so nothing is still being
+    transferred when this returns or raises.
+    """
+    pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    try:
+        futures = [pool.submit(function, item) for item in items]
+        for future in as_completed(futures):
+            yield future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _content_type(key: str) -> str:
+    guessed, encoding = mimetypes.guess_type(key)
+    return guessed if guessed and not encoding else "application/octet-stream"
+
+
+def _s3_error(exc: BaseException) -> Tuple[str, int]:
+    """Error code and HTTP status of a client error, without importing the client library."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return "", 0
+    code = str((response.get("Error") or {}).get("Code") or "")
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0
+    return code, int(status)
+
+
+def _is_missing_object(exc: BaseException) -> bool:
+    code, status = _s3_error(exc)
+    return code in ("404", "NoSuchKey", "NotFound") or (status == 404 and code != "NoSuchBucket")
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """A connection that broke while a body was read (the client retries requests itself)."""
+    return bool(_TRANSIENT_ERROR_NAMES & {cls.__name__ for cls in type(exc).__mro__})
+
+
+def _keep_client_loggers_quiet() -> None:
+    """Keep the HTTP client libraries above DEBUG: their debug output shows request bodies and headers."""
+    for name in ("boto3", "botocore", "s3transfer", "urllib3"):
+        client_logger = logging.getLogger(name)
+        if client_logger.getEffectiveLevel() < logging.INFO:
+            client_logger.setLevel(logging.INFO)
+
+
+@dataclass(frozen=True)
+class S3Settings:
+    """Connection and bucket layout of the S3 storage (``GLYCOSHAPE_S3_*``).
+
+    The secret is kept out of ``repr()`` and is only handed to the client.
+    """
+
+    endpoint_url: str
+    access_key_id: str = field(repr=False)
+    secret_access_key: str = field(repr=False)
+    region: str = "auto"
+    addressing_style: str = "path"
+    raw_bucket: str = "glycoshape-archive"
+    raw_prefix: str = "raw"
+    process_bucket: str = "glycoshape-archive"
+    process_prefix: str = "process"
+    static_bucket: str = "glycoshape-database"
+    static_prefix: str = "static"
+    staging_prefix: str = "publish-staging"
+    max_attempts: int = 8
+    multipart_threshold: int = 64 << 20
+    multipart_chunksize: int = 32 << 20
+    transfer_concurrency: int = 4
+    checksums: str = "when_required"
+
+    @classmethod
+    def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "S3Settings":
+        """Settings from the environment; raises ``ValueError`` naming what is missing or invalid."""
+        env = os.environ if environ is None else environ
+
+        def text(name: str, default: str = "") -> str:
+            return str(env.get(f"GLYCOSHAPE_S3_{name}", "") or "").strip() or default
+
+        def number(name: str, default: int, minimum: int) -> int:
+            raw = text(name)
+            try:
+                value = int(raw) if raw else default
+            except ValueError:
+                raise ValueError(f"GLYCOSHAPE_S3_{name} must be an integer") from None
+            if value < minimum:
+                raise ValueError(f"GLYCOSHAPE_S3_{name} must be at least {minimum}")
+            return value
+
+        def prefix(name: str, default: str) -> str:
+            value = text(name, default).strip("/")
+            if not value:
+                raise ValueError(f"GLYCOSHAPE_S3_{name} must not be empty")
+            return value
+
+        missing = [
+            f"GLYCOSHAPE_S3_{name}"
+            for name in ("ENDPOINT", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY")
+            if not text(name)
+        ]
+        if missing:
+            raise ValueError("S3 storage is not configured: set " + ", ".join(missing))
+        addressing_style = text("ADDRESSING_STYLE", "path").lower()
+        if addressing_style not in ("path", "virtual", "auto"):
+            raise ValueError("GLYCOSHAPE_S3_ADDRESSING_STYLE must be path, virtual or auto")
+        checksums = text("CHECKSUMS", "when_required").lower()
+        if checksums not in ("when_required", "when_supported"):
+            raise ValueError("GLYCOSHAPE_S3_CHECKSUMS must be when_required or when_supported")
+        return cls(
+            endpoint_url=text("ENDPOINT"),
+            access_key_id=text("ACCESS_KEY_ID"),
+            secret_access_key=text("SECRET_ACCESS_KEY"),
+            region=text("REGION", "auto"),
+            addressing_style=addressing_style,
+            raw_bucket=text("RAW_BUCKET", "glycoshape-archive"),
+            raw_prefix=prefix("RAW_PREFIX", "raw"),
+            process_bucket=text("PROCESS_BUCKET", "glycoshape-archive"),
+            process_prefix=prefix("PROCESS_PREFIX", "process"),
+            static_bucket=text("STATIC_BUCKET", "glycoshape-database"),
+            static_prefix=prefix("STATIC_PREFIX", "static"),
+            staging_prefix=prefix("STAGING_PREFIX", "publish-staging"),
+            max_attempts=number("MAX_ATTEMPTS", 8, 1),
+            # 5 MiB is the smallest part S3 and R2 accept.
+            multipart_threshold=number("MULTIPART_THRESHOLD_MB", 64, 5) << 20,
+            multipart_chunksize=number("MULTIPART_CHUNK_MB", 32, 5) << 20,
+            transfer_concurrency=number("TRANSFER_CONCURRENCY", 4, 1),
+            checksums=checksums,
+        )
+
+    def routes(self) -> Dict[str, str]:
+        """Key prefix -> bucket for the three kinds of data."""
+        return {
+            self.raw_prefix: self.raw_bucket,
+            self.process_prefix: self.process_bucket,
+            self.static_prefix: self.static_bucket,
+        }
+
+
+def _retry_too_many_requests(max_attempts: int) -> Callable[..., Optional[float]]:
+    """Retry rule for HTTP 429, which the client does not retry by itself.
+
+    R2 answers ``TooManyRequests`` (429) when it limits the request rate, for
+    example for two writes to one key within a second.  The returned handler
+    of the client's ``needs-retry`` event asks for another attempt after an
+    exponential backoff with jitter, up to ``max_attempts`` attempts.
+    """
+    def handler(response: Any = None, attempts: int = 0, **_: Any) -> Optional[float]:
+        if response is None or attempts >= max_attempts:
+            return None
+        http_response, parsed = response
+        code = ((parsed or {}).get("Error") or {}).get("Code")
+        if getattr(http_response, "status_code", None) != 429 and code != "TooManyRequests":
+            return None
+        return min(20.0, 2.0 ** (attempts - 1)) * (0.5 + random.random() / 2)
+
+    return handler
+
+
+def create_s3_client(settings: S3Settings, max_connections: int = 10) -> Tuple[Any, Any]:
+    """A boto3 S3 client and its transfer configuration for ``settings``.
+
+    Requests are retried by the client with exponential backoff and jitter
+    (``standard`` mode, ``settings.max_attempts`` attempts) on connection
+    errors, throttling and 5xx responses, and here on HTTP 429.  Creating the
+    client does not touch the network.
+    """
+    try:
+        import boto3
+        from boto3.s3.transfer import TransferConfig
+        from botocore.config import Config
+    except ImportError as exc:
+        raise RuntimeError(
+            "S3 storage needs boto3; install the requirements (uv pip install -r requirements.txt)"
+        ) from exc
+
+    _keep_client_loggers_quiet()
+    client = boto3.client(
+        "s3",
+        endpoint_url=settings.endpoint_url,
+        region_name=settings.region,
+        aws_access_key_id=settings.access_key_id,
+        aws_secret_access_key=settings.secret_access_key,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": settings.addressing_style},
+            # total_max_attempts counts the first request; max_attempts would count retries only
+            retries={"total_max_attempts": settings.max_attempts, "mode": "standard"},
+            max_pool_connections=max(10, int(max_connections)),
+            # R2 and other S3-compatible services do not all accept the CRC
+            # checksums that newer clients add to every request by default.
+            request_checksum_calculation=settings.checksums,
+            response_checksum_validation=settings.checksums,
+        ),
+    )
+    client.meta.events.register("needs-retry.s3", _retry_too_many_requests(settings.max_attempts))
+    transfer_config = TransferConfig(
+        multipart_threshold=settings.multipart_threshold,
+        multipart_chunksize=settings.multipart_chunksize,
+        max_concurrency=settings.transfer_concurrency,
+        use_threads=settings.transfer_concurrency > 1,
+        preferred_transfer_client="classic",
+    )
+    return client, transfer_config
+
+
+class S3StorageBackend(StorageBackend):
+    """S3-compatible object storage (Cloudflare R2, MinIO, AWS S3).
+
+    A path is an object key.  ``routes`` maps a leading key prefix to the
+    bucket that holds it (``raw`` and ``process`` live in the archive bucket,
+    ``static`` in the database bucket); every other key belongs to ``bucket``
+    when one is given.  Keys are used exactly as given apart from a leading
+    ``/``, so a GLYCAM name with ``[``, ``]`` and ``,`` is a valid key.
+
+    ``client`` is a boto3 S3 client, or an object with the same methods.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        bucket: Optional[str] = None,
+        routes: Optional[Mapping[str, str]] = None,
+        transfer_config: Any = None,
+        page_size: int = 1000,
+        stream_attempts: int = 4,
+        sleep: Callable[[float], None] = time.sleep,
+        copy_part_size: int = 1 << 30,
+    ):
+        self._client = client
+        self.bucket = bucket
+        self._routes = sorted(
+            ((str(prefix).strip("/"), target) for prefix, target in (routes or {}).items()),
+            key=lambda item: -len(item[0]),
+        )
+        self._transfer_config = transfer_config
+        self._copy_part_size = max(5 << 20, int(copy_part_size))   # 5 MiB is the smallest part of a multipart copy
+        self._page_size = max(1, int(page_size))
+        self._stream_attempts = max(1, int(stream_attempts))
+        self._sleep = sleep
+        logger.info(
+            "Initialized S3StorageBackend (bucket=%s, routes=%s)",
+            bucket,
+            {prefix: target for prefix, target in self._routes} or None,
+        )
+
+    # -- keys -----------------------------------------------------------
+    @staticmethod
+    def _key(path: Union[str, Path]) -> str:
+        key = path.as_posix() if isinstance(path, PurePath) else str(path)
+        return key.lstrip("/")
+
+    def _route(self, key: str) -> Optional[str]:
+        for prefix, target in self._routes:
+            if key == prefix or key.startswith(prefix + "/"):
+                return target
+        return self.bucket
+
+    def is_routed(self, path: Union[str, Path]) -> bool:
+        """True when ``path`` is an object key of one of the configured buckets."""
+        return self._route(self._key(path)) is not None
+
+    def _locate(self, path: Union[str, Path]) -> Tuple[str, str]:
+        key = self._key(path)
+        bucket = self._route(key)
+        if bucket is None:
+            raise FileNotFoundError(f"no S3 bucket is configured for object key {key!r}")
+        if not key or len(key.encode("utf-8")) > S3_MAX_KEY_BYTES:
+            raise ValueError(f"object key is empty or longer than {S3_MAX_KEY_BYTES} bytes: {key[:80]!r}")
+        return bucket, key
+
+    def _retry_stream(self, action: Callable[[], Any], what: str) -> Any:
+        """Run ``action`` again, with backoff, when the connection broke while a body was read."""
+        delay = 0.5
+        for attempt in range(1, self._stream_attempts + 1):
+            try:
+                return action()
+            except Exception as exc:
+                if attempt == self._stream_attempts or not _is_transient_error(exc):
+                    raise
+                pause = delay * (0.5 + random.random() / 2)
+                logger.warning(
+                    "Reading %s failed with %s (attempt %d of %d); retrying in %.1f s",
+                    what, type(exc).__name__, attempt, self._stream_attempts, pause,
+                )
+                self._sleep(pause)
+                delay = min(delay * 2, 20.0)
+
+    def _open_body(self, bucket: str, key: str) -> Any:
+        try:
+            return self._client.get_object(Bucket=bucket, Key=key)["Body"]
+        except Exception as exc:
+            if _is_missing_object(exc):
+                raise FileNotFoundError(f"no such object: {key}") from None
+            raise
+
+    # -- listing --------------------------------------------------------
+    def list_objects(self, prefix: Union[str, Path] = "") -> Iterator[Dict[str, Any]]:
+        """Every object whose key starts with ``prefix`` as ``{"key", "size", "etag"}``, in key order.
+
+        The listing is followed over all its pages (continuation tokens).
+        """
+        key_prefix = self._key(prefix)
+        bucket = self._route(key_prefix)
+        if bucket is None:
+            return
+        token: Optional[str] = None
+        while True:
+            request: Dict[str, Any] = {"Bucket": bucket, "Prefix": key_prefix, "MaxKeys": self._page_size}
+            if token:
+                request["ContinuationToken"] = token
+            page = self._client.list_objects_v2(**request)
+            for item in page.get("Contents") or []:
+                yield {
+                    "key": item["Key"],
+                    "size": int(item.get("Size", 0)),
+                    "etag": str(item.get("ETag", "")).strip('"'),
+                }
+            if not page.get("IsTruncated"):
+                return
+            token = page.get("NextContinuationToken")
+            if not token:
+                raise RuntimeError(f"truncated listing of {key_prefix!r} without a continuation token")
+
+    def list_files(self, path: Union[str, Path], pattern: str = "*") -> list:
+        """Keys of all objects below ``path`` (recursive), as ``Path``.
+
+        ``pattern`` filters on the first path segment below ``path``.
+        """
+        return self.list_files_paginated(path, pattern)
+
+    def list_files_paginated(self, path: Union[str, Path], pattern: str = "*") -> list:
+        base = self._key(path).rstrip("/")
+        prefix = f"{base}/" if base else ""
+        found = []
+        for item in self.list_objects(prefix):
+            key = item["key"]
+            if key.endswith("/"):
+                continue
+            if pattern != "*" and not fnmatch.fnmatchcase(key[len(prefix):].split("/", 1)[0], pattern):
+                continue
+            found.append(Path(key))
+        return found
+
+    def list_common_prefixes(self, prefix: Union[str, Path]) -> list:
+        """Immediate child 'directories' of ``prefix``, for example ``static/GS00001``."""
+        base = self._key(prefix).strip("/")
+        key_prefix = f"{base}/" if base else ""
+        bucket = self._route(key_prefix)
+        if bucket is None:
+            return []
+        found: List[str] = []
+        token: Optional[str] = None
+        while True:
+            request: Dict[str, Any] = {
+                "Bucket": bucket, "Prefix": key_prefix, "Delimiter": "/", "MaxKeys": self._page_size,
+            }
+            if token:
+                request["ContinuationToken"] = token
+            page = self._client.list_objects_v2(**request)
+            found.extend(str(item["Prefix"]).rstrip("/") for item in page.get("CommonPrefixes") or [])
+            if not page.get("IsTruncated"):
+                return found
+            token = page.get("NextContinuationToken")
+            if not token:
+                raise RuntimeError(f"truncated listing of {key_prefix!r} without a continuation token")
+
+    # -- existence ------------------------------------------------------
+    def head(self, path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+        """Size, SHA-256 metadata and ETag of an object, or ``None`` when it does not exist.
+
+        The answer to a HEAD request has no body, so a bucket that does not
+        exist looks like a missing object here; listings and reads raise.
+        """
+        if not self._key(path) or not self.is_routed(path):
+            return None
+        bucket, key = self._locate(path)
+        try:
+            response = self._client.head_object(Bucket=bucket, Key=key)
+        except Exception as exc:
+            if _is_missing_object(exc):
+                return None
+            raise
+        metadata = {str(name).lower(): value for name, value in (response.get("Metadata") or {}).items()}
+        return {
+            "size": int(response.get("ContentLength", 0)),
+            "sha256": metadata.get(SHA256_METADATA_KEY),
+            "etag": str(response.get("ETag", "")).strip('"'),
+            "metadata": metadata,
+        }
+
+    def exists(self, path: Union[str, Path]) -> bool:
+        """Check if an object, or any object below the prefix, exists."""
+        key = self._key(path)
+        if not key.endswith("/") and self.head(key) is not None:
+            return True
+        return self.is_dir(key)
+
+    def is_file(self, path: Union[str, Path]) -> bool:
+        """Check if path is an object."""
+        key = self._key(path)
+        return bool(key) and not key.endswith("/") and self.head(key) is not None
+
+    def is_dir(self, path: Union[str, Path]) -> bool:
+        """Check if any object exists below the prefix."""
+        base = self._key(path).rstrip("/")
+        key_prefix = f"{base}/" if base else ""
+        bucket = self._route(key_prefix)
+        if bucket is None:
+            return False
+        page = self._client.list_objects_v2(Bucket=bucket, Prefix=key_prefix, MaxKeys=1)
+        return bool(page.get("Contents"))
+
+    # -- reading --------------------------------------------------------
+    def read_binary(self, path: Union[str, Path]) -> bytes:
+        """Read an object into memory; use :meth:`download_file` for large objects."""
+        bucket, key = self._locate(path)
+
+        def read() -> bytes:
+            body = self._open_body(bucket, key)
+            try:
+                return body.read()
+            finally:
+                body.close()
+
+        return self._retry_stream(read, key)
+
+    def read_text(self, path: Union[str, Path], encoding: str = "utf-8") -> str:
+        """Read text content from an object."""
+        return self.read_binary(path).decode(encoding)
+
+    def stream_sha256(self, path: Union[str, Path], chunk: int = 1 << 20) -> Tuple[int, str]:
+        """Size and SHA-256 of an object's content, downloaded as a stream and not stored."""
+        bucket, key = self._locate(path)
+
+        def read() -> Tuple[int, str]:
+            body = self._open_body(bucket, key)
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                for block in iter(lambda: body.read(chunk), b""):
+                    digest.update(block)
+                    size += len(block)
+            finally:
+                body.close()
+            return size, digest.hexdigest()
+
+        return self._retry_stream(read, key)
+
+    def download_file(self, path: Union[str, Path], local_path: Union[str, Path]) -> None:
+        """Download an object to a local file as a stream (ranged parts for large objects).
+
+        The transfer writes a temporary file next to ``local_path`` and
+        renames it when complete, and retries parts whose connection broke.
+        """
+        bucket, key = self._locate(path)
+        options = {"Config": self._transfer_config} if self._transfer_config is not None else {}
+        try:
+            self._client.download_file(Bucket=bucket, Key=key, Filename=str(local_path), **options)
+        except Exception as exc:
+            if _is_missing_object(exc):
+                raise FileNotFoundError(f"no such object: {key}") from None
+            raise
+
+    def open_text(self, path: Union[str, Path], mode: str = "r") -> TextIO:
+        """Open a text object; a writer uploads when it is closed."""
+        if 'w' in mode:
+            return OracleTextBuffer(self, path, mode)
+        return io.StringIO(self.read_text(path))
+
+    def open_binary(self, path: Union[str, Path], mode: str = "rb") -> BinaryIO:
+        """Open a binary object; a writer uploads when it is closed."""
+        if 'w' in mode:
+            return OracleBinaryBuffer(self, path, mode)
+        return io.BytesIO(self.read_binary(path))
+
+    # -- writing --------------------------------------------------------
+    def write_binary(self, path: Union[str, Path], content: bytes) -> None:
+        """Write a small object from memory in one request, with its SHA-256 as metadata."""
+        bucket, key = self._locate(path)
+        self._client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=content,
+            ContentType=_content_type(key),
+            Metadata={SHA256_METADATA_KEY: hashlib.sha256(content).hexdigest()},
+        )
+        logger.debug("Wrote %d bytes to s3://%s/%s", len(content), bucket, key)
+
+    def write_text(self, path: Union[str, Path], content: str, encoding: str = "utf-8") -> None:
+        """Write text content to an object."""
+        self.write_binary(path, content.encode(encoding))
+
+    def upload_file(
+        self,
+        local_path: Union[str, Path],
+        path: Union[str, Path],
+        sha256: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Upload a local file as a stream; multipart above the configured threshold.
+
+        The object carries the SHA-256 of the file as user metadata.  Pass
+        ``sha256`` when it is already known, otherwise the file is hashed here.
+        """
+        bucket, key = self._locate(path)
+        if sha256 is None:
+            sha256 = file_sha256(local_path)[1]
+        options = {"Config": self._transfer_config} if self._transfer_config is not None else {}
+        self._client.upload_file(
+            Filename=str(local_path),
+            Bucket=bucket,
+            Key=key,
+            ExtraArgs={"Metadata": {SHA256_METADATA_KEY: sha256}, "ContentType": _content_type(key)},
+            **options,
+        )
+        logger.debug("Uploaded %s to s3://%s/%s", local_path, bucket, key)
+        return {"key": key, "sha256": sha256}
+
+    def copy(
+        self,
+        source: Union[str, Path],
+        path: Union[str, Path],
+        sha256: Optional[str] = None,
+        size: Optional[int] = None,
+    ) -> None:
+        """Copy an object inside the storage; the content does not pass through this machine.
+
+        One ``CopyObject`` request up to ``copy_part_size`` bytes, a multipart
+        copy in parts of that size above it.  Only plain requests are used
+        (no conditional copy headers, which R2 does not implement).  The copy
+        carries ``sha256`` as metadata; size and SHA-256 are read from the
+        source when they are not given.
+        """
+        source_bucket, source_key = self._locate(source)
+        bucket, key = self._locate(path)
+        if sha256 is None or size is None:
+            head = self.head(source_key)
+            if head is None:
+                raise FileNotFoundError(f"no such object: {source_key}")
+            sha256 = head["sha256"] if sha256 is None else sha256
+            size = head["size"] if size is None else size
+        copy_source = {"Bucket": source_bucket, "Key": source_key}
+        described = {
+            "Metadata": {SHA256_METADATA_KEY: sha256} if sha256 else {},
+            "ContentType": _content_type(key),
+        }
+        if size <= self._copy_part_size:
+            self._client.copy_object(
+                Bucket=bucket, Key=key, CopySource=copy_source, MetadataDirective="REPLACE", **described)
+            return
+        upload_id = self._client.create_multipart_upload(Bucket=bucket, Key=key, **described)["UploadId"]
+        try:
+            parts = []
+            for number, start in enumerate(range(0, size, self._copy_part_size), start=1):
+                copied = self._client.upload_part_copy(
+                    Bucket=bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    PartNumber=number,
+                    CopySource=copy_source,
+                    CopySourceRange=f"bytes={start}-{min(start + self._copy_part_size, size) - 1}",
+                )
+                parts.append({"ETag": copied["CopyPartResult"]["ETag"], "PartNumber": number})
+            self._client.complete_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload={"Parts": parts})
+        except BaseException:
+            try:
+                self._client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            except Exception:
+                logger.warning("Could not abort the multipart copy to s3://%s/%s", bucket, key)
+            raise
+
+    def mkdir(self, path: Union[str, Path], parents: bool = True, exist_ok: bool = True) -> None:
+        """No-op for object storage; prefixes do not require explicit creation."""
+        logger.debug(f"Skipping mkdir for object storage prefix: {path}")
+
+    def unlink(self, path: Union[str, Path]) -> None:
+        """Delete an object (deleting a missing object is not an error in S3)."""
+        bucket, key = self._locate(path)
+        self._client.delete_object(Bucket=bucket, Key=key)
+        logger.debug("Deleted s3://%s/%s", bucket, key)
+
+
+def create_s3_backend(
+    settings: Optional[S3Settings] = None,
+    bucket: Optional[str] = None,
+    max_connections: int = 10,
+) -> S3StorageBackend:
+    """S3 backend from ``GLYCOSHAPE_S3_*`` (or ``settings``).
+
+    Without ``bucket`` the backend routes keys by their prefix to the raw,
+    process and static buckets; with ``bucket`` every key belongs to it.
+    """
+    settings = settings or S3Settings.from_env()
+    client, transfer_config = create_s3_client(settings, max_connections=max_connections)
+    if bucket is not None:
+        return S3StorageBackend(client, bucket=bucket, transfer_config=transfer_config)
+    return S3StorageBackend(client, routes=settings.routes(), transfer_config=transfer_config)
+
+
 class StorageManager:
     """
     Unified storage manager that abstracts file operations across backends.
@@ -587,7 +1223,8 @@ class StorageManager:
             self.backend = self._detect_backend()
         # Local backend used for staging writes even in Oracle mode
         self._local_backend = LocalStorageBackend()
-        self._is_oracle = isinstance(self.backend, OracleStorageBackend)
+        # "Oracle mode" below means remote object storage: the PAR backend or S3.
+        self._is_oracle = isinstance(self.backend, (OracleStorageBackend, S3StorageBackend))
 
     def _is_data_prefix(self, path: Union[str, Path]) -> bool:
         p = str(path).lstrip('/')
@@ -610,9 +1247,14 @@ class StorageManager:
     
     def _detect_backend(self) -> StorageBackend:
         """Auto-detect appropriate storage backend from environment."""
+        selected = config.selected_storage()
+        if selected == "s3":
+            logger.info("Using S3 object storage (GLYCOSHAPE_STORAGE=s3)")
+            return create_s3_backend()
+
         # Check if Oracle PAR URL is provided
         par_url = os.environ.get("GLYCOSHAPE_ORACLE_PAR_URL")
-        if par_url:
+        if par_url and selected != "local":
             logger.info(f"Using Oracle Cloud Storage (PAR URL detected)")
             return OracleStorageBackend(par_url)
         
@@ -750,6 +1392,9 @@ class StorageManager:
             path_str = str(path)
             if self._is_process_prefix(path_str) or self._is_data_prefix(path_str) or self._is_output_prefix(path_str):
                 return self.backend.list_files(path, pattern)
+            # S3: the configured raw/process/static prefixes need not have the names above
+            if isinstance(self.backend, S3StorageBackend) and self.backend.is_routed(path_str):
+                return self.backend.list_files(path, pattern)
             # For other directories, prefer local listings (best effort)
             try:
                 return self._local_backend.list_files(path, pattern)
@@ -772,7 +1417,7 @@ class StorageManager:
         Returns a list of Path-like entries.
         """
         path = self._wrap_path(path, base_dir)
-        if isinstance(self.backend, OracleStorageBackend):
+        if isinstance(self.backend, (OracleStorageBackend, S3StorageBackend)):
             base = str(path)
             prefixes = self.backend.list_common_prefixes(base)
             return [Path(p) for p in prefixes]
@@ -896,6 +1541,10 @@ class StorageManager:
                             return ("skipped", lpath, rpath, None)
                     except Exception:
                         pass
+                if isinstance(self.backend, S3StorageBackend):
+                    # streamed, multipart for large files; nothing is read into memory
+                    self.backend.upload_file(lpath, rpath)
+                    return ("uploaded", lpath, rpath, None)
                 with open(lpath, 'rb') as f:
                     data = f.read()
                 self.backend.write_binary(rpath, data)
@@ -904,7 +1553,7 @@ class StorageManager:
                 return ("failed", lpath, rpath, str(exc))
 
         max_workers = max(1, int(getattr(config, "upload_workers", 1)))
-        if isinstance(self.backend, OracleStorageBackend) and len(upload_jobs) > 1 and max_workers > 1:
+        if isinstance(self.backend, (OracleStorageBackend, S3StorageBackend)) and len(upload_jobs) > 1 and max_workers > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {executor.submit(_upload_one, job): job for job in upload_jobs}
                 for future in as_completed(future_map):

@@ -58,10 +58,19 @@ export GLYCOSHAPE_GAP_LOG="${REPO_ROOT}/logs/static_after_${ARRAY_JOB_ID}.log"
     --process-dir "${REPO_ROOT}/process" \
     --output-dir "${REPO_ROOT}/static"
 
-echo "Static rebuild succeeded; publishing static output to Oracle."
-"${REPO_ROOT}/.venv/bin/python" -u scripts/upload_static_to_oracle.py \
-    --static-dir "${REPO_ROOT}/static" \
-    --workers 16 \
-    --progress-every 100
+# The storage that lib/config.py selects from the environment and .env.
+STORAGE="$("${REPO_ROOT}/.venv/bin/python" -c 'from lib import config; print(config.storage_backend)')"
+if [[ "${STORAGE}" == "s3" ]]; then
+    echo "Static rebuild succeeded; publishing static output to S3 storage."
+    "${REPO_ROOT}/.venv/bin/python" -u scripts/static_s3.py publish \
+        --static-dir "${REPO_ROOT}/static" \
+        --workers 16
+else
+    echo "Static rebuild succeeded; publishing static output to Oracle."
+    "${REPO_ROOT}/.venv/bin/python" -u scripts/upload_static_to_oracle.py \
+        --static-dir "${REPO_ROOT}/static" \
+        --workers 16 \
+        --progress-every 100
+fi
 
-echo "Process, static rebuild, and Oracle publication completed successfully."
+echo "Process, static rebuild, and publication completed successfully."

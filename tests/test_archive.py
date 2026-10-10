@@ -915,3 +915,124 @@ def test_converter_cli_refuses_two_sources_with_one_glycam_name(tmp_path):
     assert {row["source_folder"] for row in report["failed"]} == {"DGlcpa1-OH", "G11111AA"}
     assert all("have the same GLYCAM name" in row["reason"] for row in report["failed"])
     assert not (target / "DGlcpa1-OH").exists()
+
+
+# ---------------------------------------------------------------------------
+# Names given from outside (--names)
+# ---------------------------------------------------------------------------
+# info.json of G60371DN writes the sialic acids without the D of GLYCAM names.
+FIXED_G60371DN = NAME_G60371DN.replace("Neup5Ac", "DNeup5Ac")
+
+
+def test_name_override_takes_precedence_and_is_recorded(tmp_path):
+    assert len(FIXED_G60371DN) == 271 and FIXED_G60371DN != NAME_G60371DN
+    source = make_source(tmp_path / "data", "G60371DN", random_coords(6, 12), info_json=NAME_G60371DN)
+    name, origin, warnings = archive.resolve_glycam_name(source, FIXED_G60371DN)
+    assert (name, origin) == (FIXED_G60371DN, "names-file") and archive.NAMES_FILE_ORIGIN == "names-file"
+    assert len(warnings) == 1 and warnings[0].endswith("taken from names-file: " + NAME_G60371DN)
+
+    result = archive.convert_entry(source, tmp_path / "archive", name_override=FIXED_G60371DN)
+    manifest = result["manifest"]
+    assert manifest["glycam_name"] == FIXED_G60371DN
+    assert manifest["source"]["glycam_name_from"] == "names-file" and manifest["source"]["folder"] == "G60371DN"
+    assert manifest["folder"] == archive.entry_folder_name(FIXED_G60371DN) == Path(result["entry"]).name
+    assert manifest["object_key_prefix"] == "raw/" + FIXED_G60371DN + "/"
+    assert manifest["warnings"] == warnings
+    assert (Path(result["entry"]) / "info.json").read_bytes() == (source / "info.json").read_bytes()   # unchanged
+    assert archive.convert_entry(source, tmp_path / "archive", name_override=FIXED_G60371DN)["status"] == "skipped"
+
+    # verification against the source: with the override the name is compared, without it it cannot be
+    entry = result["entry"]
+    report = archive.verify_entry(entry, source, name_override=FIXED_G60371DN)
+    assert report["ok"] and report["glycam_name_checked"]
+    report = archive.verify_entry(entry, source)
+    assert report["ok"] and report["glycam_name_checked"] is False
+    errors = archive.verify_entry(entry, source, name_override=NAME_G60371DN)["errors"]
+    assert len(errors) == 1 and errors[0].startswith("the source folder has GLYCAM name Neup5Ac")
+
+    # it also beats name.json, and both differences are reported
+    other = make_source(tmp_path / "data", "DGlcpa1-OH", random_coords(2, 12),
+                        name_json="DGlcpb1-OH", info_json="DGlcpa1-OME")
+    name, origin, warnings = archive.resolve_glycam_name(other, "DGalpa1-OH")
+    assert (name, origin) == ("DGalpa1-OH", "names-file")
+    assert [warning.split(" ", 1)[0] for warning in warnings] == ["name.json", "info.json"]
+    assert "DGlcpb1-OH" in warnings[0] and "DGlcpa1-OME" in warnings[1]
+    assert len(archive.resolve_glycam_name(other, "DGlcpb1-OH")[2]) == 1          # agrees with name.json
+    for bad in ("", " DGlcpa1-OH", "a/../b"):
+        with pytest.raises(archive.NamingError):
+            archive.convert_entry(other, tmp_path / "archive", name_override=bad)
+
+    # a folder named by a GlyTouCan ID without any name file can be converted with a name from outside
+    bare = make_source(tmp_path / "data", "G12345AB", random_coords(2, 12))
+    converted = archive.convert_entry(bare, tmp_path / "archive", name_override="DManpa1-OH")
+    assert converted["manifest"]["glycam_name"] == "DManpa1-OH"
+    assert archive.verify_entry(converted["entry"], bare)["ok"]
+
+
+def test_converter_cli_names_file_renames_an_entry(tmp_path):
+    data, target = tmp_path / "data", tmp_path / "archive"
+    coords = random_coords(8, 14, seed=5)
+    make_source(data, "G60371DN", coords, info_json=NAME_G60371DN)
+    make_source(data, "DGlcpa1-OH", random_coords(4, 12))
+    names = tmp_path / "names.json"
+    names.write_text(json.dumps({"G60371DN": FIXED_G60371DN}))
+    old_folder, new_folder = archive.entry_folder_name(NAME_G60371DN), archive.entry_folder_name(FIXED_G60371DN)
+
+    # the archive as it is today: the entry carries the name of info.json
+    assert run_converter("--data-dir", data, "--archive-dir", target).returncode == 0
+    assert (target / old_folder / "manifest.json").is_file()
+
+    # with the names file the entry is converted under the right name; the old one is reported, not deleted
+    run = run_converter("--data-dir", data, "--archive-dir", target, "--names", names)
+    report = json.loads((target / "conversion_report.json").read_text())
+    assert run.returncode == 1 and report["counts"] == {"converted": 1, "skipped": 1, "failed": 0}
+    assert report["names_file"] == str(names)
+    assert report["superseded"] == [
+        {"source_folder": "G60371DN", "folder": old_folder, "glycam_name": NAME_G60371DN, "removed": False}]
+    assert report["index_problems"] == ["2 entries come from source folder G60371DN"]
+    assert "SUPERSEDED G60371DN" in run.stderr and "--remove-superseded" in run.stderr
+    assert (target / old_folder).is_dir() and (target / new_folder).is_dir()
+
+    run = run_converter("--data-dir", data, "--archive-dir", target, "--names", names, "--remove-superseded")
+    report = json.loads((target / "conversion_report.json").read_text())
+    assert run.returncode == 0, run.stderr
+    assert report["counts"] == {"converted": 0, "skipped": 2, "failed": 0} and report["superseded"][0]["removed"]
+    assert not (target / old_folder).exists()
+    index = json.loads((target / "index.json").read_text())
+    assert {record["source_folder"]: record["glycam_name"] for record in index["records"]} == {
+        "DGlcpa1-OH": "DGlcpa1-OH", "G60371DN": FIXED_G60371DN}
+    manifest = json.loads((target / new_folder / "manifest.json").read_text())
+    assert manifest["source"]["glycam_name_from"] == "names-file"
+    assert np.array_equal(archive.ArchiveEntry(target / new_folder).read_frames(unit="milliangstrom"), coords)
+    assert run_converter("--data-dir", data, "--archive-dir", target, "--names", names).returncode == 0
+
+    # verification against the source, with and without the names file
+    for extra in (["--names", names], []):
+        run = run_converter("--verify-only", "--data-dir", data, "--archive-dir", target, *extra)
+        assert run.returncode == 0, run.stdout + run.stderr
+        checked = {report["glycam_name"]: report["glycam_name_checked"]
+                   for report in json.loads((target / "verification_report.json").read_text())["reports"]}
+        assert checked == {"DGlcpa1-OH": True, FIXED_G60371DN: bool(extra)}
+
+
+def test_converter_cli_rejects_a_bad_names_file(tmp_path):
+    data, target = tmp_path / "data", tmp_path / "archive"
+    make_source(data, "DGlcpa1-OH", random_coords(3, 12))
+    make_source(data, "DGalpa1-OH", random_coords(3, 12))
+    names = tmp_path / "names.json"
+
+    names.write_text(json.dumps({"DGlcpa1-OHH": "DGlcpb1-OH"}))
+    run = run_converter("--data-dir", data, "--archive-dir", target, "--names", names)
+    assert run.returncode != 0 and "not under" in run.stderr and "DGlcpa1-OHH" in run.stderr
+    for content in ("[]", json.dumps({"DGlcpa1-OH": ""}), json.dumps({"DGlcpa1-OH": 3}), "{"):
+        names.write_text(content)
+        run = run_converter("--data-dir", data, "--archive-dir", target, "--names", names)
+        assert run.returncode != 0 and "--names" in run.stderr
+    assert not any(target.glob("*/manifest.json"))
+
+    # a name that another source folder already has is refused for both
+    names.write_text(json.dumps({"DGlcpa1-OH": "DGalpa1-OH"}))
+    run = run_converter("--data-dir", data, "--archive-dir", target, "--names", names)
+    report = json.loads((target / "conversion_report.json").read_text())
+    assert run.returncode == 1 and report["counts"] == {"converted": 0, "skipped": 0, "failed": 2}
+    assert all("have the same GLYCAM name" in row["reason"] for row in report["failed"])
