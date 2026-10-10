@@ -9,7 +9,6 @@ from io import BytesIO
 from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Descriptors
-import numpy as np
 import re
 
 from glycowork.motif.processing import canonicalize_iupac
@@ -20,12 +19,16 @@ import logging
 from lib import glypdbio, config, name_utils
 from lib.storage import get_storage_manager
 # The files that need neither identifiers nor the network are written by
-# lib.static_ready, which the one-entry mode uses on its own.
+# lib.static_ready, which the one-entry mode uses on its own. The writer of
+# data.json is there too, for lib.static_levels, which must not need the
+# chemistry libraries imported here.
 from lib.static_ready import (
     copy_analysis_files,
     copy_and_convert_pdbs,
     extract_cluster_data,
     load_info_json,
+    make_serializable,
+    save_glycan_data,
 )
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -296,36 +299,6 @@ def generate_glycan_id(glycam_name: str) -> str:
     # Create a hash of the glycam name for a consistent ID
     hash_obj = hashlib.md5(glycam_name.encode())
     return f"GS{hash_obj.hexdigest()[:6].upper()}"
-
-
-def make_serializable(obj):
-    """Recursively convert numpy types to native Python types for JSON serialization."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, dict):
-        return {k: make_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [make_serializable(item) for item in obj]
-    else:
-        return obj
-
-
-def save_glycan_data(glycan_data: dict, output_dir, filename: str) -> None:
-    """Save glycan data as JSON file."""
-    try:
-        storage = get_storage_manager()
-        storage.mkdir(output_dir)
-        output_file = f"{output_dir}/{filename}.json"
-        serializable_data = make_serializable(glycan_data)
-        with storage.open(output_file, 'w') as f:
-            json.dump(serializable_data, f, indent=4, ensure_ascii=False)
-        logger.info(f"Saved glycan data to {output_file}")
-        
-    except Exception as e:
-        logger.error(f"Failed to save glycan data: {str(e)}")
-        raise
 
 
 def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -> dict:

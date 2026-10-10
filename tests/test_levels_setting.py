@@ -293,6 +293,55 @@ def test_legacy_csv_table_is_copied_without_other_levels(tmp_path):
     assert (tmp_path / "static" / "torsion_all.csv").read_bytes() == (folder / "output" / "torsion_all.csv").read_bytes()
 
 
+def test_csv_for_levels():
+    content = (b'frame,phi,level_1_cluster,level_1_center,level_3_cluster,level_3_center,"odd,name"\n'
+               b'0,-65.31234,2,,417,,x\n1,1e-05,0,0,3,3,"a,b"\n')
+    assert static_ready.csv_other_level_columns(content, (1, 2)) == ["level_3_cluster", "level_3_center"]
+    assert static_ready.csv_other_level_columns(content.split(b"\n", 1)[0], (1, 2)) == ["level_3_cluster", "level_3_center"]
+    assert static_ready.csv_other_level_columns(content, (1, 2, 3)) == []
+    reduced = static_ready.csv_for_levels(content, (1, 2))
+    assert reduced == b'frame,phi,level_1_cluster,level_1_center,"odd,name"\n0,-65.31234,2,,x\n1,1e-05,0,0,"a,b"\n'
+    assert static_ready.csv_for_levels(content, (1, 2, 3)) is content           # nothing to leave out: the same bytes
+    assert static_ready.csv_for_levels(reduced, (1, 2)) is reduced
+    with cluster_levels((1, 2)):                                                # the configured levels by default
+        assert static_ready.csv_for_levels(content) == reduced
+    with cluster_levels((1, 2, 3)):
+        assert static_ready.csv_for_levels(content) is content and static_ready.csv_other_level_columns(content) == []
+
+
+def test_info_json_for_levels():
+    info = {"entropy_nats": 1.5, "levels": [{"level": 1, "n": 5}, {"level": 2, "n": 9}, {"level": 3, "n": 512}],
+            "pca": {"main_clustering": {"H_nats": 1e-05}, "level_3_clustering": {"selected_n_clusters": 512}}}
+    content = json.dumps(info).encode()                                         # in any formatting
+    reduced = static_ready.info_json_for_levels(content, (1, 2))
+    assert reduced == json.dumps(static_ready.filter_info_levels(info, (1, 2))[0], indent=2).encode()
+    assert b"level_3" not in reduced and json.loads(reduced)["pca"] == {"main_clustering": {"H_nats": 1e-05}}
+    assert static_ready.info_json_for_levels(content, (1, 2, 3)) is content     # nothing to leave out: the same bytes
+    assert static_ready.info_json_for_levels(reduced, (1, 2)) is reduced
+    with cluster_levels((1, 2)):
+        assert static_ready.info_json_for_levels(content) == reduced
+    with cluster_levels((1, 2, 3)):
+        assert static_ready.info_json_for_levels(content) is content
+    with pytest.raises(ValueError):
+        static_ready.info_json_for_levels(b'{"levels": [', (1, 2))
+
+
+def test_the_writer_of_data_json_is_shared_with_the_static_stage(tmp_path):
+    import numpy as np
+
+    from lib import glystatic
+
+    assert glystatic.save_glycan_data is static_ready.save_glycan_data
+    data = {"archetype": {"ID": "GS00042", "mass": np.float64(180.06), "rot_bonds": np.int64(3), "name": "µ"},
+            "search_meta": {"keywords": []}}
+    static_ready.save_glycan_data(data, str(tmp_path / "GS00042"), "data")
+    written = (tmp_path / "GS00042" / "data.json").read_bytes()
+    assert written == json.dumps({"archetype": {"ID": "GS00042", "mass": 180.06, "rot_bonds": 3, "name": "µ"},
+                                  "search_meta": {"keywords": []}}, indent=4, ensure_ascii=False).encode("utf-8")
+    static_ready.save_glycan_data(json.loads(written), str(tmp_path / "again"), "data")     # what was read is written back
+    assert (tmp_path / "again" / "data.json").read_bytes() == written
+
+
 class OfflineNames:
     """lib.name_utils without its web services: what the static stage gets when nothing resolves."""
 
