@@ -28,6 +28,13 @@ source.  The public pieces are
 * :class:`ArchiveEntry` - reader that streams frames in chunks,
 * :func:`verify_entry` - verifier, optionally against the source folder,
 * :func:`build_index` / :func:`write_index` - ``index.json`` of an archive.
+
+A source that is damaged in one of a few known ways (a frame that the file
+cuts short, frames without a MODEL record) is refused unless ``repair`` is
+asked for.  The entry then holds every complete frame, in source order, and
+its manifest says under ``source_irregularities`` what was wrong with the
+source and which of its bytes are not in the archive; see
+:class:`PdbTrajectory`.
 """
 from __future__ import annotations
 
@@ -91,6 +98,23 @@ MAX_TRAILER_BYTES = 4 << 20
 #: Positions (of records between frames, of unit-cell changes) listed in a manifest at most.
 MAX_LISTED_POSITIONS = 1000
 
+# Irregularities of a source that ``repair`` accepts (``kind`` of an item of
+# ``source_irregularities`` in a manifest).
+#: A frame without ENDMDL that has fewer atom records than the first frame; it is dropped.
+INCOMPLETE_FRAME = "incomplete_frame"
+#: A frame with every atom record and no ENDMDL before the next MODEL record or the end; it is kept.
+FRAME_WITHOUT_ENDMDL = "frame_without_endmdl"
+#: A MODEL record that no atom record follows.
+MODEL_WITHOUT_FRAME = "model_record_without_frame"
+#: Frames that ENDMDL ends and no MODEL record starts; they are kept.
+FRAME_WITHOUT_MODEL = "frame_without_model_record"
+#: MODEL records that carry no number; listed for a repaired source only (they are read anyway).
+MODEL_WITHOUT_NUMBER = "model_records_without_number"
+#: Frames dropped or kept without ENDMDL, and MODEL records without a frame, accepted at most:
+#: each is listed in the manifest, and a source with more needs a look, not a repair.
+MAX_REPAIRED_FRAMES = 1000
+END_OF_FILE = "end of file"
+
 _GLYTOUCAN_ID = re.compile(r"G\d{5}[A-Z]{2}\Z")
 _SHORT_FOLDER = re.compile(r"~[0-9a-f]{%d}\Z" % SHORT_FOLDER_HASH_CHARS)
 _UNSAFE_FOLDER_CHARS = re.compile(r"[/\\\x00-\x1f\x7f]")
@@ -99,6 +123,16 @@ _ATOM_RECORDS = (b"ATOM  ", b"HETATM")
 _MODEL = b"MODEL"
 _MODEL_BYTES = np.frombuffer(_MODEL, dtype=np.uint8)
 _COORD_COLUMNS = np.arange(30, 54)
+_COORD_BYTES = frozenset(b" -.0123456789")
+#: Record names of the PDB format other than ATOM and HETATM; in a frame that is not ended by
+#: ENDMDL, a line with one of them that the first frame does not have is where the frame ends.
+_PDB_RECORDS = frozenset(
+    b"HEADER OBSLTE TITLE SPLIT CAVEAT COMPND SOURCE KEYWDS EXPDTA NUMMDL MDLTYP AUTHOR REVDAT SPRSDE "
+    b"JRNL REMARK DBREF DBREF1 DBREF2 SEQADV SEQRES MODRES HET HETNAM HETSYN FORMUL HELIX SHEET SSBOND "
+    b"LINK CISPEP SITE CRYST1 ORIGX1 ORIGX2 ORIGX3 SCALE1 SCALE2 SCALE3 MTRIX1 MTRIX2 MTRIX3 MODEL "
+    b"ANISOU SIGATM SIGUIJ TER ENDMDL CONECT MASTER END".split()
+)
+_WITH_REPAIR = "with repair (--repair of the converter)"
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +541,39 @@ class PdbTrajectory:
     :class:`PdbFormatError`.
 
     A file without MODEL records is one frame holding all its atoms.
+
+    ``repair`` accepts a source that is damaged in one of the following ways,
+    and no other; without it each of them raises :class:`PdbFormatError`.
+    What was accepted is in :attr:`irregularities`.
+
+    * A frame that is not ended by ENDMDL: the next MODEL record, or the end
+      of the file, comes first.  Its records have to be those of the first
+      frame, in order, as far as they go, every one a whole line; after them
+      the frame may hold one last line that is the beginning of the record
+      expected there (the line that the cut went through).  With fewer atom
+      records than the first frame the frame is *dropped*
+      (``incomplete_frame``); with all of them it is *kept*
+      (``frame_without_endmdl``), because nothing but the ENDMDL is missing
+      and its coordinates are checked like those of every other frame.
+      A cut line never counts as an atom record, whatever it holds.  When
+      one file was cut and another appended, the CRYST1 record of the next
+      file stands on the cut line; it is read as the record it is, and
+      CRYST1 behind any other text is refused.
+    * A MODEL record that no atom record follows
+      (``model_record_without_frame``), whole or cut like any other line.
+    * Frames that ENDMDL ends and no MODEL record starts
+      (``frame_without_model_record``).
+
+    Everything else stays an error with ``repair`` too: a frame that ENDMDL
+    ends with another atom count, atom records that are not those of the
+    first frame, an unreadable coordinate, a first frame that is not
+    complete, atom records with neither MODEL before nor ENDMDL after them,
+    a cut line with MODEL or any text but CRYST1 behind it.  Not seen, with
+    or without ``repair``: text behind the word ENDMDL or END on its line.
+    :attr:`n_frames`, the frame offsets, the cells and the positions of
+    records count the frames that are kept, which are the frames of the
+    archive; :attr:`source_frames` counts the dropped ones too, and ``frame
+    N`` in an error message is that index.
     """
 
     def __init__(
@@ -516,8 +583,10 @@ class PdbTrajectory:
         batch_bytes: int = DEFAULT_BATCH_BYTES,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         hash_source: bool = True,
+        repair: bool = False,
     ) -> None:
         self.path = Path(path)
+        self.repair = bool(repair)
         self._block_bytes = max(1, int(block_bytes))
         self._batch_bytes = max(1, int(batch_bytes))
         self._max_frame_bytes = int(max_frame_bytes)
@@ -526,7 +595,8 @@ class PdbTrajectory:
         self._consumed = False
 
         self.n_atoms = 0
-        self.n_frames = 0
+        self.n_frames = 0                 # frames read, which are the frames of the archive
+        self.source_frames = 0            # frames of the source: those and the ones repair dropped
         self.header = b""                 # every line before the first frame
         self.first_frame = b""            # lines of the first frame, without MODEL/ENDMDL
         self.trailer = b""                # records after the last frame, without END
@@ -550,6 +620,15 @@ class PdbTrajectory:
         self._model_last: Optional[int] = None
         self._model_largest: Optional[int] = None
         self._model_breaks = 0
+        self._model_unnumbered = 0
+        self._model_unnumbered_example: Optional[str] = None
+
+        # What repair accepted.
+        self._repaired: List[Dict[str, Any]] = []          # one item per frame or MODEL record, in source order
+        self._without_model = 0                            # frames without a MODEL record
+        self._without_model_frames: List[int] = []         # their source index and byte offset, the first ones
+        self._without_model_offsets: List[int] = []
+        self._layout: Optional[Tuple[List[Tuple[bool, bytes]], List[int], frozenset]] = None
 
     # -- results -----------------------------------------------------------
     @property
@@ -564,7 +643,12 @@ class PdbTrajectory:
 
     @property
     def model_numbers(self) -> Optional[Dict[str, Any]]:
-        """First, last and largest MODEL number, and whether they count up by one."""
+        """First, last and largest MODEL number, and whether they count up by one.
+
+        The numbers are those of every MODEL record of the source, in order;
+        -1 stands for a record without a number.  The archive does not keep
+        them: a frame is its position in the trajectory.
+        """
         if self._model_first is None:
             return None
         return {
@@ -573,6 +657,62 @@ class PdbTrajectory:
             "largest": self._model_largest,
             "sequential": self._model_breaks == 0,
             "breaks": self._model_breaks,
+        }
+
+    @property
+    def irregularities(self) -> Optional[Dict[str, Any]]:
+        """What ``repair`` accepted in this source; ``None`` for a source that needed none of it.
+
+        This is ``source_irregularities`` of a manifest.  ``items`` lists, in
+        source order, every frame that was dropped or kept without its
+        ENDMDL and every MODEL record without a frame, each with the byte
+        range of the source it stands for (``offset``, ``bytes``, and the
+        SHA-256 of those bytes) and how many of those bytes are not in the
+        archive (``bytes_ignored``).  ``source_frame`` is the index of a
+        frame among the frames of the source, ``frames_kept_before`` the
+        number of frames the archive holds before it, which is the index of
+        the next frame of the archive.  The frames without a MODEL record
+        follow as one item, and the MODEL records without a number as
+        another.  Read it after :meth:`blocks` is exhausted.
+        """
+        if not self._repaired and not self._without_model:
+            return None
+        items: List[Dict[str, Any]] = []
+        truncated = False
+        for item in self._repaired:
+            item = dict(item)
+            if item["followed_by"] == END_OF_FILE and item["kind"] != MODEL_WITHOUT_FRAME:
+                truncated = True          # the file ends inside this frame
+                item["file_truncated"] = True
+                item["file_size"] = self.source_size
+            items.append(item)
+        counts = Counter(item["kind"] for item in items)
+        if self._without_model:
+            counts[FRAME_WITHOUT_MODEL] = self._without_model
+            items.append({
+                "kind": FRAME_WITHOUT_MODEL,
+                "action": "kept",
+                "count": self._without_model,
+                "source_frames": list(self._without_model_frames),
+                "offsets": list(self._without_model_offsets),
+            })
+        if self._model_unnumbered:
+            counts[MODEL_WITHOUT_NUMBER] = self._model_unnumbered
+            items.append({
+                "kind": MODEL_WITHOUT_NUMBER,
+                "action": "noted",
+                "count": self._model_unnumbered,
+                "example": self._model_unnumbered_example,
+            })
+        return {
+            "accepted_with": "repair",
+            "frames_in_source": self.source_frames,
+            "frames_kept": self.n_frames,
+            "frames_dropped": self.source_frames - self.n_frames,
+            "bytes_ignored": sum(item.get("bytes_ignored", 0) for item in items),
+            "truncated": truncated,
+            "counts": dict(sorted(counts.items())),
+            "items": items,
         }
 
     def box_summary(self) -> Dict[str, Any]:
@@ -641,7 +781,8 @@ class PdbTrajectory:
                         continue
                     self.trailer = b""   # what preceded this frame was not the end of the file
                     self.trailer_dropped = 0
-                    yield coordinates, self._cell
+                    if len(coordinates):   # nothing when repair dropped what the MODEL record starts
+                        yield coordinates, self._cell
                     continue
                 end = data.find(b"\n", pos)
                 if end < 0:
@@ -652,10 +793,20 @@ class PdbTrajectory:
                     following = end + 1
                 line = data[pos:end]
                 if line[:6] in _ATOM_RECORDS:
+                    if self.repair:
+                        coordinates = self._frame_without_model(buf)
+                        if coordinates is None:
+                            buf.refill()   # at end of file _frame_without_model decides
+                            continue
+                        self.trailer = b""
+                        self.trailer_dropped = 0
+                        yield coordinates, self._cell
+                        continue
                     if self.has_model_records:
                         raise PdbFormatError(
                             f"ATOM record outside MODEL/ENDMDL at byte {buf.base + pos} "
-                            f"(after frame {self.n_frames})"
+                            f"(after frame {self.source_frames}); {_WITH_REPAIR} a frame without "
+                            "its MODEL record is accepted when ENDMDL ends it, and recorded in the manifest"
                         )
                     yield self._single_frame(buf), self._cell
                     continue
@@ -745,69 +896,322 @@ class PdbTrajectory:
             lines, values, negative = lines[:rows], values[:rows], negative[:rows]
 
         self.negative_zeros += int(np.count_nonzero(negative & (values == 0)))
-        self._note_model_numbers(_model_numbers(lines[:, 5:head - 1]))
+        numbers = _model_numbers(lines[:, 5:head - 1])
+        self._note_model_numbers(numbers, lambda row: lines[row, :head - 1].tobytes())
         self._offsets.append(buf.base + pos + stride * np.arange(rows, dtype=np.int64))
         self._lengths.append(np.full(rows, stride, dtype=np.int64))
         coordinates = np.ascontiguousarray(values.reshape(rows, self.n_atoms, 3), dtype="<i4")
         self._coordinate_digest.update(coordinates)
         self.n_frames += rows
+        self.source_frames += rows
         buf.pos = pos + rows * stride
         return coordinates
 
     # -- frames read line by line ------------------------------------------
     def _frame_by_lines(self, buf: _Buffer) -> Optional[np.ndarray]:
         data, pos = buf.data, buf.pos
-        frame_index = self.n_frames
-        where = f"frame {frame_index} (byte {buf.base + pos})"
+        where = f"frame {self.source_frames} (byte {buf.base + pos})"
         end = data.find(b"\nENDMDL", pos)
         if end >= 0:
             stop = data.find(b"\n", end + 1)
             if stop < 0 and not buf.eof:
                 return None
             stop = len(data) if stop < 0 else stop + 1
+            nested = data.find(b"\nMODEL", pos + 1, stop)
+            if nested < 0:   # the regular case: MODEL ... ENDMDL
+                frame = data[pos:stop]
+                head = frame.find(b"\n") + 1
+                coordinates = self._accept_frame(frame[head:], frame[:head], self.n_frames, ends_with_endmdl=True)
+                self._offsets.append(np.array([buf.base + pos], dtype=np.int64))
+                self._lengths.append(np.array([len(frame)], dtype=np.int64))
+                buf.pos = stop
+                return coordinates
+            if not self.repair:
+                raise PdbFormatError(
+                    f"{where}: MODEL record at byte {buf.base + nested + 1} before the ENDMDL of this frame; "
+                    f"{_WITH_REPAIR} a frame without ENDMDL is dropped when atom records are missing, "
+                    "kept when none is, and recorded in the manifest"
+                )
         else:
-            if len(data) - pos > self._max_frame_bytes:
-                raise PdbFormatError(f"{where}: no ENDMDL within {self._max_frame_bytes} bytes")
-            if not buf.eof:
-                return None
-            raise PdbFormatError(f"{where} is not terminated by ENDMDL; the file is truncated")
-
-        frame = data[pos:stop]
-        nested = frame.find(b"\nMODEL", 1)
-        if nested >= 0:
-            raise PdbFormatError(
-                f"{where}: MODEL record at byte {buf.base + pos + nested + 1} before the ENDMDL of this frame"
-            )
-        head = frame.find(b"\n") + 1
-        body = frame[head:]
-        coordinates = self._accept_frame(body, frame[:head], frame_index, ends_with_endmdl=True)
-        self._offsets.append(np.array([buf.base + pos], dtype=np.int64))
-        self._lengths.append(np.array([len(frame)], dtype=np.int64))
-        buf.pos = stop
-        return coordinates
+            # With repair the next MODEL record ends the frame; without it the ENDMDL has to come.
+            nested = data.find(b"\nMODEL", pos + 1) if self.repair else -1
+            if nested < 0:
+                if len(data) - pos > self._max_frame_bytes:
+                    raise PdbFormatError(f"{where}: no ENDMDL within {self._max_frame_bytes} bytes")
+                if not buf.eof:
+                    return None
+                if not self.repair:
+                    raise PdbFormatError(
+                        f"{where} is not terminated by ENDMDL; the file is truncated; {_WITH_REPAIR} "
+                        "the frames before it are archived and the cut is recorded in the manifest"
+                    )
+        return self._unterminated_frame(buf, len(data) if nested < 0 else nested + 1, at_end=nested < 0)
 
     def _single_frame(self, buf: _Buffer) -> np.ndarray:
         """A file without MODEL records: all atoms up to the end are one frame."""
-        while buf.refill():
+        checked = 0   # bytes after buf.pos that hold neither MODEL nor ENDMDL
+        while True:
+            self._refuse_frame_records(buf, checked)
+            checked = len(buf.data) - buf.pos
+            if not buf.refill():
+                break
             if len(buf.data) - buf.pos > self._max_frame_bytes:
+                self._refuse_frame_records(buf, checked)
                 raise PdbFormatError(
                     f"no MODEL record and more than {self._max_frame_bytes} bytes of atom records"
                 )
         start = buf.base + buf.pos
         body = buf.data[buf.pos:]
-        for marker in (b"MODEL", b"ENDMDL"):
-            if body.startswith(marker) or b"\n" + marker in body:
-                raise PdbFormatError(
-                    f"{marker.decode()} record after ATOM records that are outside any MODEL"
-                )
         coordinates = self._accept_frame(body, b"", 0, ends_with_endmdl=False)
         self._offsets.append(np.array([start], dtype=np.int64))
         self._lengths.append(np.array([len(body)], dtype=np.int64))
         buf.pos = len(buf.data)
         return coordinates
 
+    def _refuse_frame_records(self, buf: _Buffer, checked: int) -> None:
+        """Raise when MODEL or ENDMDL follows atom records that started outside any MODEL."""
+        begin = buf.pos + max(checked - 8, 0)   # a record name may lie across what was checked before
+        found = [
+            (at, marker) for marker in (b"ENDMDL", b"MODEL")
+            for at in [buf.data.find(b"\n" + marker, begin)] if at >= 0
+        ]
+        if not found:
+            return
+        at, marker = min(found)
+        hint = (
+            f"; {_WITH_REPAIR} frames that ENDMDL ends and no MODEL record starts are accepted "
+            "and recorded in the manifest" if marker == b"ENDMDL" else ""
+        )
+        raise PdbFormatError(
+            f"{marker.decode()} record at byte {buf.base + at + 1} after ATOM records that are outside any MODEL"
+            + hint
+        )
+
+    # -- repair ---------------------------------------------------------------
+    def _frame_without_model(self, buf: _Buffer) -> Optional[np.ndarray]:
+        """Repair: atom records at ``buf.pos`` that no MODEL record starts.
+
+        They are a frame when ENDMDL ends them before any MODEL record, and
+        the single frame of a file that has neither.  ``None`` when more
+        bytes are needed.
+        """
+        data, pos = buf.data, buf.pos
+        start = buf.base + pos
+        end = data.find(b"\nENDMDL", pos)
+        nested = data.find(b"\nMODEL", pos, len(data) if end < 0 else end)
+        if nested >= 0:
+            raise PdbFormatError(
+                f"ATOM record outside MODEL/ENDMDL at byte {start} (after frame {self.source_frames}): "
+                f"the MODEL record at byte {buf.base + nested + 1} comes before any ENDMDL, "
+                "and atom records with neither are not repaired"
+            )
+        if end < 0:
+            if len(data) - pos > self._max_frame_bytes:
+                raise PdbFormatError(
+                    f"no MODEL record and more than {self._max_frame_bytes} bytes of atom records"
+                    if self.n_frames == 0 and not self.has_model_records else
+                    f"ATOM record outside MODEL/ENDMDL at byte {start} (after frame {self.source_frames}): "
+                    f"no ENDMDL within {self._max_frame_bytes} bytes"
+                )
+            if not buf.eof:
+                return None
+            if self.n_frames == 0 and not self.has_model_records:
+                return self._single_frame(buf)   # a file with neither MODEL nor ENDMDL is one frame
+            raise PdbFormatError(
+                f"ATOM record outside MODEL/ENDMDL at byte {start} (after frame {self.source_frames}): "
+                "no ENDMDL ends these atom records, and atom records with neither are not repaired"
+            )
+        stop = data.find(b"\n", end + 1)
+        if stop < 0 and not buf.eof:
+            return None
+        stop = len(data) if stop < 0 else stop + 1
+        frame = data[pos:stop]
+        index = self.source_frames
+        coordinates = self._accept_frame(frame, b"", self.n_frames, ends_with_endmdl=True)
+        self._offsets.append(np.array([start], dtype=np.int64))
+        self._lengths.append(np.array([len(frame)], dtype=np.int64))
+        self._without_model += 1
+        if len(self._without_model_frames) < MAX_LISTED_POSITIONS:
+            self._without_model_frames.append(index)
+            self._without_model_offsets.append(start)
+        buf.pos = stop
+        return coordinates
+
+    def _first_frame_layout(self) -> Tuple[List[Tuple[bool, bytes]], List[int], frozenset]:
+        """Lines of the first frame, the position of each atom record among them, the other record names."""
+        if self._layout is None:
+            layout = [
+                (raw[:6] in _ATOM_RECORDS, raw.rstrip(b"\r\n"))
+                for raw in self.first_frame.splitlines(keepends=True)
+            ]
+            positions = [index for index, (is_atom, _) in enumerate(layout) if is_atom]
+            records = frozenset(line[:6].rstrip() for is_atom, line in layout if not is_atom)
+            self._layout = (layout, positions, records)
+        return self._layout
+
+    def _unterminated_frame(self, buf: _Buffer, region_end: int, at_end: bool) -> np.ndarray:
+        """Repair: the MODEL record at ``buf.pos`` is not followed by an ENDMDL.
+
+        ``buf.data[buf.pos:region_end]`` runs to the next MODEL record, or to
+        the end of the file (``at_end``).  The frame is the MODEL record, the
+        records of the first frame that follow it as whole lines, and a last
+        line that was cut short; what stands after that is left to be read
+        as records between frames.  Returns the coordinates of the frame,
+        none when it is dropped.
+        """
+        data, pos = buf.data, buf.pos
+        start = buf.base + pos
+        index = self.source_frames
+        where = f"frame {index} (byte {start})"
+        if self.n_frames == 0:
+            raise PdbFormatError(
+                f"{where} is not terminated by ENDMDL; a source is repaired only when its first frame is complete"
+            )
+        if len(self._repaired) >= MAX_REPAIRED_FRAMES:
+            raise PdbFormatError(
+                f"{where} is not terminated by ENDMDL, and {MAX_REPAIRED_FRAMES} frames or MODEL records "
+                "of this source were repaired already; such a source is not repaired"
+            )
+        region = data[pos:region_end]
+        head = region.find(b"\n") + 1 or len(region)
+        cr = region.find(b"\r", 0, head)
+        if 0 <= cr < head - 2:   # a \r without its \n ends the line too, as it does for the lines below
+            head = cr + 1
+        glued: Optional[str] = None
+        glue = region.find(b"CRYST1", len(_MODEL), head)
+        if glue >= 0:        # the MODEL record is the line that was cut: nothing of the frame follows it
+            if region[len(_MODEL):glue].strip(b" 0123456789"):
+                raise PdbFormatError(
+                    f"{where}: CRYST1 stands on the line of the MODEL record behind text that is not its number"
+                )
+            head, glued = glue, "CRYST1"
+        frame_records = self._first_frame_layout()[2]
+        atoms = 0
+        extent = head        # bytes of the region that are the frame
+        cut = 0              # of those, the bytes of a last line that was cut short
+        for raw in region[head:].splitlines(keepends=True) if glued is None else ():
+            line = raw.rstrip(b"\r\n")
+            # A whole line of the frame ends with a line end and has no CRYST1 behind other text: a
+            # record that was cut can be all there but for its line end (the columns of an atom
+            # record that are compared end at 80), with the next file following on the same line.
+            whole = raw.endswith(b"\n") and line.find(b"CRYST1", 1) < 0
+            record = line[:6]
+            if (whole and record in _ATOM_RECORDS and atoms < self.n_atoms and len(line) >= 54
+                    and line[:30] + line[54:80].rstrip() == self._identity[atoms]):
+                _parse_fields_lenient(line, index, atoms)   # an unreadable coordinate is an error here too
+                atoms += 1
+            elif whole and record not in _ATOM_RECORDS and record.rstrip() in frame_records:
+                pass                                        # TER and the like, as in the first frame
+            else:
+                cut, glued = self._cut_record(line, atoms, where, start + extent)
+                if cut and glued is None:
+                    cut = len(raw)                          # the cut line with its line end, if it has one
+                extent += cut
+                break
+            extent += len(raw)
+
+        rest = region[extent:]
+        if glued is not None:
+            followed_by = f"{glued} record on the same line"
+        elif rest.strip():
+            followed_by = rest.lstrip()[:6].rstrip().decode("latin-1") + " record"
+        else:
+            followed_by = END_OF_FILE if at_end else "MODEL record"
+        model_line = region[:head]
+        place = {
+            "frames_kept_before": self.n_frames,
+            "offset": start,
+            "bytes": extent,
+            "bytes_ignored": extent,
+            "sha256": hashlib.sha256(region[:extent]).hexdigest(),
+            "model_record": model_line.rstrip(b"\r\n").decode("latin-1"),
+        }
+        counted = {"atoms_found": atoms, "atoms_expected": self.n_atoms, "cut_line_bytes": cut}
+        if atoms == self.n_atoms:
+            # Every atom record is there, each a whole line that is the record of the first frame:
+            # only the ENDMDL (and what the cut line was) is missing.  _accept_frame checks the
+            # records again and reads the coordinates.
+            coordinates = self._accept_frame(
+                region[head:extent - cut], model_line, self.n_frames, ends_with_endmdl=False)
+            self._offsets.append(np.array([start], dtype=np.int64))
+            self._lengths.append(np.array([extent - cut], dtype=np.int64))
+            place["bytes_ignored"] = cut
+            item = {"kind": FRAME_WITHOUT_ENDMDL, "action": "kept", "source_frame": index, **place, **counted}
+        else:
+            coordinates = np.zeros((0, self.n_atoms, 3), dtype="<i4")
+            self._note_model_numbers(
+                _model_numbers(np.frombuffer(model_line[5:].rstrip(b"\r\n"), dtype=np.uint8)[None, :]),
+                lambda row: model_line,
+            )
+            if atoms == 0 and cut == 0:   # nothing of a frame is there: not a frame of the source
+                item = {"kind": MODEL_WITHOUT_FRAME, "action": "ignored", "source_frames_before": index, **place}
+            else:
+                item = {"kind": INCOMPLETE_FRAME, "action": "dropped", "source_frame": index, **place, **counted}
+                self.source_frames += 1
+        item["followed_by"] = followed_by
+        self._repaired.append(item)
+        buf.pos = pos + extent
+        return coordinates
+
+    def _cut_record(self, line: bytes, atoms: int, where: str, at: int) -> Tuple[int, Optional[str]]:
+        """Classify a line of an unterminated frame that is not a whole record of the frame.
+
+        ``atoms`` atom records precede it.  Returns ``(bytes, record)``:
+        the bytes at the start of the line that are a record cut short, and
+        the record that follows them on the same line (CRYST1 is the only
+        one read there).  ``(0, None)`` says that the frame ends before this
+        line.  A line that is none of this raises.
+        """
+        layout, positions, _ = self._first_frame_layout()
+        low = positions[atoms - 1] + 1 if atoms else 0
+        if atoms < self.n_atoms:
+            expected = layout[low:positions[atoms] + 1]
+        else:
+            expected = layout[low:] + [(False, b"ENDMDL")]
+        longest = max((_common_prefix(line, text, is_atom) for is_atom, text in expected), default=0)
+        glue = line.find(b"CRYST1", 1)
+        if glue > 0:
+            if glue <= longest:
+                return glue, "CRYST1"
+            raise PdbFormatError(
+                f"{where}: CRYST1 stands on the line at byte {at} behind text that is not the beginning "
+                "of the record expected there"
+            )
+        if longest and longest == len(line) and line.strip() != b"END":
+            return longest, None
+        record = line[:6]
+        if record in _ATOM_RECORDS:
+            if atoms >= self.n_atoms:
+                raise AtomCountError(
+                    f"{where} has more than {self.n_atoms} atoms, the number of the first frame"
+                )
+            if len(line) >= 54:
+                found, first = line[:30] + line[54:80].rstrip(), self._identity[atoms]
+                if found == first:
+                    return len(line), None   # the whole record without its line end
+                part = "columns 1-30" if found[:30] != first[:30] else "columns 55-80"
+                chosen = slice(0, 30) if found[:30] != first[:30] else slice(30, None)
+                raise TopologyChangeError(
+                    f"frame {self.source_frames}, atom {atoms}: {part} of the atom record differ from the first "
+                    f"frame ({found[chosen].decode('latin-1')!r} against {first[chosen].decode('latin-1')!r})"
+                )
+            raise PdbFormatError(
+                f"{where}: the atom record at byte {at} is not the record of atom {atoms} of the first frame "
+                "and not the beginning of it"
+            )
+        if record.rstrip() in _PDB_RECORDS or not longest:
+            return 0, None
+        raise PdbFormatError(
+            f"{where}: the line at byte {at} begins like a record of the frame and is neither that record, "
+            "nor one cut short, nor one cut short with CRYST1 after it"
+        )
+
     def _accept_frame(self, body: bytes, model_line: bytes, frame_index: int, ends_with_endmdl: bool) -> np.ndarray:
-        """Check one frame against the first and return its coordinates (1, atoms, 3)."""
+        """Check one frame against the first and return its coordinates (1, atoms, 3).
+
+        ``frame_index`` is the index the frame gets in the archive; messages name its index in the source.
+        """
+        number = self.source_frames
         atom_lines: List[bytes] = []
         atom_offsets: List[int] = []
         kept: List[bytes] = []
@@ -827,10 +1231,10 @@ class PdbTrajectory:
         if not atom_lines:
             if frame_index == 0:
                 raise PdbFormatError("frame 0 has no ATOM/HETATM records")
-            raise AtomCountError(f"frame {frame_index} has 0 atoms, the first frame has {self.n_atoms}")
+            raise AtomCountError(f"frame {number} has 0 atoms, the first frame has {self.n_atoms}")
         short = [i for i, line in enumerate(atom_lines) if len(line) < 54]
         if short:
-            raise PdbFormatError(f"frame {frame_index}, atom {short[0]}: record shorter than 54 columns")
+            raise PdbFormatError(f"frame {number}, atom {short[0]}: record shorter than 54 columns")
         identity = [line[:30] + line[54:80].rstrip() for line in atom_lines]
 
         if frame_index == 0:
@@ -842,7 +1246,7 @@ class PdbTrajectory:
         else:
             if len(atom_lines) != self.n_atoms:
                 raise AtomCountError(
-                    f"frame {frame_index} has {len(atom_lines)} atoms, the first frame has {self.n_atoms}"
+                    f"frame {number} has {len(atom_lines)} atoms, the first frame has {self.n_atoms}"
                 )
             if identity != self._identity:
                 atom = next(i for i, (a, b) in enumerate(zip(identity, self._identity)) if a != b)
@@ -850,13 +1254,13 @@ class PdbTrajectory:
                 part = "columns 1-30" if found[:30] != first[:30] else "columns 55-80"
                 cut = slice(0, 30) if found[:30] != first[:30] else slice(30, None)
                 raise TopologyChangeError(
-                    f"frame {frame_index}, atom {atom}: {part} of the atom record differ from the first frame "
+                    f"frame {number}, atom {atom}: {part} of the atom record differ from the first frame "
                     f"({found[cut].decode('latin-1')!r} against {first[cut].decode('latin-1')!r})"
                 )
 
         values = np.empty((1, self.n_atoms, 3), dtype="<i4")
         for atom, line in enumerate(atom_lines):
-            values[0, atom], negative_zero = _parse_fields_lenient(line, frame_index, atom)
+            values[0, atom], negative_zero = _parse_fields_lenient(line, number, atom)
             self.negative_zeros += negative_zero
 
         if ends_with_endmdl and body.endswith(b"\n"):
@@ -869,24 +1273,51 @@ class PdbTrajectory:
 
         if model_line:
             self._note_model_numbers(
-                _model_numbers(np.frombuffer(model_line[5:].rstrip(b"\r\n"), dtype=np.uint8)[None, :])
+                _model_numbers(np.frombuffer(model_line[5:].rstrip(b"\r\n"), dtype=np.uint8)[None, :]),
+                lambda row: model_line,
             )
         self._coordinate_digest.update(values)
         self.line_parsed_frames += 1
         self.n_frames += 1
+        self.source_frames += 1
         return values
 
-    def _note_model_numbers(self, numbers: np.ndarray) -> None:
+    def _note_model_numbers(self, numbers: np.ndarray, record: Callable[[int], bytes]) -> None:
+        """Take the numbers of successive MODEL records; ``record(row)`` is the text of one of them."""
         if numbers.size == 0:
             return
         previous = numbers if self._model_last is None else np.concatenate(([self._model_last], numbers))
         self._model_breaks += int(np.count_nonzero(np.diff(previous) != 1))
-        self._model_breaks += int(np.count_nonzero(numbers < 0))
+        unnumbered = numbers < 0
+        self._model_breaks += int(np.count_nonzero(unnumbered))
+        if unnumbered.any():
+            self._model_unnumbered += int(np.count_nonzero(unnumbered))
+            if self._model_unnumbered_example is None:
+                text = record(int(np.argmax(unnumbered)))
+                self._model_unnumbered_example = text.rstrip(b"\r\n").decode("latin-1")
         if self._model_first is None:
             self._model_first = int(numbers[0])
         self._model_last = int(numbers[-1])
         largest = int(numbers.max())
         self._model_largest = largest if self._model_largest is None else max(self._model_largest, largest)
+
+
+def _common_prefix(line: bytes, record: bytes, is_atom: bool) -> int:
+    """Length of the longest beginning of ``line`` that can be the beginning of ``record``.
+
+    ``record`` is a line of the first frame.  Outside the coordinate columns
+    of an atom record the bytes have to be its bytes; inside them, where
+    every frame has its own, anything a coordinate is written with.
+    """
+    length = 0
+    for column, (found, wanted) in enumerate(zip(line, record)):
+        if is_atom and 30 <= column < 54:
+            if found not in _COORD_BYTES:
+                break
+        elif found != wanted:
+            break
+        length += 1
+    return length
 
 
 def _model_numbers(text: np.ndarray) -> np.ndarray:
@@ -1248,13 +1679,25 @@ def _check_boxes(boxes: np.ndarray, cells: List[Tuple[int, Cell]], frames: int) 
     return float(delta[:, :3].max()), float(delta[:, 3:].max())
 
 
-def _sample_indices(frames: int, count: int) -> List[int]:
-    """Evenly spaced frame indices including the first and the last."""
+def _sample_indices(frames: int, count: int, irregularities: Optional[Dict[str, Any]] = None) -> List[int]:
+    """Evenly spaced frame indices including the first and the last.
+
+    For a repaired source also the frames on both sides of everything that
+    was dropped or ignored, and the frames kept without ENDMDL: the places
+    where the frames of the archive and of the source stop running in step.
+    """
     if count < 0 or count >= frames:
         return list(range(frames))
     if count == 0:
         return []
-    return sorted(set(np.rint(np.linspace(0, frames - 1, count)).astype(int).tolist()))
+    chosen = set(np.rint(np.linspace(0, frames - 1, count)).astype(int).tolist())
+    for item in (irregularities or {}).get("items", []):
+        if "frames_kept_before" in item:
+            chosen.update(
+                index for index in (item["frames_kept_before"] - 1, item["frames_kept_before"])
+                if 0 <= index < frames
+            )
+    return sorted(chosen)
 
 
 class _ReferenceCheck:
@@ -1303,9 +1746,180 @@ class _ReferenceCheck:
         self._handle.close()
 
 
-def _compare_stream(pdb_path: Path, entry_dir: Path) -> Dict[str, Any]:
-    """Compare every coordinate of the source text with the archive, frame by frame."""
-    source = PdbTrajectory(pdb_path)
+def _record_offsets(
+    path: Path, records: Sequence[bytes], block_bytes: int = 8 << 20
+) -> Tuple[Dict[bytes, np.ndarray], int]:
+    """Byte offset of every line of ``path`` that starts with one of ``records``, and the file size.
+
+    A plain search of the bytes of the file; it shares nothing with :class:`PdbTrajectory`.
+    """
+    found: Dict[bytes, List[int]] = {record: [] for record in records}
+    carry = {record: b"\n" for record in records}   # the line break before the first byte of the file
+    size = 0
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(block_bytes)
+            if not block:
+                break
+            for record in records:
+                needle = b"\n" + record
+                data = carry[record] + block
+                base = size - len(carry[record])
+                at = data.find(needle)
+                while at >= 0:
+                    found[record].append(base + at + 1)
+                    at = data.find(needle, at + 1)
+                carry[record] = data[-len(record):]   # shorter than the needle: nothing is found twice
+            size += len(block)
+    return {record: np.asarray(offsets, dtype=np.int64) for record, offsets in found.items()}, size
+
+
+def _check_irregularities(
+    pdb_path: Path, recorded: Dict[str, Any], frames: int, atoms: int, source: Optional[PdbTrajectory] = None
+) -> Dict[str, Any]:
+    """Compare ``source_irregularities`` of a manifest with the source file, read once more.
+
+    The block reader does not read here.  The MODEL and ENDMDL records of
+    the file are located by a search of its bytes; their numbers have to be
+    those the record implies, and every listed item has to be, at its
+    offset, what the record says: the frame of the source with that index,
+    after that many frames of the archive, not ended by ENDMDL, with those
+    bytes (SHA-256) and that many whole atom records in them.  ``frames``
+    and ``atoms`` are those of the entry.
+
+    With ``source``, the reader that read the file with ``repair``, the byte
+    range it gives every frame of the archive (the ranges the reference
+    check reads frames from) is held against the same search: the n-th frame
+    that has an ENDMDL has to be the bytes around the n-th ENDMDL record of
+    the file.  Raises :class:`VerificationError`; returns what was counted.
+    """
+    def refuse(message: str) -> None:
+        raise VerificationError(f"the source is not what source_irregularities of the manifest says: {message}")
+
+    try:
+        items = recorded["items"]
+        unknown = sorted({item["kind"] for item in items} - {
+            INCOMPLETE_FRAME, FRAME_WITHOUT_ENDMDL, MODEL_WITHOUT_FRAME, FRAME_WITHOUT_MODEL, MODEL_WITHOUT_NUMBER})
+        if unknown:
+            refuse(f"unknown kind {', '.join(unknown)}")
+        listed = [item for item in items if "offset" in item]
+        dropped = [item for item in listed if item["kind"] == INCOMPLETE_FRAME]
+        without_endmdl = [item for item in listed if item["kind"] == FRAME_WITHOUT_ENDMDL]
+        orphans = [item for item in listed if item["kind"] == MODEL_WITHOUT_FRAME]
+        without_model = next((item for item in items if item["kind"] == FRAME_WITHOUT_MODEL), None)
+        without_model_count = without_model["count"] if without_model else 0
+        without_model_offsets = without_model["offsets"] if without_model else []
+
+        if recorded["frames_kept"] != frames:
+            refuse(f"{recorded['frames_kept']} frames kept, the entry holds {frames}")
+        if recorded["frames_dropped"] != len(dropped) or recorded["frames_in_source"] != frames + len(dropped):
+            refuse("the numbers of frames in the source, kept and dropped do not agree with the items")
+        if [item["offset"] for item in listed] != sorted(item["offset"] for item in listed):
+            refuse("the items are not in source order")
+
+        found, size = _record_offsets(pdb_path, (b"MODEL", b"ENDMDL"))
+        models, ends = found[b"MODEL"], found[b"ENDMDL"]
+        if len(ends) != frames - len(without_endmdl):
+            refuse(f"{len(ends)} ENDMDL records for {frames} frames, {len(without_endmdl)} of them without one")
+        expected_models = recorded["frames_in_source"] - without_model_count + len(orphans)
+        if len(models) != expected_models:
+            refuse(f"{len(models)} MODEL records, {expected_models} expected")
+        if source is not None:
+            starts, stops = source.frame_offsets, source.frame_offsets + source.frame_lengths
+            ended = np.ones(frames, dtype=bool)
+            ended[[item["frames_kept_before"] for item in without_endmdl]] = False
+            if len(starts) != frames or not ((starts[ended] < ends) & (ends < stops[ended])).all():
+                refuse("the frames of the archive are not the frames that the ENDMDL records of the file end")
+
+        ignored = 0
+        with open(pdb_path, "rb") as handle:
+            for offset in without_model_offsets:
+                handle.seek(offset)
+                if handle.read(6) not in _ATOM_RECORDS or offset in models:
+                    refuse(f"byte {offset} is not the first atom record of a frame without MODEL record")
+            for item in listed:
+                kind, offset, length = item["kind"], item["offset"], item["bytes"]
+                what = f"{kind} at byte {offset}"
+                at = int(np.searchsorted(models, offset))
+                if at == len(models) or models[at] != offset:
+                    refuse(f"{what}: no MODEL record there")
+                following = int(models[at + 1]) if at + 1 < len(models) else size
+                if offset + length > following:
+                    refuse(f"{what}: its {length} bytes run past the next MODEL record")
+                if np.searchsorted(ends, offset) != np.searchsorted(ends, following):
+                    refuse(f"{what}: an ENDMDL record follows before the next MODEL record")
+                handle.seek(offset)
+                text = handle.read(length)
+                if len(text) != length or hashlib.sha256(text).hexdigest() != item["sha256"]:
+                    refuse(f"{what}: its {length} bytes do not have the recorded SHA-256")
+                # What stands between it and the next MODEL record, or the end of the file.
+                after = handle.read(min(following - offset - length, 1 << 16))
+                if not after.strip():
+                    followed_by = END_OF_FILE if following == size else "MODEL record"
+                else:
+                    followed_by = after.lstrip()[:6].rstrip().decode("latin-1") + " record"
+                    if not text.endswith((b"\n", b"\r")) and not after[:1].isspace():
+                        followed_by += " on the same line"
+                if item["followed_by"] != followed_by:
+                    refuse(f"{what}: followed by {followed_by}, not by {item['followed_by']}")
+                truncated = item["followed_by"] == END_OF_FILE and kind != MODEL_WITHOUT_FRAME
+                if item.get("file_truncated", False) != truncated:
+                    refuse(f"{what}: file_truncated is {item.get('file_truncated', False)}")
+                if truncated and item["file_size"] != size:
+                    refuse(f"{what}: the file has {size} bytes, not {item['file_size']}")
+
+                # Its place among the frames: the MODEL records before it that start a frame and
+                # the frames without one; for the archive, the ENDMDL records before it.
+                if without_model_count == len(without_model_offsets):
+                    in_source = (
+                        at - sum(1 for other in orphans if other["offset"] < offset)
+                        + sum(1 for other in without_model_offsets if other < offset)
+                    )
+                    if in_source != item.get("source_frame", item.get("source_frames_before")):
+                        refuse(f"{what}: {in_source} frames of the source precede it")
+                kept_before = int(np.searchsorted(ends, offset)) + sum(
+                    1 for other in without_endmdl if other["offset"] < offset)
+                if kept_before != item["frames_kept_before"]:
+                    refuse(f"{what}: {kept_before} complete frames precede it")
+
+                cut = item.get("cut_line_bytes", 0)
+                lines, cut_line = text[:length - cut], text[length - cut:]
+                atom_records = sum(1 for line in lines.split(b"\n")[:-1] if line[:6] in _ATOM_RECORDS)
+                if kind == MODEL_WITHOUT_FRAME:
+                    expected_atoms, expected_ignored = 0, length
+                elif kind == INCOMPLETE_FRAME:
+                    expected_atoms, expected_ignored = item["atoms_found"], length
+                    if not 0 <= item["atoms_found"] < item["atoms_expected"] == atoms:
+                        refuse(f"{what}: {item['atoms_found']} of {item['atoms_expected']} atom records")
+                else:
+                    expected_atoms, expected_ignored = atoms, cut
+                whole_lines = lines.endswith(b"\n") or (kind == MODEL_WITHOUT_FRAME and b"\n" not in lines)
+                if atom_records != expected_atoms or not whole_lines or b"\n" in cut_line[:-1]:
+                    refuse(f"{what}: {atom_records} whole atom records and a cut line of {len(cut_line)} bytes")
+                if item["bytes_ignored"] != expected_ignored:
+                    refuse(f"{what}: {expected_ignored} of its bytes are not in the archive, not {item['bytes_ignored']}")
+                ignored += item["bytes_ignored"]
+        if ignored != recorded["bytes_ignored"]:
+            refuse(f"{ignored} bytes ignored, not {recorded['bytes_ignored']}")
+        if recorded["truncated"] != any(item.get("file_truncated") for item in listed):
+            refuse(f"truncated is {recorded['truncated']}")
+    except (KeyError, TypeError, IndexError) as exc:
+        raise VerificationError(f"incomplete source_irregularities: {type(exc).__name__}: {exc}") from exc
+    return {
+        "items_checked": len(listed),
+        "model_records": int(len(models)),
+        "endmdl_records": int(len(ends)),
+        "bytes_ignored": ignored,
+    }
+
+
+def _compare_stream(pdb_path: Path, entry_dir: Path, repair: bool = False) -> Dict[str, Any]:
+    """Compare every coordinate of the source text with the archive, frame by frame.
+
+    ``repair`` reads the source as a repaired entry was converted: its
+    frames are then the frames that were kept, in source order.
+    """
+    source = PdbTrajectory(pdb_path, repair=repair)
     mismatched = 0
     compared = 0
     largest = 0.0
@@ -1347,7 +1961,8 @@ def _compare_stream(pdb_path: Path, entry_dir: Path) -> Dict[str, Any]:
 
 def _verify_trajectory(pdb_path: Path, entry_dir: Path, source: PdbTrajectory, check_frames: int) -> Dict[str, Any]:
     """Read the written XTC back and compare it with what ``source`` parsed."""
-    check = _ReferenceCheck(pdb_path, source, _sample_indices(source.n_frames, check_frames))
+    irregularities = source.irregularities
+    check = _ReferenceCheck(pdb_path, source, _sample_indices(source.n_frames, check_frames, irregularities))
     try:
         back = _read_back(entry_dir, source.n_atoms, on_frames=check)
     finally:
@@ -1356,7 +1971,7 @@ def _verify_trajectory(pdb_path: Path, entry_dir: Path, source: PdbTrajectory, c
     if precision is not None and precision != float(XTC_PRECISION):
         raise VerificationError(f"{TRAJECTORY_FILE} was written at precision {precision}, not {XTC_PRECISION}")
     if back["frames"] != source.n_frames or back["coordinates_sha256"] != source.coordinates_sha256:
-        detail = _compare_stream(pdb_path, entry_dir)
+        detail = _compare_stream(pdb_path, entry_dir, repair=source.repair)
         where = detail["first_mismatch"]
         beyond = back["max_abs_coordinate_angstrom"] >= XTC_EXACT_LIMIT_ANGSTROM
         raise VerificationError(
@@ -1376,7 +1991,7 @@ def _verify_trajectory(pdb_path: Path, entry_dir: Path, source: PdbTrajectory, c
         raise VerificationError(
             f"box of the trajectory differs from CRYST1 by {box_length:.6f} A / {box_angle:.6f} degree"
         )
-    return {
+    verification = {
         "passed": True,
         "comparison": (
             "every coordinate of trajectory.xtc, read back and rounded to 0.001 A, "
@@ -1391,6 +2006,17 @@ def _verify_trajectory(pdb_path: Path, entry_dir: Path, source: PdbTrajectory, c
         "box_max_abs_difference_angstrom": box_length,
         "box_max_abs_difference_degree": box_angle,
     }
+    if irregularities is not None:
+        # A repaired source: what was left out is compared with the file once more, without the reader.
+        verification["source_irregularities"] = dict(
+            _check_irregularities(pdb_path, irregularities, source.n_frames, source.n_atoms, source),
+            comparison=(
+                "MODEL and ENDMDL records of the source located by a search of its bytes: their numbers, an "
+                "ENDMDL in the bytes of every frame of the archive but those kept without one, and every "
+                "listed item read at its offset (place among the frames, no ENDMDL, SHA-256, whole atom records)"
+            ),
+        )
+    return verification
 
 
 def verify_entry(
@@ -1408,6 +2034,14 @@ def verify_entry(
     coordinates hash to the recorded digest.  With ``source_dir``: the source
     ``simulation.pdb`` has the recorded size and SHA-256 and every one of its
     coordinates equals the archive.
+
+    The manifest decides how the source is read.  An entry without
+    ``source_irregularities`` is compared with a source that has to be
+    regular.  A repaired entry (``repaired`` in the report) is compared with
+    the source read with ``repair``: the frames that are kept have to be the
+    frames of the archive, the irregularities found have to be exactly the
+    recorded ones, and the recorded ones are checked against the bytes of
+    the file once more (:func:`_check_irregularities`).
 
     ``name_override`` is the name the names file gives this source folder, as
     in :func:`convert_entry`.  The name of an entry that was converted with
@@ -1444,6 +2078,14 @@ def verify_entry(
             if size != recorded["size"] or sha256 != recorded["sha256"]:
                 errors.append(f"{name} does not match the size and SHA-256 of the manifest")
         atoms, frames = int(manifest["atoms"]), int(manifest["frames"])
+        irregularities = manifest.get("source_irregularities")
+        if irregularities is not None:
+            report["repaired"] = True
+            if irregularities["frames_kept"] != frames:
+                errors.append(
+                    f"source_irregularities says {irregularities['frames_kept']} frames were kept, "
+                    f"the manifest says {frames} frames"
+                )
     except (KeyError, TypeError, ValueError, NamingError) as exc:
         errors.append(f"incomplete manifest: {type(exc).__name__}: {exc}")
         return report
@@ -1462,7 +2104,7 @@ def verify_entry(
                 source_name = resolve_glycam_name(source_dir, name_override)[0]
                 if source_name != manifest["glycam_name"]:
                     errors.append(f"the source folder has GLYCAM name {source_name}, the manifest says {manifest['glycam_name']}")
-            detail = _compare_stream(inputs["pdb"], entry_dir)
+            detail = _compare_stream(inputs["pdb"], entry_dir, repair=irregularities is not None)
             source: PdbTrajectory = detail["source"]
             recorded = manifest["source"]
             if source.source_size != recorded["size"] or source.source_sha256 != recorded["sha256"]:
@@ -1474,10 +2116,16 @@ def verify_entry(
                 )
             if source.topology_text() != (entry_dir / TOPOLOGY_FILE).read_bytes():
                 errors.append(f"{TOPOLOGY_FILE} is not the header, first frame and trailing records of the source")
+            if irregularities is not None:
+                if source.irregularities != irregularities:
+                    errors.append("the irregularities of the source are not those source_irregularities records")
+                report["source_irregularities_checked"] = _check_irregularities(
+                    inputs["pdb"], irregularities, frames, atoms, source)["items_checked"]
             report["source_frames_compared"] = detail["frames"]
             report["mismatched_coordinates"] = detail["mismatched_coordinates"]
             report["max_abs_difference_angstrom"] = detail["max_abs_difference_angstrom"]
-            check = _ReferenceCheck(inputs["pdb"], source, _sample_indices(source.n_frames, check_frames))
+            check = _ReferenceCheck(
+                inputs["pdb"], source, _sample_indices(source.n_frames, check_frames, irregularities))
         except (ArchiveError, OSError) as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
 
@@ -1555,6 +2203,7 @@ def convert_entry(
     block_bytes: int = DEFAULT_BLOCK_BYTES,
     batch_bytes: int = DEFAULT_BATCH_BYTES,
     name_override: Optional[str] = None,
+    repair: bool = False,
 ) -> Dict[str, Any]:
     """Convert one source folder into an archive entry under ``archive_dir``.
 
@@ -1567,6 +2216,15 @@ def convert_entry(
     ``name_override`` names the entry instead of ``name.json``, ``info.json``
     or the folder (:func:`resolve_glycam_name`); the manifest then records
     ``"names-file"`` as the source of the name.
+
+    ``repair`` archives a source that is damaged in one of the ways
+    :class:`PdbTrajectory` lists instead of refusing it.  The entry holds the
+    complete frames, its manifest has ``source_irregularities`` (what was
+    wrong, the frames of the source against those kept, the bytes left out)
+    and a warning, and the verification also checks that record against the
+    file.  A source that needs no repair gives the same entry with and
+    without it, with no such key; an existing entry is skipped as described
+    above whether or not it was repaired.
 
     Returns ``{"status", "manifest", "entry", "timing"}``; raises an
     :class:`ArchiveError` with the reason when the source cannot be archived.
@@ -1608,7 +2266,7 @@ def convert_entry(
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
     try:
-        source = PdbTrajectory(inputs["pdb"], block_bytes=block_bytes, batch_bytes=batch_bytes)
+        source = PdbTrajectory(inputs["pdb"], block_bytes=block_bytes, batch_bytes=batch_bytes, repair=repair)
         writer = _XtcWriter(staging / TRAJECTORY_FILE)
         try:
             for coordinates, cell in source.blocks():
@@ -1639,6 +2297,13 @@ def convert_entry(
         if source.trailer_dropped:
             warnings.append(
                 f"{source.trailer_dropped} bytes of records after the last frame are not kept in {TOPOLOGY_FILE}"
+            )
+        irregularities = source.irregularities
+        if irregularities is not None:
+            warnings.append(
+                "the source is irregular and was archived with repair: "
+                f"{irregularities['frames_kept']} of its {irregularities['frames_in_source']} frames are in the "
+                f"archive, {irregularities['bytes_ignored']} of its bytes are not (source_irregularities)"
             )
 
         import mdtraj
@@ -1674,6 +2339,10 @@ def convert_entry(
                 "negative_zero_coordinates": source.negative_zeros,
                 "frames_parsed_line_by_line": source.line_parsed_frames,
             },
+        }
+        if irregularities is not None:   # a regular source has no such key: its manifest is what it always was
+            manifest["source_irregularities"] = irregularities
+        manifest.update({
             "verification": verification,
             "converter": {
                 "name": "lib/archive.py",
@@ -1685,7 +2354,7 @@ def convert_entry(
                 "machine": platform.machine(),
             },
             "warnings": warnings,
-        }
+        })
         _write_json_atomic(staging / MANIFEST_FILE, manifest)
         _fsync_path(staging)
 
@@ -1724,8 +2393,27 @@ def iter_entry_dirs(archive_dir: PathLike) -> Iterator[Path]:
             yield path
 
 
+def repair_summary(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The short form of ``source_irregularities`` for an index or a report; None for a regular entry."""
+    irregularities = manifest.get("source_irregularities")
+    if irregularities is None:
+        return None
+    return {
+        "frames_in_source": irregularities["frames_in_source"],
+        "frames_dropped": irregularities["frames_dropped"],
+        "bytes_ignored": irregularities["bytes_ignored"],
+        "truncated": irregularities["truncated"],
+        "counts": irregularities["counts"],
+    }
+
+
 def build_index(archive_dir: PathLike) -> Tuple[Dict[str, Any], List[str]]:
-    """Index of every entry of ``archive_dir`` and the problems met while reading."""
+    """Index of every entry of ``archive_dir`` and the problems met while reading.
+
+    ``repaired`` names the entries that were archived with repair; the
+    record of each of them, and of no other entry, has ``repaired`` with the
+    short form of its ``source_irregularities``.
+    """
     records: List[Dict[str, Any]] = []
     problems: List[str] = []
     for path in iter_entry_dirs(archive_dir):
@@ -1736,7 +2424,7 @@ def build_index(archive_dir: PathLike) -> Tuple[Dict[str, Any], List[str]]:
             size, sha256 = _sha256_file(path / MANIFEST_FILE)
             files = {MANIFEST_FILE: {"size": size, "sha256": sha256}}
             files.update(manifest["files"])
-            records.append({
+            record = {
                 "glycam_name": manifest["glycam_name"],
                 "folder": manifest["folder"],
                 "object_key_prefix": manifest["object_key_prefix"],
@@ -1747,7 +2435,11 @@ def build_index(archive_dir: PathLike) -> Tuple[Dict[str, Any], List[str]]:
                 "source_sha256": manifest["source"]["sha256"],
                 "archive_size": sum(item["size"] for item in files.values()),
                 "files": files,
-            })
+            }
+            repaired = repair_summary(manifest)
+            if repaired is not None:
+                record["repaired"] = repaired
+            records.append(record)
         except (ArchiveError, KeyError, TypeError, OSError) as exc:
             problems.append(f"{path.name}: {type(exc).__name__}: {exc}")
     records.sort(key=lambda record: record["glycam_name"])
@@ -1766,6 +2458,7 @@ def build_index(archive_dir: PathLike) -> Tuple[Dict[str, Any], List[str]]:
             "source_bytes": sum(record["source_size"] for record in records),
             "archive_bytes": sum(record["archive_size"] for record in records),
         },
+        "repaired": [record["glycam_name"] for record in records if "repaired" in record],
         "records": records,
     }
     return index, problems
