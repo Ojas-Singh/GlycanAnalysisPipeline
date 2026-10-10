@@ -115,6 +115,37 @@ frame_quality_block_frames = _int_env(
 )
 upload_workers = _int_env("GLYCOSHAPE_UPLOAD_WORKERS", 1)
 
+
+def parse_cluster_levels(raw) -> tuple:
+    """Clustering levels from "1,2" or "1,2,3" (or a sequence of integers).
+
+    Level 1 (GMM) and Level 2 (k-center coverage) are always present; the
+    only choice is whether Level 3 (up to 512 k-center structures) is added.
+    """
+    if isinstance(raw, str):
+        raw = [part for part in raw.replace(" ", "").split(",") if part]
+    levels = tuple(sorted({int(value) for value in raw}))
+    if levels not in ((1, 2), (1, 2, 3)):
+        raise ValueError(f"cluster levels must be 1,2 or 1,2,3, got {raw!r}")
+    return levels
+
+
+def _cluster_levels_env(name: str, default: tuple) -> tuple:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return parse_cluster_levels(raw)
+    except ValueError as exc:
+        logger.warning("Invalid %s (%s); using %s", name, exc, ",".join(map(str, default)))
+        return default
+
+
+# Clustering levels that are computed, required by the completeness checks
+# and exported, in the process stage and in the static stage. Level 3 is no
+# longer published; folders that still contain it remain valid.
+cluster_levels = _cluster_levels_env("GLYCOSHAPE_CLUSTER_LEVELS", (1, 2))
+
 # Static SNFG rendering. crabWURCS is the default; set the renderer to
 # "glycodraw" to retain the previous glycowork implementation. The executable
 # can be an absolute path or a command available on PATH.

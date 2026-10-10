@@ -61,6 +61,7 @@ export GLYCOSHAPE_STATIC_WORKERS=8
 export GLYCOSHAPE_UPLOAD_WORKERS=1
 export GLYCOSHAPE_STORE_FRAMES_BUFFER=128
 export GLYCOSHAPE_STORE_FRAME_CHUNK=128
+export GLYCOSHAPE_CLUSTER_LEVELS=1,2
 export GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM=3.0
 export GLYCOSHAPE_FRAME_QUALITY_BLOCK_FRAMES=1024
 export GLYCOSHAPE_SNFG_RENDERER=crabwurcs
@@ -82,6 +83,10 @@ and WURCS → extended-IUPAC conversion when the remote format service cannot
 represent a glycan.
 
 With `GLYCOSHAPE_ORACLE_PAR_URL` set, use the staged workflow below: download the bucket `data/` prefix to local storage on a login node, process local data on AMD Slurm nodes, then build and upload only `static/` from a login node. `process/` is deliberately local-only and must not be uploaded to Oracle.
+
+`GLYCOSHAPE_CLUSTER_LEVELS` (or `--levels`) is the set of clustering levels
+that is computed, required by the completeness checks and exported: `1,2`
+(the default) or `1,2,3`. See [Clustering levels](#clustering-levels).
 
 `GLYCOSHAPE_STORE_FRAME_CHUNK` is the number of frames per Zarr chunk of
 `process/<glycan>/data/coords.zarr`; `0` (the default) is one chunk for the
@@ -109,6 +114,33 @@ Run modes:
 - `fresh`: recomputes v2 and glystatic even when bucket outputs already exist. `--update` is kept as an alias for this mode except when `--mode process-only` or `--mode static-only` is explicitly selected.
 - `process-only`: runs local `data/` to local `process/` only, skips glystatic/glymeta/PocketBase/Oracle upload/finalization, and is suitable for Slurm nodes without internet access.
 - `static-only`: rebuilds local `static/` from existing local `process/` outputs, skips already complete GS folders unless `--update` is passed, skips v2/process and Oracle sync/upload, runs glymeta best-effort for rebuilt glycans, and refreshes final database artifacts.
+
+### Clustering levels
+
+Level 1 is the GMM clustering into five clusters, Level 2 the k-center
+coverage set (5 to 128 structures, from the conformational entropy). Level 3,
+the k-center set of up to 512 structures, is no longer published and is off by
+default: with levels `1,2` nothing of it is computed, written, required or
+exported, in the process stage and in the static stage. Levels 1 and 2 do not
+depend on it (each k-center run seeds the generator itself), so they are the
+same with and without it.
+
+- `--levels 1,2,3` (or `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3`) restores Level 3
+  everywhere: clustering, `output/level_3/`, `torsion_level_3_reps`, the
+  `level_3_cluster` / `level_3_center` columns of `torsion_all`, `info.json`
+  and the completeness checks.
+- Existing `process/` and `static/` folders that contain Level 3 are complete
+  under either setting and are not recomputed by an incremental run.
+- The static stage writes only the configured levels: `--mode static-only
+  --update` with levels `1,2` rebuilds `static/GSxxxxx/` without Level 3 from a
+  `process/` folder that has it (no `output/level_3/`, no
+  `torsion_level_3_reps.csv`, no Level 3 columns in `torsion_all.csv`, no
+  Level 3 entries in `info.json` and `data.json`).
+- A `process/` folder made with levels `1,2` is incomplete under `1,2,3`; a
+  process run then adds Level 3 and rewrites what is indexed by clusters.
+- A forced process run (`--update`) with levels `1,2` on a folder that has
+  Level 3 leaves the old `output/level_3/` and `torsion_level_3_reps.parquet`
+  files in place; they are ignored.
 
 Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
 

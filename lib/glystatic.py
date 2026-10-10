@@ -19,6 +19,14 @@ from glycowork.motif.draw import GlycoDraw
 import logging
 from lib import glypdbio, config, name_utils
 from lib.storage import get_storage_manager
+# The files that need neither identifiers nor the network are written by
+# lib.static_ready, which the one-entry mode uses on its own.
+from lib.static_ready import (
+    copy_analysis_files,
+    copy_and_convert_pdbs,
+    extract_cluster_data,
+    load_info_json,
+)
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 
@@ -90,29 +98,6 @@ def _apply_glytoucan_fallbacks(
     if not glytoucan and inventory_glytoucan:
         glytoucan = inventory_glytoucan
     return glytoucan, glytoucan_alpha, glytoucan_beta
-
-
-def _copy_or_convert_analysis_table(storage, folder_path: str, output_subdir: str, csv_name: str, parquet_name: str) -> bool:
-    """Write a static CSV from a Parquet process export, falling back to legacy CSV copy."""
-    parquet_src = f"{folder_path}/embedding/exports/{parquet_name}"
-    csv_src = f"{folder_path}/output/{csv_name}"
-    csv_dst = f"{output_subdir}/{csv_name}"
-
-    if storage.exists(parquet_src):
-        try:
-            df = pd.read_parquet(BytesIO(storage.read_binary(parquet_src)))
-            storage.write_text(csv_dst, df.to_csv(index=False))
-            logger.info(f"Converted Parquet export to static CSV: {parquet_name} -> {csv_name}")
-            return True
-        except Exception as exc:
-            logger.warning(f"Failed to convert {parquet_src} to {csv_name}: {exc}")
-
-    if storage.exists(csv_src):
-        content = storage.read_binary(csv_src)
-        storage.write_binary(csv_dst, content)
-        return True
-
-    return False
 
 
 def get_glycan_metadata(glycam_name: str) -> dict:
@@ -304,21 +289,6 @@ def _get_metadata_from_csv(glycam_name: str) -> dict:
         raise
 
 
-def _emit_multimodel_pdbs(dest_level_dir: str, source_level_dir: str, cluster_data: dict, level_name: str, anomer_meta: dict | None = None) -> None:
-    """Delegate multi-model emission to glypdbio with remarks support."""
-    try:
-        glypdbio.emit_multimodel_pdbs(
-            source_level_dir=source_level_dir,
-            dest_level_dir=dest_level_dir,
-            cluster_data=cluster_data,
-            level_name=level_name,
-            anomer_meta=anomer_meta,
-            formats=["GLYCAM", "PDB"],
-        )
-    except Exception as e:
-        logger.warning(f"Failed to emit multi-model PDBs for {level_name}: {e}")
-
-
 def generate_glycan_id(glycam_name: str) -> str:
     """Generate a simple ID from glycam name as fallback."""
     # Simple ID generation - you can make this more sophisticated if needed
@@ -326,130 +296,6 @@ def generate_glycan_id(glycam_name: str) -> str:
     # Create a hash of the glycam name for a consistent ID
     hash_obj = hashlib.md5(glycam_name.encode())
     return f"GS{hash_obj.hexdigest()[:6].upper()}"
-
-
-def load_info_json(folder_path) -> dict:
-    """Load and parse the info.json file from the output directory."""
-    storage = get_storage_manager()
-    info_path = f"{folder_path}/output/info.json"
-    if not storage.exists(info_path):
-        raise FileNotFoundError(f"info.json not found at {info_path}")
-    
-    with storage.open(info_path, 'r') as f:
-        return json.load(f)
-
-
-def extract_cluster_data(info_data: dict, folder_path: str) -> dict:
-    """Extract cluster data directly from info.json without probing remote per-cluster files."""
-    cluster_data = {
-        "entropy_nats": info_data.get("entropy_nats"),
-        "torsions": info_data.get("torsions", {}),
-        "levels": {},
-        "pca": info_data.get("pca", {})
-    }
-    
-    # Process each level
-    for level_info in info_data.get("levels", []):
-        level_num = level_info["level"]
-        
-        # Extract cluster information for this level
-        clusters = []
-        for cluster in level_info.get("clusters", []):
-            cluster_info = {
-                "cluster_id": cluster["cluster_id"],
-                "cluster_size_pct": cluster["cluster_size_pct"],
-                "representative_idx": cluster["representative_idx"],
-                "members_count": cluster["members_count"],
-                "torsion_stats": cluster.get("torsion_stats", {})
-            }
-            clusters.append(cluster_info)
-        
-        cluster_data["levels"][f"level_{level_num}"] = {
-            "n_clusters": level_info["n_clusters"],
-            "clusters": clusters
-        }
-    
-    return cluster_data
-
-
-def copy_and_convert_pdbs(
-    folder_path: str, 
-    output_dir: str, 
-    glycam_name: str,
-    archetype_glytoucan: str = None,
-    archetype_iupac: str = None,
-    alpha_glytoucan: str = None,
-    alpha_iupac: str = None,
-    beta_glytoucan: str = None,
-    beta_iupac: str = None,
-    cluster_data: dict = None
-):
-    """Copy PDB files and convert them to different formats using glypdbio.
-    
-    Parameters:
-        folder_path: Path to the source folder containing PDB files
-        output_dir: Path to the output directory
-        glycam_name: GLYCAM name of the glycan
-        archetype_glytoucan: GlyTouCan ID for the archetype form
-        archetype_iupac: IUPAC name for the archetype form
-        alpha_glytoucan: GlyTouCan ID for the alpha anomer
-        alpha_iupac: IUPAC name for the alpha anomer
-        beta_glytoucan: GlyTouCan ID for the beta anomer
-        beta_iupac: IUPAC name for the beta anomer
-        cluster_data: Dictionary containing cluster information from info.json
-    """
-    storage = get_storage_manager()
-    source_output = Path(folder_path) / "output"
-
-    # Determine levels from info.json cluster_data to be backend-agnostic
-    level_names: list[str] = []
-    if isinstance(cluster_data, dict) and "levels" in cluster_data and isinstance(cluster_data["levels"], dict):
-        level_names = sorted([k for k in cluster_data["levels"].keys() if k.startswith("level_")])
-    # Fallback to filesystem probing only if necessary
-    if not level_names:
-        try:
-            # Best-effort: collect unique names under output/ that look like level_* prefixes
-            all_objs = storage.list_files(source_output, "*")
-            seen = set()
-            for obj in all_objs:
-                parts = Path(obj).as_posix().split('/')
-                try:
-                    idx = parts.index("output")
-                    name = parts[idx+1]
-                    if name.startswith("level_"):
-                        seen.add(name)
-                except Exception:
-                    continue
-            level_names = sorted(seen)
-        except Exception:
-            level_names = []
-
-    for level_name in level_names:
-        dest_level_dir = Path(output_dir) / "output" / level_name
-        storage.mkdir(dest_level_dir)
-
-        # Copy dist.svg if it exists
-        dist_file = source_output / level_name / "dist.svg"
-        if storage.exists(dist_file):
-            # Use storage abstraction to read and write
-            content = storage.read_binary(dist_file)
-            storage.write_binary(dest_level_dir / "dist.svg", content)
-
-        # Build multi-model PDBs for every discovered clustering level; do not emit per-cluster converted PDBs.
-        try:
-            anomer_meta = {
-                "alpha": {"glytoucan": alpha_glytoucan or archetype_glytoucan, "iupac": alpha_iupac or archetype_iupac},
-                "beta": {"glytoucan": beta_glytoucan or archetype_glytoucan, "iupac": beta_iupac or archetype_iupac},
-            }
-            _emit_multimodel_pdbs(
-                dest_level_dir=dest_level_dir,
-                source_level_dir=source_output / level_name,
-                cluster_data=cluster_data,
-                level_name=level_name,
-                anomer_meta=anomer_meta,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to build multi-model PDBs for {level_name}: {e}")
 
 
 def make_serializable(obj):
@@ -882,39 +728,8 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
             cluster_data=cluster_data
         )
         
-        # Copy additional analysis files to output subdirectory
-        output_subdir = f"{final_output_dir}/output"
-        storage.mkdir(output_subdir)
-        
-        table_exports = {
-            "pca.csv": "pca.parquet",
-            "torsion_glycosidic.csv": "torsion_glycosidic.parquet",
-            "torsion_all.csv": "torsion_all.parquet",
-        }
-        for level_key in cluster_levels.keys():
-            table_exports[f"torsion_{level_key}_reps.csv"] = f"torsion_{level_key}_reps.parquet"
-
-        for csv_name, parquet_name in table_exports.items():
-            _copy_or_convert_analysis_table(storage, folder_path, output_subdir, csv_name, parquet_name)
-
-        for file_name in ("torparts.npz", "info.json"):
-            src_file = f"{folder_path}/output/{file_name}"
-            if storage.exists(src_file):
-                # Use storage abstraction to copy files
-                content = storage.read_binary(src_file)
-                storage.write_binary(f"{output_subdir}/{file_name}", content)
-        
-        # Copy frozen PCA landscape data (ROH-excluded, anomer-independent)
-        landscape_src_dir = f"{folder_path}/embedding/landscape"
-        if storage.exists(landscape_src_dir):
-            landscape_dst_dir = f"{final_output_dir}/landscape"
-            storage.mkdir(landscape_dst_dir)
-            for landscape_file in ("pca_model.joblib", "landscape_metadata.json", "preprocessing.npz"):
-                src_file = f"{landscape_src_dir}/{landscape_file}"
-                if storage.exists(src_file):
-                    content = storage.read_binary(src_file)
-                    storage.write_binary(f"{landscape_dst_dir}/{landscape_file}", content)
-                    logger.info(f"Copied landscape file: {landscape_file}")
+        # Tables, info.json, torparts.npz and the frozen PCA landscape
+        copy_analysis_files(folder_path, final_output_dir, cluster_levels.keys())
 
         logger.info(f"Successfully processed {glycam_name} -> {final_output_dir}")
         return {

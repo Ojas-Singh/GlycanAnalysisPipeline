@@ -770,13 +770,36 @@ def _build_frame_row_lookup(df: pl.DataFrame, frame_col: str = "frame") -> tuple
     return frames, {int(frame): idx for idx, frame in enumerate(frames.tolist())}
 
 
+def _required_cluster_levels() -> Tuple[int, ...]:
+    """Levels that are computed, exported and required for completeness."""
+    return tuple(int(level) for level in config.cluster_levels)
+
+
+def _level_assignment_columns() -> List[str]:
+    """Per-frame cluster and center columns of torsion_all for the configured levels."""
+    return [
+        f"level_{level}_{kind}"
+        for level in _required_cluster_levels()
+        for kind in ("cluster", "center")
+    ]
+
+
+def _levels_to_process(cr) -> List[int]:
+    """Stored levels that are configured; an older folder may hold more."""
+    wanted = set(_required_cluster_levels())
+    return [int(level) for level in cr.levels() if int(level) in wanted]
+
+
 def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, return_context: bool = False):
     """Run two-level clustering:
        - main: H_nats-guided target (1–8) with local silhouette refinement; save silhouettes to pca.json
        - coverage: linear H_nats -> [10..128] via k-center.
+       - level 3 (k-center, up to 512 centers) only when config.cluster_levels includes it.
        
-       Returns the conformational entropy H (nats).
+       Returns the conformational entropy H (nats). With return_context the
+       context says whether the clustering was computed ("computed") or reused.
     """
+    levels = _required_cluster_levels()
     pca_df = _read_parquet_robust(pca_path)
     selected_cols = [f"PC{i}" for i in range(1, 4)]
     all_pc_cols = [col for col in pca_df.columns if col.startswith("PC") and col[2:].isdigit()]
@@ -806,22 +829,19 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
         except Exception:
             existing_levels = set()
 
-        if {1, 2, 3}.issubset(existing_levels):
-            logger.info("Clustering step: outputs exist and include level_3; skipping")
-            _update_pca_json(
-                embedding_dir,
-                {
-                    "main_clustering": {"H_nats": H},
-                    "level_3_clustering": {
-                        "selected_n_clusters": int(cr_existing.get_n_clusters(3) or 0),
-                    },
-                },
-            )
+        if set(levels).issubset(existing_levels):
+            logger.info(f"Clustering step: outputs exist and include levels {list(levels)}; skipping")
+            pca_updates: Dict = {"main_clustering": {"H_nats": H}}
+            if 3 in levels:
+                pca_updates["level_3_clustering"] = {
+                    "selected_n_clusters": int(cr_existing.get_n_clusters(3) or 0),
+                }
+            _update_pca_json(embedding_dir, pca_updates)
             if return_context:
-                return H, {"cr": cr_existing, "pca_df": pca_df}
+                return H, {"cr": cr_existing, "pca_df": pca_df, "computed": False}
             return H
 
-        logger.info("Clustering step: existing outputs missing level_3; recomputing")
+        logger.info(f"Clustering step: existing outputs do not include levels {list(levels)}; recomputing")
 
     # Extract PCA data
     pca_data = pca_df.select(selected_cols).to_numpy()
@@ -897,18 +917,22 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
         min_coverage_improvement=0.01
     )
 
+    # LEVEL 3: k-center with up to 512 centers, only when configured. Each
+    # k-center call seeds the generator itself, so levels 1 and 2 do not
+    # depend on whether this one runs.
     n_frames = int(len(pca_data))
-    n_level_3_target = 512 if n_frames >= 512 else n_frames
-    labels_level_3, n_clusters_level_3 = kcenter_coverage_clustering(
-        pca_data,
-        max_clusters=n_level_3_target,
-        coverage_threshold=0.95,
-        min_coverage_improvement=0.01,
-    )
+    n_clusters_level_3 = None
+    if 3 in levels:
+        n_level_3_target = 512 if n_frames >= 512 else n_frames
+        labels_level_3, n_clusters_level_3 = kcenter_coverage_clustering(
+            pca_data,
+            max_clusters=n_level_3_target,
+            coverage_threshold=0.95,
+            min_coverage_improvement=0.01,
+        )
 
     main_member_lookup = _build_cluster_member_lookup(labels_main, 1 if n_main == 1 else n_main)
     cov_member_lookup = _build_cluster_member_lookup(labels_cov, n_clusters_cov)
-    level3_member_lookup = _build_cluster_member_lookup(labels_level_3, n_clusters_level_3)
 
     # Format results and save
     all_levels = {
@@ -926,14 +950,16 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
             pca_data_scaled=pca_data_scaled,
             cluster_member_indices=cov_member_lookup,
         ),
-        3: create_cluster_info_fast(
+    }
+    if n_clusters_level_3 is not None:
+        level3_member_lookup = _build_cluster_member_lookup(labels_level_3, n_clusters_level_3)
+        all_levels[3] = create_cluster_info_fast(
             labels_level_3,
             pca_df,
             n_clusters_level_3,
             pca_data_scaled=pca_data_scaled,
             cluster_member_indices=level3_member_lookup,
-        ),
-    }
+        )
 
     save_clustering_results(all_levels, output_path=cluster_out_json)
     save_clustering_results_parquet(all_levels, output_dir=embedding_dir)
@@ -957,34 +983,34 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
         logger.warning(f"Failed to map coverage clusters to main clusters: {exc}")
 
     # Update pca.json with main silhouettes and selections
-    _update_pca_json(
-        embedding_dir,
-        {
-            "main_clustering": {
-                "H_nats": H,
-                "silhouette_scores": silhouette_scores,
-                "selected_n_clusters": int(1 if n_main == 1 else n_main),
-                "coverage_clusters_per_main": {str(k): v for k, v in main_to_coverage_map.items()},
-            },
-            "coverage_clustering": {
-                "selected_n_clusters": int(n_clusters_cov),
-            },
-            "level_3_clustering": {
-                "selected_n_clusters": int(n_clusters_level_3),
-            },
+    pca_updates = {
+        "main_clustering": {
+            "H_nats": H,
+            "silhouette_scores": silhouette_scores,
+            "selected_n_clusters": int(1 if n_main == 1 else n_main),
+            "coverage_clusters_per_main": {str(k): v for k, v in main_to_coverage_map.items()},
         },
-    )
+        "coverage_clustering": {
+            "selected_n_clusters": int(n_clusters_cov),
+        },
+    }
+    if n_clusters_level_3 is not None:
+        pca_updates["level_3_clustering"] = {
+            "selected_n_clusters": int(n_clusters_level_3),
+        }
+    _update_pca_json(embedding_dir, pca_updates)
 
     logger.info(f"Saved clustering results to {cluster_out_json} and parquet in {embedding_dir}")
     logger.info(
         f"Main clusters: {1 if n_main == 1 else n_main}; "
-        f"Coverage clusters: {n_clusters_cov}; Level 3 coverage clusters: {n_clusters_level_3}"
+        f"Coverage clusters: {n_clusters_cov}"
+        + (f"; Level 3 coverage clusters: {n_clusters_level_3}" if n_clusters_level_3 is not None else "")
     )
     # Quick read-back and simple diagnostics
     cr = load_clustering_results_parquet(embedding_dir)
     logger.info(f"Cluster reader levels: {cr.levels()}")
     if return_context:
-        return H, {"cr": cr, "pca_df": pca_df}
+        return H, {"cr": cr, "pca_df": pca_df, "computed": True}
     return H
 
 
@@ -1147,7 +1173,7 @@ def step_cluster_torsion_stats(
                 for level in existing.get('levels', [])
                 if isinstance(level, dict) and level.get('level') is not None
             } if isinstance(existing, dict) else set()
-            levels_ok = {1, 2, 3}.issubset(level_keys)
+            levels_ok = set(_required_cluster_levels()).issubset(level_keys)
             if tors_ok and levels_ok:
                 logger.info("Torsion stats step: torsion_stats.json complete; skipping (use --update to force)")
                 return
@@ -1231,7 +1257,7 @@ def step_cluster_torsion_stats(
                 pca_frame_to_row = {}
 
     level_entropy_map = {}
-    for level in cr.levels():
+    for level in _levels_to_process(cr):
         n_clusters = cr.get_n_clusters(level)
         reps_df = cr.representatives(level)
         clusters_out = []
@@ -1358,7 +1384,7 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
             torsions_block = existing.get('torsions', {}) if isinstance(existing, dict) else {}
             if (
                 int(existing.get('schema_version', 0)) >= 3
-                and {1, 2, 3}.issubset(existing_levels)
+                and set(_required_cluster_levels()).issubset(existing_levels)
                 and torsions_block.get('metadata')
             ):
                 logger.info("Create info.json step: info.json exists and matches schema v3; skipping")
@@ -1590,6 +1616,7 @@ def step_save_representative_structures(
         current_anomer,
     )
     opposite_anomer = "beta" if current_anomer == "alpha" else "alpha"
+    levels = _levels_to_process(cr)
     # Read the reference frame and every representative frame in one pass:
     # with one Zarr chunk per trajectory, each single-frame read decompresses
     # all frames.
@@ -1597,7 +1624,7 @@ def step_save_representative_structures(
         coords,
         [0] + [
             int(rep_idx)
-            for level in cr.levels()
+            for level in levels
             for rep_idx in cr.representatives(level)["representative_idx"].to_list()
             if rep_idx is not None
         ],
@@ -1609,7 +1636,7 @@ def step_save_representative_structures(
     # Process each clustering level
     storage = get_storage_manager()
     total_structures = 0
-    for level in cr.levels():
+    for level in levels:
         reps_df = cr.representatives(level)
         level_dir = os.path.join(out_dir, f"level_{level}")
         os.makedirs(level_dir, exist_ok=True)
@@ -1785,7 +1812,7 @@ def step_plot_torsion_distributions(
     plots_skipped = 0
     pending: List[Tuple[int, str, List[int]]] = []
     
-    for level in cr.levels():
+    for level in _levels_to_process(cr):
         level_dir = os.path.join(out_dir, f"level_{level}")
         if not _path_exists(level_dir):
             logger.warning(f"Level directory {level_dir} does not exist; skipping distribution plot")
@@ -1966,7 +1993,7 @@ def step_export_analysis_data(
             torsion_metadata = _align_torsion_metadata_to_labels(torsion_labels, raw_metadata)
             export_names = _unique_column_names(_canonical_torsion_export_names(torsion_metadata))
 
-            levels_to_export = [1, 2, 3]
+            levels_to_export = list(_required_cluster_levels())
             frame_to_cluster_by_level: Dict[int, Dict[int, int]] = {}
             representative_by_level: Dict[int, Dict[int, int]] = {}
             reps_rows_by_level: Dict[int, List[Dict]] = {}
@@ -2013,7 +2040,7 @@ def step_export_analysis_data(
                     pl.Series(f"level_{level}_center", center_values, dtype=pl.Int32),
                 )
 
-            if force or not _has_required_parquet_headers(torsion_all_export_path, {"frame", "source_frame", "level_1_cluster", "level_1_center"}):
+            if force or not _has_required_parquet_headers(torsion_all_export_path, {"frame", "source_frame", *_level_assignment_columns()}):
                 _write_parquet(all_df, torsion_all_export_path)
                 logger.info(f"Exported all torsions with cluster assignments to {torsion_all_export_path}")
                 files_created += 1
@@ -2129,9 +2156,6 @@ def step_export_analysis_data(
     logger.info(f"Data export: {files_created} files created, {files_skipped} files skipped")
 
 
-REQUIRED_CLUSTER_LEVELS = (1, 2, 3)
-
-
 def _read_csv_header(path: str) -> List[str]:
     import csv
 
@@ -2186,7 +2210,7 @@ def _has_complete_clustering_outputs(embedding_dir: str) -> bool:
         except Exception:
             continue
 
-    return set(REQUIRED_CLUSTER_LEVELS).issubset(levels)
+    return set(_required_cluster_levels()).issubset(levels)
 
 
 def _has_complete_torsion_stats(embedding_dir: str) -> bool:
@@ -2203,7 +2227,7 @@ def _has_complete_torsion_stats(embedding_dir: str) -> bool:
         torsions_block.get("labels")
         and torsions_block.get("metadata")
         and torsions_block.get("family_summary")
-        and set(REQUIRED_CLUSTER_LEVELS).issubset(level_keys)
+        and set(_required_cluster_levels()).issubset(level_keys)
     )
 
 
@@ -2223,13 +2247,13 @@ def _has_current_output_info_json(info_path: str) -> bool:
 
     return bool(
         int(info.get("schema_version", 0)) >= 3
-        and set(REQUIRED_CLUSTER_LEVELS).issubset(levels)
+        and set(_required_cluster_levels()).issubset(levels)
         and torsions_block.get("metadata")
     )
 
 
 def _has_complete_structure_outputs(out_dir: str) -> bool:
-    for level in REQUIRED_CLUSTER_LEVELS:
+    for level in _required_cluster_levels():
         for file_name in ("alpha.pdb", "beta.pdb"):
             if not _path_exists(os.path.join(out_dir, f"level_{level}", file_name)):
                 return False
@@ -2237,7 +2261,7 @@ def _has_complete_structure_outputs(out_dir: str) -> bool:
 
 
 def _has_complete_plot_outputs(out_dir: str) -> bool:
-    for level in REQUIRED_CLUSTER_LEVELS:
+    for level in _required_cluster_levels():
         if not _path_exists(os.path.join(out_dir, f"level_{level}", "dist.svg")):
             return False
     return True
@@ -2267,22 +2291,14 @@ def _has_complete_export_outputs(embedding_dir: str, out_dir: str) -> bool:
         torsion_glycosidic_out_path,
         torparts_out_path,
     ]
-    required_paths.extend(os.path.join(exports_dir, f"torsion_level_{level}_reps.parquet") for level in REQUIRED_CLUSTER_LEVELS)
+    required_paths.extend(os.path.join(exports_dir, f"torsion_level_{level}_reps.parquet") for level in _required_cluster_levels())
 
     if not all(_path_exists(path) for path in required_paths):
         return False
 
     if not _has_required_parquet_headers(
         torsion_all_out_path,
-        {
-            "frame",
-            "level_1_cluster",
-            "level_1_center",
-            "level_2_cluster",
-            "level_2_center",
-            "level_3_cluster",
-            "level_3_center",
-        },
+        {"frame", *_level_assignment_columns()},
     ):
         return False
 
@@ -2499,6 +2515,11 @@ class GlycanAnalysisPipeline:
                 results['error_message'] = f"Clustering step failed: {str(e)}"
                 return results
 
+            # A clustering computed in this run (first run, forced, or a level
+            # added to existing outputs) invalidates what is indexed by its
+            # clusters: statistics, info.json, structures, plots, exports.
+            cluster_force = bool(downstream_force or clustering_context.get('computed'))
+
             # Step 5: Cluster torsion statistics
             try:
                 self.logger.info("Step 5: Torsion statistics")
@@ -2506,7 +2527,7 @@ class GlycanAnalysisPipeline:
                 step_cluster_torsion_stats(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
-                    force=downstream_force,
+                    force=cluster_force,
                     cr=clustering_context.get('cr'),
                     pca_df=clustering_context.get('pca_df'),
                 )
@@ -2526,7 +2547,7 @@ class GlycanAnalysisPipeline:
                 step_create_info_json(
                     paths['embedding_dir'], 
                     entropy, 
-                    force=downstream_force
+                    force=cluster_force
                 )
                 results['step_durations_sec']['create_info'] = round(time.perf_counter() - step_started_at, 3)
                 self.logger.info(f"Step 6 completed in {results['step_durations_sec']['create_info']:.3f}s")
@@ -2546,7 +2567,7 @@ class GlycanAnalysisPipeline:
                     paths['embedding_dir'], 
                     paths['out_dir'], 
                     paths['glycam_name'], 
-                    force=downstream_force,
+                    force=cluster_force,
                     cr=clustering_context.get('cr'),
                 )
                 results['step_durations_sec']['structures'] = round(time.perf_counter() - step_started_at, 3)
@@ -2565,7 +2586,7 @@ class GlycanAnalysisPipeline:
                 step_plot_torsion_distributions(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
-                    force=downstream_force,
+                    force=cluster_force,
                     cr=clustering_context.get('cr'),
                 )
                 results['step_durations_sec']['plots'] = round(time.perf_counter() - step_started_at, 3)
@@ -2584,7 +2605,7 @@ class GlycanAnalysisPipeline:
                 step_export_analysis_data(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
-                    force=downstream_force,
+                    force=cluster_force,
                     frame_data_dir=paths['frame_data_dir'],
                     cr=clustering_context.get('cr'),
                     pca_df=clustering_context.get('pca_df'),
