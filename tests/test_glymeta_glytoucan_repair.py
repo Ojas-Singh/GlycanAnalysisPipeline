@@ -2,10 +2,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import main as pipeline_main
 import requests
+from lib import name_utils
 from lib import storage as storage_module
 from lib.glybake import GlycoShapeBaker
 from lib.glymeta import GlycanMetadataProcessor
@@ -20,6 +21,108 @@ class GlyTouCanRepairTests(unittest.TestCase):
 
     def tearDown(self):
         storage_module._storage_manager = self._previous_storage_manager
+
+    def test_wurcs_lookup_uses_normalizing_converter_accession(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [{"id": "G77945NE"}]
+
+        with (
+            patch("lib.name_utils.requests.post", return_value=response) as post,
+            patch("lib.name_utils.requests.get") as get,
+        ):
+            result = name_utils.wurcs2glytoucan(
+                "WURCS=2.0/1,1,0/[noncanonical]/1/"
+            )
+
+        self.assertEqual(result, "G77945NE")
+        self.assertEqual(
+            post.call_args.kwargs["json"],
+            ["WURCS=2.0/1,1,0/[noncanonical]/1/"],
+        )
+        self.assertEqual(post.call_args.kwargs["timeout"], 30)
+        get.assert_not_called()
+
+    def test_wurcs_lookup_falls_back_to_exact_match(self):
+        canonical_response = Mock()
+        canonical_response.raise_for_status.return_value = None
+        canonical_response.json.return_value = [{"WURCS": "WURCS=2.0/example"}]
+        exact_response = Mock()
+        exact_response.raise_for_status.return_value = None
+        exact_response.json.return_value = [{"id": "G40990LB"}]
+
+        with (
+            patch(
+                "lib.name_utils.requests.post",
+                return_value=canonical_response,
+            ),
+            patch(
+                "lib.name_utils.requests.get",
+                return_value=exact_response,
+            ) as get,
+        ):
+            result = name_utils.wurcs2glytoucan("WURCS=2.0/example")
+
+        self.assertEqual(result, "G40990LB")
+        self.assertEqual(
+            get.call_args.kwargs["params"],
+            {"wurcs": "WURCS=2.0/example"},
+        )
+        self.assertEqual(get.call_args.kwargs["timeout"], 30)
+
+    def test_bulk_lookup_deduplicates_and_maps_converter_results(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = [
+            {"id": "G11111AA"},
+            {"message": "Accession not found."},
+        ]
+
+        with patch(
+            "lib.name_utils.requests.post",
+            return_value=response,
+        ) as post:
+            result = name_utils.wurcs2glytoucan_many(
+                ["WURCS=2.0/one", "WURCS=2.0/two", "WURCS=2.0/one"]
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "WURCS=2.0/one": "G11111AA",
+                "WURCS=2.0/two": None,
+            },
+        )
+        self.assertEqual(
+            post.call_args.kwargs["json"],
+            ["WURCS=2.0/one", "WURCS=2.0/two"],
+        )
+
+    def test_missing_report_rechecks_and_deduplicates_wurcs(self):
+        wurcs = "WURCS=2.0/1,1,0/[a2122h-1b_1-5]/1/"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "GLYCOSHAPE.json").write_text(
+                json.dumps({
+                    "GS00001": {
+                        "archetype": {"wurcs": wurcs, "glytoucan": ""},
+                        "alpha": {"wurcs": wurcs, "glytoucan": None},
+                    }
+                }),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "lib.glybake.name_utils.wurcs2glytoucan_many",
+                return_value={wurcs: "G12345AB"},
+            ) as lookup:
+                GlycoShapeBaker(root).extract_missing_glytoucan_ids()
+
+            self.assertEqual(
+                (root / "missing_glytoucan.txt").read_text(encoding="utf-8"),
+                "",
+            )
+            lookup.assert_called_once_with([wurcs])
 
     def test_update_glycan_metadata_repairs_missing_variant_glytoucan_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -47,6 +47,7 @@ class PocketBaseClient:
         self._cache_by_id: Dict[str, Any] = {}
         self._cache_by_name: Dict[str, Any] = {}
         self._glycan_cache_by_id: Dict[str, Any] = {}
+        self._glycan_cache_by_name: Dict[str, Any] = {}
         self._prefetched_collections = set()
         self.timeout = float(os.environ.get("POCKETBASE_TIMEOUT", "30"))
         self.retries = max(1, int(os.environ.get("POCKETBASE_RETRIES", "3")))
@@ -165,8 +166,9 @@ class PocketBaseClient:
         self, glycam_name: str, collection: str = COLLECTION
     ) -> Optional[dict]:
         """Fetch a record by glycam_name, with in-memory cache."""
-        if glycam_name in self._cache_by_name:
-            return self._cache_by_name[glycam_name]
+        name_cache = self._glycan_cache_by_name if collection == GLYCAN_COLLECTION else self._cache_by_name
+        if glycam_name in name_cache:
+            return name_cache[glycam_name]
         if collection in self._prefetched_collections:
             return None
         data = self.request(
@@ -176,7 +178,7 @@ class PocketBaseClient:
         )
         items = data.get("items", [])
         record = items[0] if items else None
-        self._cache_by_name[glycam_name] = record
+        name_cache[glycam_name] = record
         return record
 
     def prefetch_all(
@@ -199,7 +201,10 @@ class PocketBaseClient:
                 elif gs_id:
                     self._cache_by_id[gs_id] = item
                 if glycam_name:
-                    self._cache_by_name[glycam_name] = item
+                    if collection == GLYCAN_COLLECTION:
+                        self._glycan_cache_by_name[glycam_name] = item
+                    else:
+                        self._cache_by_name[glycam_name] = item
                 total_loaded += 1
             if page >= data.get("totalPages", 1):
                 break
@@ -212,6 +217,7 @@ class PocketBaseClient:
         self._cache_by_id.clear()
         self._cache_by_name.clear()
         self._glycan_cache_by_id.clear()
+        self._glycan_cache_by_name.clear()
         self._prefetched_collections.clear()
         self._available = None
 
@@ -249,6 +255,8 @@ class PocketBaseClient:
 
         if result.get("glycoshape_id"):
             self._glycan_cache_by_id[result["glycoshape_id"]] = result
+        if result.get("glycam_name"):
+            self._glycan_cache_by_name[result["glycam_name"]] = result
         return result
 
     def update_submission_record(
@@ -372,13 +380,17 @@ def extract_inventory_metadata(pb_record: dict) -> dict:
     Returns the same structure as ``get_glycan_metadata_from_inventory()``
     in ``lib/glystatic.py``, so it can be used as a drop-in replacement.
     """
-    return {
+    metadata = {
         "ID": pb_record.get("glycoshape_id", ""),
         "timestamp": pb_record.get("created", ""),
         "email": pb_record.get("email", ""),
         "glycam_name": pb_record.get("glycam_name", ""),
         "transfer_method": pb_record.get("source_value", ""),
         "length": _safe_float(pb_record.get("simulation_length")),
+        # Optional explicit source field.  Do not derive duration from
+        # submission progress: the authoritative duration belongs with the
+        # uploaded glycan data and is converted by the static exporter.
+        "simulation_length_ns": _safe_float(pb_record.get("simulation_length_ns")),
         "package": pb_record.get("md_package", ""),
         "forcefield": pb_record.get("force_field", ""),
         "temperature": _safe_float(pb_record.get("temperature")),
@@ -387,6 +399,8 @@ def extract_inventory_metadata(pb_record: dict) -> dict:
         "comments": pb_record.get("comments", ""),
         "glytoucan_id": pb_record.get("glytoucan_id", ""),
     }
+
+    return metadata
 
 
 def extract_md_info(pb_record: dict) -> tuple:

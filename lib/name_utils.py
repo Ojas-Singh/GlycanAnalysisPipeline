@@ -7,6 +7,7 @@ import requests
 import collections
 import polars as pl
 import math
+from functools import lru_cache
 from pathlib import Path
 from io import BytesIO
 from lib.storage import get_storage_manager
@@ -172,24 +173,79 @@ def iupac2wurcs_glytoucan(iupac_condensed):
         dict: A dictionary containing the GlyTouCan accession number and WURCS format, 
               or an error message if the request fails.
     """
-    # Base URL for the API endpoint
-    url = f"https://api.glycosmos.org/glycanformatconverter/2.10.0/iupaccondensed2wurcs/{iupac_condensed}"
+    # Prefer the pinned local converter so WURCS generation is reproducible
+    # and benefits from crabWURCS fixes even when GlyCosmos also accepts the
+    # input.  GlyCosmos remains the fallback and is still used to resolve the
+    # corresponding GlyTouCan accession.
+    local_wurcs = crabwurcs_convert(iupac_condensed, "iupac-condensed", "wurcs")
+    if local_wurcs:
+        return wurcs2glytoucan(local_wurcs), local_wurcs
+
+    encoded_iupac = requests.utils.quote(str(iupac_condensed or "").strip(), safe="")
+    url = f"https://api.glycosmos.org/glycanformatconverter/2.10.0/iupaccondensed2wurcs/{encoded_iupac}"
     
     try:
         # Make the API request
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         # Raise an exception if the request failed
         response.raise_for_status()
         
         # Parse the JSON response
         data = response.json()
-        return data.get("id"),data.get("WURCS")
+        return data.get("id"), data.get("WURCS")
     except requests.exceptions.RequestException as e:
         # Handle any request exceptions
-        return {"error": str(e)}
-    except KeyError:
+        logger.error(f"Failed to convert IUPAC to WURCS/GlyTouCan for {iupac_condensed}: {e}")
+        return None, crabwurcs_convert(iupac_condensed, "iupac-condensed", "wurcs")
+    except (KeyError, ValueError) as e:
         # Handle unexpected response structure
-        return {"error": "Unexpected response structure"}
+        logger.error(f"Unexpected IUPAC to WURCS response for {iupac_condensed}: {e}")
+        return None, crabwurcs_convert(iupac_condensed, "iupac-condensed", "wurcs")
+
+
+def crabwurcs_convert(value, source_format, target_format, timeout=30):
+    """Convert a glycan notation locally with crabWURCS.
+
+    Returns ``None`` when crabWURCS is unavailable or cannot represent the
+    input, allowing callers to retain their existing remote/Java fallbacks.
+    """
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+
+    command = [
+        config.crabwurcs_executable,
+        "convert",
+        "--from",
+        source_format,
+        "--to",
+        target_format,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            input=text_value,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.debug("crabWURCS conversion unavailable: %s", exc)
+        return None
+
+    converted = result.stdout.strip()
+    if result.returncode == 0 and converted:
+        return converted
+
+    detail = result.stderr.strip() or converted or f"exit code {result.returncode}"
+    logger.debug(
+        "crabWURCS %s -> %s conversion failed: %s",
+        source_format,
+        target_format,
+        detail,
+    )
+    return None
 
 def wurcs2extendediupac(wurcs):
     """
@@ -201,12 +257,19 @@ def wurcs2extendediupac(wurcs):
     Returns:
         str: Extended IUPAC format or None if request fails
     """
+    local_iupac = crabwurcs_convert(wurcs, "wurcs", "iupac-extended")
+    if local_iupac:
+        return local_iupac
+
     url = "https://api.glycosmos.org/glycanformatconverter/2.10.0/wurcs2iupacextended"
     try:
-        response = requests.post(url, json={"input": wurcs})
+        response = requests.post(url, json={"input": wurcs}, timeout=30)
         response.raise_for_status()
         response.encoding = 'utf-8'
-        raw_iupac = response.json()["IUPACextended"]
+        payload = response.json()
+        raw_iupac = payload.get("IUPACextended")
+        if not raw_iupac:
+            raise ValueError(f"response did not contain IUPACextended: {payload}")
         return raw_iupac
     except Exception as e:
         logger.error(f"Failed to convert WURCS to extended IUPAC: {str(e)}")
@@ -457,8 +520,30 @@ def glytoucan2glygen(glytoucan_ac):
             url,
             headers={'accept': 'application/json', 'Content-Type': 'application/json'},
             json={'glytoucan_ac': glytoucan_ac},
-            verify=False
+            verify=False,
+            timeout=30,
         )
+        if response.status_code == 500:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            reason = payload.get("reason", {}) if isinstance(payload, dict) else {}
+            error_list = payload.get("error_list", []) if isinstance(payload, dict) else []
+            known_missing = (
+                reason.get("type") in {"discontinued_in_glygen", "non-existent-record"}
+                or any(
+                    isinstance(item, dict) and item.get("error_code") == "non-existent-record"
+                    for item in error_list
+                )
+            )
+            if known_missing:
+                logger.info(
+                    "GlyGen has no active record for %s: %s",
+                    glytoucan_ac,
+                    reason.get("description") or reason.get("type") or "non-existent record",
+                )
+                return payload
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -485,11 +570,32 @@ def glytoucan2glycosmos(glytoucan_id):
         return None
     
 
+def _detect_local_java_home():
+    """Return a usable local Java home bundled with the pipeline, if present."""
+    java_root = Path(__file__).resolve().parents[1] / ".java"
+    direct_java = java_root / "bin" / "java"
+    if direct_java.exists():
+        return java_root
+
+    for java_bin in sorted(java_root.glob("*/bin/java")):
+        if java_bin.exists():
+            return java_bin.parent.parent
+
+    return None
+
+
 def smiles2wurcs(smiles):
+    crabwurcs_result = crabwurcs_convert(smiles, "smiles", "wurcs")
+    if crabwurcs_result:
+        return crabwurcs_result
+
     jar_path = Path(__file__).parent / "MolWURCS.jar"
-    print("Using MolWURCS at :",jar_path)
     env = os.environ.copy()
     java_home = env.get("JAVA_HOME", "").strip()
+    if not java_home:
+        detected_java_home = _detect_local_java_home()
+        if detected_java_home:
+            java_home = str(detected_java_home)
     if java_home:
         lib_paths = [str(Path(java_home) / "lib"), str(Path(java_home) / "lib" / "server")]
         existing = env.get("LD_LIBRARY_PATH", "")
@@ -509,21 +615,100 @@ def smiles2wurcs(smiles):
         return None
 
 
+GLYCOSMOS_SPARQL_ENDPOINT = "https://ts.glycosmos.org/sparql"
+
+
+@lru_cache(maxsize=4096)
+def glytoucan2iupac(glytoucan_id):
+    """Resolve a GlyTouCan accession to condensed IUPAC via GlyCosmos RDF.
+
+    Motif accessions use the same GlyTouCan identifier space as ordinary
+    glycans (for example, ``G00026MO``).  The motif endpoint returns the
+    identifier and label but not the sequence, so the RDF endpoint is queried
+    for the condensed IUPAC sequence.
+
+    ``None`` is returned for an empty accession, an empty result, malformed
+    JSON, or a network/API failure.  The caller can therefore retain the motif
+    record and serialize an explicit ``iupac: null`` value.
+    """
+    glytoucan_id = str(glytoucan_id or "").strip()
+    if not glytoucan_id:
+        return None
+
+    # JSON quoting keeps the accession safe when embedded in the SPARQL
+    # string while retaining compatibility with the public endpoint.
+    accession_literal = json.dumps(glytoucan_id)
+    query = f"""
+PREFIX glycan: <http://purl.jp/bio/12/glyco/glycan#>
+PREFIX glytoucan: <http://www.glytoucan.org/glyco/owl/glytoucan#>
+SELECT DISTINCT ?sequence WHERE {{
+  ?saccharide glytoucan:has_primary_id ?accession .
+  FILTER (STR(?accession) = {accession_literal})
+  ?saccharide glycan:has_glycosequence ?glycosequence .
+  ?glycosequence glycan:has_sequence ?sequence .
+  ?glycosequence glycan:in_carbohydrate_format
+      glycan:carbohydrate_format_iupac_condensed .
+}}
+LIMIT 1
+"""
+
+    try:
+        response = requests.get(
+            GLYCOSMOS_SPARQL_ENDPOINT,
+            params={"query": query},
+            headers={"Accept": "application/sparql-results+json"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        bindings = payload.get("results", {}).get("bindings", [])
+        if not isinstance(bindings, list) or not bindings:
+            logger.warning("No condensed IUPAC found for GlyTouCan accession %s", glytoucan_id)
+            return None
+
+        sequence = bindings[0].get("sequence", {})
+        value = sequence.get("value") if isinstance(sequence, dict) else None
+        return str(value).strip() if value else None
+    except Exception as e:
+        logger.warning("Failed to get condensed IUPAC for %s: %s", glytoucan_id, e)
+        return None
+
+
 def glytoucan2motif(glytoucan_id):
-    """Get glycan motif data from GlyCosmos API for a GlyTouCan ID.
+    """Get glycan motif data from GlyCosmos and enrich it with condensed IUPAC.
     
     Args:
         glytoucan_id (str): GlyTouCan accession number
         
     Returns:
-        dict: Motif data or None if request fails
+        list: Motif data, with an ``iupac`` key on each motif object, or None
+        if the motif request fails
     """
     url = f"https://api.glycosmos.org/sparqlist/get_glycan_motif?id={glytoucan_id}"
     
     try:
         response = requests.get(url)
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        if not isinstance(payload, list):
+            return payload
+
+        enriched = []
+        for motif in payload:
+            if not isinstance(motif, dict):
+                enriched.append(motif)
+                continue
+
+            motif_data = dict(motif)
+            motif_id = str(motif_data.get("motif") or "").strip()
+            if not str(motif_data.get("iupac") or "").strip():
+                motif_data["iupac"] = glytoucan2iupac(motif_id) if motif_id else None
+            else:
+                # Make the output schema explicit even when an upstream
+                # response already provides the sequence.
+                motif_data.setdefault("iupac", None)
+            enriched.append(motif_data)
+        return enriched
     except Exception as e:
         logger.error(f"Failed to get glycan motif data: {str(e)}")
         return None
@@ -633,7 +818,11 @@ def get_wurcs_variants(input_wurcs: str):
     beta_wurcs = f'WURCS=2.0/{S},{D},{B}/{beta_residues_str}/{linkage}/{annotation}'
 
 
-    return normalize_wurcs(archetype_wurcs), normalize_wurcs(alpha_wurcs), normalize_wurcs(beta_wurcs)
+    return (
+        normalize_wurcs(archetype_wurcs) or archetype_wurcs,
+        normalize_wurcs(alpha_wurcs) or alpha_wurcs,
+        normalize_wurcs(beta_wurcs) or beta_wurcs,
+    )
 
 def validate_wurcs(wurcs):
     """
@@ -686,7 +875,13 @@ def normalize_wurcs(wurcs):
         return None  
     
 def wurcs2glytoucan(wurcs):
-    """Convert WURCS to GlyTouCan ID using GlyCosmos API.
+    """Resolve a WURCS string to a GlyTouCan ID using GlyCosmos.
+
+    GlyTouCan stores canonical WURCS strings, while valid WURCS produced by
+    converters may differ only in residue/linkage ordering.  The historical
+    ``wurcs2gtcids`` lookup is an exact-string query and reports those valid
+    aliases as missing.  Ask the format converter first because it
+    canonicalizes the structure and includes the matching accession.
     
     Args:
         wurcs (str): WURCS format string
@@ -694,22 +889,100 @@ def wurcs2glytoucan(wurcs):
     Returns:
         str: GlyTouCan ID or None if request fails
     """
+    wurcs = str(wurcs or "").strip()
+    if not wurcs:
+        return None
+
+    errors = []
+
     try:
-        # URL encode the WURCS string
-        encoded_wurcs = requests.utils.quote(wurcs)
-        url = f"https://api.glycosmos.org/sparqlist/wurcs2gtcids?wurcs={encoded_wurcs}"
-        
-        # Make the request
-        response = requests.get(url)
+        response = requests.post(
+            "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs",
+            json=[wurcs],
+            timeout=30,
+        )
         response.raise_for_status()
-        
-        # Parse response
         data = response.json()
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0].get("id")
-            
-        return None
-        
-    except Exception as e:
-        logger.error(f"Failed to convert WURCS to GlyTouCan ID: {str(e)}")
-        return None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            glytoucan_id = str(data[0].get("id") or "").strip()
+            if glytoucan_id:
+                return glytoucan_id
+    except Exception as exc:
+        errors.append(f"canonical lookup: {exc}")
+
+    # Retain the exact-match endpoint as a fallback in case the format
+    # converter accepts the WURCS but does not include accession metadata.
+    try:
+        response = requests.get(
+            "https://api.glycosmos.org/sparqlist/wurcs2gtcids",
+            params={"wurcs": wurcs},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            for match in data:
+                if not isinstance(match, dict):
+                    continue
+                glytoucan_id = str(match.get("id") or "").strip()
+                if glytoucan_id:
+                    return glytoucan_id
+    except Exception as exc:
+        errors.append(f"exact lookup: {exc}")
+
+    if errors:
+        logger.error(
+            "Failed to convert WURCS to GlyTouCan ID (%s)",
+            "; ".join(errors),
+        )
+    return None
+
+
+def wurcs2glytoucan_many(wurcs_values, batch_size=100):
+    """Resolve multiple WURCS strings with GlyCosmos' batch converter.
+
+    Returns a mapping for every non-empty input.  Values are ``None`` only
+    when no accession could be found.  Malformed or partial batch responses
+    fall back to the scalar resolver rather than silently misaligning IDs.
+    """
+    unique_wurcs = list(dict.fromkeys(
+        str(wurcs or "").strip()
+        for wurcs in wurcs_values
+        if str(wurcs or "").strip()
+    ))
+    results = {}
+
+    for start in range(0, len(unique_wurcs), batch_size):
+        batch = unique_wurcs[start:start + batch_size]
+        try:
+            response = requests.post(
+                "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs",
+                json=batch,
+                timeout=60,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list) or len(payload) != len(batch):
+                raise ValueError(
+                    f"expected {len(batch)} converter results, got "
+                    f"{len(payload) if isinstance(payload, list) else type(payload).__name__}"
+                )
+
+            for wurcs, item in zip(batch, payload):
+                glytoucan_id = (
+                    str(item.get("id") or "").strip()
+                    if isinstance(item, dict)
+                    else ""
+                )
+                results[wurcs] = glytoucan_id or None
+        except Exception as exc:
+            logger.warning(
+                "Batch WURCS-to-GlyTouCan lookup failed for %d entries; "
+                "falling back to individual lookup: %s",
+                len(batch),
+                exc,
+            )
+            for wurcs in batch:
+                results[wurcs] = wurcs2glytoucan(wurcs)
+
+    return results

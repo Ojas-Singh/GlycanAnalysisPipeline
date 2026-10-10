@@ -405,6 +405,67 @@ load_dotenv() {
 # Load .env file if present
 load_dotenv
 
+ensure_crabwurcs() {
+    local renderer
+    local required_version="0.2.2"
+    local crabwurcs_rev="d6145803ce5977eb4fb9ab785f3a242f63e0036b"
+    renderer="$(printf '%s' "${GLYCOSHAPE_SNFG_RENDERER:-crabwurcs}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$renderer" == "glycodraw" ]]; then
+        echo "Using glycowork GlycoDraw for SNFG rendering."
+        return 0
+    fi
+    if [[ "$renderer" != "crabwurcs" ]]; then
+        echo "WARNING: Invalid GLYCOSHAPE_SNFG_RENDERER=$renderer; using crabwurcs."
+    fi
+
+    if [[ -n "${GLYCOSHAPE_CRABWURCS_BIN:-}" ]]; then
+        if [[ -x "$GLYCOSHAPE_CRABWURCS_BIN" ]] || command -v "$GLYCOSHAPE_CRABWURCS_BIN" >/dev/null 2>&1; then
+            echo "Using configured crabWURCS executable: $GLYCOSHAPE_CRABWURCS_BIN"
+            return 0
+        fi
+        echo "ERROR: GLYCOSHAPE_CRABWURCS_BIN does not resolve to an executable: $GLYCOSHAPE_CRABWURCS_BIN"
+        return 1
+    fi
+
+    local install_root="$SCRIPT_DIR/.crabwurcs"
+    local crabwurcs_bin="$install_root/bin/crabwurcs"
+    if [[ -x "$crabwurcs_bin" ]]; then
+        if "$crabwurcs_bin" --version 2>/dev/null | grep -Eq "(^|[[:space:]])${required_version}([[:space:]]|$)"; then
+            export GLYCOSHAPE_CRABWURCS_BIN="$crabwurcs_bin"
+            echo "Using project-local crabWURCS ${required_version}: $crabwurcs_bin"
+            return 0
+        fi
+        echo "Updating project-local crabWURCS to ${required_version}..."
+    fi
+    if command -v crabwurcs >/dev/null 2>&1; then
+        export GLYCOSHAPE_CRABWURCS_BIN="$(command -v crabwurcs)"
+        echo "Using crabWURCS from PATH: $GLYCOSHAPE_CRABWURCS_BIN"
+        return 0
+    fi
+
+    export RUSTUP_HOME="$SCRIPT_DIR/.rustup"
+    export CARGO_HOME="$SCRIPT_DIR/.cargo"
+    export PATH="$CARGO_HOME/bin:$PATH"
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "Rust/Cargo not found. Installing a project-local minimal Rust toolchain..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal
+    fi
+
+    echo "Installing crabWURCS SNFG renderer..."
+    cargo install \
+        --git https://github.com/Ojas-Singh/crabWURCS \
+        --rev "$crabwurcs_rev" \
+        --locked \
+        --force \
+        --root "$install_root" \
+        crabwurcs-cli
+    export GLYCOSHAPE_CRABWURCS_BIN="$crabwurcs_bin"
+    echo "crabWURCS installation ready: $GLYCOSHAPE_CRABWURCS_BIN"
+}
+
+ensure_crabwurcs
+
 # Check if environment variables are set
 echo "Checking environment variables..."
 

@@ -305,15 +305,41 @@ def _classify_glycosidic_from_parts(atom_names: Sequence[str], residue_ids: Sequ
 	):
 		return f"{res1}_{res3}_phi"
 
+	# Sialic acids use C2 as the anomeric carbon and O6 as the ring oxygen.
+	# Keep the same ring-oxygen convention used above for ordinary pyranoses.
+	if (
+		atom1 == "O6"
+		and atom2 == "C2"
+		and atom3.startswith("O")
+		and atom4.startswith("C")
+		and res1 == res2
+		and res3 == res4
+		and res1 != res3
+	):
+		return f"{res1}_{res3}_phi"
+
 	if (
 		atom1 == "C1"
 		and atom2.startswith("O")
 		and atom2 != "O5"
 		and atom3.startswith("C")
 		and atom4.startswith(("C", "O"))
-		and res1 == res2
-		and res2 != res3
-		and res3 == res4
+		# In GLYCAM/PDB connectivity the bridging oxygen belongs to the
+		# acceptor residue: C1(donor)-O(acceptor)-Cx(acceptor)-X(acceptor).
+		# The previous donor-owned oxygen rule mislabeled valid psi torsions
+		# (for example GS00971 C1_3-O4_2-C4_2-C5_2) as residue-local.
+		and res1 != res2
+		and res2 == res3 == res4
+	):
+		return f"{res1}_{res3}_psi"
+
+	if (
+		atom1 == "C2"
+		and atom2.startswith("O")
+		and atom3.startswith("C")
+		and atom4.startswith(("C", "O"))
+		and res1 != res2
+		and res2 == res3 == res4
 	):
 		return f"{res1}_{res3}_psi"
 
@@ -495,12 +521,17 @@ def annotate_torsion(
 	atoms_df,
 	index: int,
 	original_name: Optional[str] = None,
+	glycosidic_omega_residues: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
 	"""Build stable metadata for a torsion definition."""
 	atom_indices, atom_names, residue_ids, residue_names = _torsion_atom_metadata(torsion, atoms_df)
 	original_name = original_name or _make_original_torsion_name(atom_names, residue_ids)
 
-	glycosidic_name = classify_glycosidic_from_name(original_name)
+	if glycosidic_omega_residues is not None:
+		donor_residue, acceptor_residue = glycosidic_omega_residues
+		glycosidic_name = f"{donor_residue}_{acceptor_residue}_omega"
+	else:
+		glycosidic_name = classify_glycosidic_from_name(original_name)
 	if glycosidic_name and not glycosidic_name.startswith("other_"):
 		subtype = glycosidic_name.rsplit("_", 1)[-1]
 		return {
@@ -541,11 +572,60 @@ def build_torsion_metadata(
 	torsion_list: Sequence[Torsion],
 	atoms_df,
 	original_names: Optional[Sequence[str]] = None,
+	bonds_df=None,
 ) -> List[Dict[str, Any]]:
+	# An omega torsion is residue-local geometrically, so its atom labels alone
+	# cannot distinguish a free side chain from one participating in a
+	# glycosidic linkage.  Associate the supported exocyclic side-chain
+	# patterns with their linkage oxygen and only promote them to glycosidic
+	# omega when that oxygen is bonded to a different residue.
+	omega_patterns = {
+		("C4", "C5", "C6", "O6"): "O6",
+		("C6", "C7", "C8", "O8"): "O8",
+	}
+	linked_omega_by_index: Dict[int, Tuple[int, int]] = {}
+	if bonds_df is not None and len(torsion_list):
+		atom_names = [str(value) for value in atoms_df["name"].to_list()]
+		residue_ids = [int(value) for value in atoms_df["res_id"].to_list()]
+		adjacency: Dict[int, set[int]] = {index: set() for index in range(len(atom_names))}
+		for a, b in bonds_df.iter_rows():
+			a_idx, b_idx = int(a), int(b)
+			if 0 <= a_idx < len(atom_names) and 0 <= b_idx < len(atom_names):
+				adjacency[a_idx].add(b_idx)
+				adjacency[b_idx].add(a_idx)
+
+		for index, torsion in enumerate(torsion_list):
+			try:
+				torsion_names = [atom_names[int(atom)] for atom in torsion]
+				torsion_residues = [residue_ids[int(atom)] for atom in torsion]
+			except (IndexError, TypeError, ValueError):
+				continue
+			forward_names = tuple(torsion_names)
+			reverse_names = tuple(reversed(torsion_names))
+			pattern = forward_names if forward_names in omega_patterns else reverse_names
+			if pattern in omega_patterns and len(set(torsion_residues)) == 1:
+				linkage_oxygen = omega_patterns[pattern]
+				oxygen_position = torsion_names.index(linkage_oxygen)
+				oxygen_index = int(torsion[oxygen_position])
+				acceptor_residue = torsion_residues[oxygen_position]
+				donor_residues = sorted({
+					residue_ids[neighbor]
+					for neighbor in adjacency.get(oxygen_index, set())
+					if residue_ids[neighbor] != acceptor_residue
+				})
+				if donor_residues:
+					linked_omega_by_index[index] = (donor_residues[0], acceptor_residue)
+
 	metadata: List[Dict[str, Any]] = []
 	for index, torsion in enumerate(torsion_list):
 		original_name = original_names[index] if original_names and index < len(original_names) else None
-		metadata.append(annotate_torsion(torsion, atoms_df=atoms_df, index=index, original_name=original_name))
+		metadata.append(annotate_torsion(
+			torsion,
+			atoms_df=atoms_df,
+			index=index,
+			original_name=original_name,
+			glycosidic_omega_residues=linked_omega_by_index.get(index),
+		))
 	return metadata
 
 
@@ -603,6 +683,8 @@ def get_glycan_torsions_enhanced(atoms_df, bonds_df) -> List[Torsion]:
 	This method implements the correct phi, psi, and omega definitions:
 	- phi: O5-C1-O-Cx' (glycosidic linkage angle)
 	- psi: C1-O-Cx'-Cx+1' (continuation angle)  
+	- Neu5 phi: O6-C2-O-Cx' (C2 is the anomeric carbon)
+	- Neu5 psi: C2-O-Cx'-Cnext'
 	- omega: C4-C5-C6-O6 (side chain angle)
 	"""
 	_require_rdkit()
@@ -692,37 +774,112 @@ def get_glycan_torsions_enhanced(atoms_df, bonds_df) -> List[Torsion]:
 						# PSI torsion: C1-O-Cx'-Cx+1' (or C1-O-Cx'-Ox')
 						psi_torsion = (node, glyc_o, other_c, next_atom)
 						torsions.append(psi_torsion)
+
+	# Method 1b: Neu5 glycosidic linkage torsions.  Neu5 has its anomeric
+	# center at C2 and its ring oxygen at O6, so the ordinary C1 detector
+	# above cannot represent its phi/psi angles.
+	neu5_psi_continuation = {
+		"C3": "C4",
+		"C4": "C5",
+		"C6": "C5",
+		"C8": "C7",
+		"C9": "C8",
+	}
+	for node in G.nodes():
+		if node >= len(atom_names) or atom_names[node] != "C2":
+			continue
+
+		ring_o6_candidates = [
+			neighbor for neighbor in G.neighbors(node)
+			if neighbor < len(atom_names)
+			and atom_names[neighbor] == "O6"
+			and res_ids[neighbor] == res_ids[node]
+		]
+		same_residue_c1 = any(
+			neighbor < len(atom_names)
+			and atom_names[neighbor] == "C1"
+			and res_ids[neighbor] == res_ids[node]
+			for neighbor in G.neighbors(node)
+		)
+		if not ring_o6_candidates or not same_residue_c1:
+			continue
+
+		glycosidic_oxygens = [
+			neighbor for neighbor in G.neighbors(node)
+			if neighbor < len(atom_names)
+			and elements[neighbor] == "O"
+			and res_ids[neighbor] != res_ids[node]
+		]
+		for glyc_o in glycosidic_oxygens:
+			acceptor_carbons = [
+				neighbor for neighbor in G.neighbors(glyc_o)
+				if neighbor != node
+				and neighbor < len(atom_names)
+				and elements[neighbor] == "C"
+				and res_ids[neighbor] == res_ids[glyc_o]
+			]
+			for acceptor_c in acceptor_carbons:
+				torsions.append((ring_o6_candidates[0], node, glyc_o, acceptor_c))
+
+				next_name = neu5_psi_continuation.get(str(atom_names[acceptor_c]))
+				if next_name is None:
+					continue
+				next_candidates = [
+					neighbor for neighbor in G.neighbors(acceptor_c)
+					if neighbor != glyc_o
+					and neighbor < len(atom_names)
+					and atom_names[neighbor] == next_name
+					and res_ids[neighbor] == res_ids[acceptor_c]
+				]
+				if next_candidates:
+					torsions.append((node, glyc_o, acceptor_c, next_candidates[0]))
 	
-	# Method 2: Find omega torsions (C4-C5-C6-O6)
+	# Method 2: Find omega torsions for actual exocyclic glycosidic
+	# linkages.  These same torsions exist as residue-local side-chain
+	# rotations when the terminal oxygen is free, so only include them when
+	# that oxygen bonds to a different residue.
+	#
+	# Hexose 1→6: C4-C5-C6-O6
+	# Neu5   2→8: C6-C7-C8-O8
+	omega_chains = (
+		("C4", "C5", "C6", "O6"),
+		("C6", "C7", "C8", "O8"),
+	)
 	for node in G.nodes():
 		if node >= len(atom_names):
 			continue
-			
-		atom_name = atom_names[node]
-		
-		if atom_name == "C6":
-			neighbors = list(G.neighbors(node))
-			
-			# Find C5 and O6 neighbors
-			c5_node = None
-			o6_node = None
-			
-			for n in neighbors:
-				if n < len(atom_names):
-					if atom_names[n] == "C5":
-						c5_node = n
-					elif atom_names[n] == "O6":
-						o6_node = n
-			
-			if c5_node is not None and o6_node is not None:
-				# Find C4 (neighbor of C5)
-				c4_candidates = [n for n in G.neighbors(c5_node) 
-				               if n < len(atom_names) and atom_names[n] == "C4"]
-				
-				if c4_candidates:
-					c4_node = c4_candidates[0]
-					# OMEGA torsion: C4-C5-C6-O6
-					torsions.append((c4_node, c5_node, node, o6_node))
+
+		for outer_name, inner_name, carbon_name, oxygen_name in omega_chains:
+			if atom_names[node] != carbon_name:
+				continue
+
+			inner_candidates = [
+				neighbor for neighbor in G.neighbors(node)
+				if neighbor < len(atom_names)
+				and atom_names[neighbor] == inner_name
+				and res_ids[neighbor] == res_ids[node]
+			]
+			oxygen_candidates = [
+				neighbor for neighbor in G.neighbors(node)
+				if neighbor < len(atom_names)
+				and atom_names[neighbor] == oxygen_name
+				and res_ids[neighbor] == res_ids[node]
+			]
+			for inner_node in inner_candidates:
+				outer_candidates = [
+					neighbor for neighbor in G.neighbors(inner_node)
+					if neighbor < len(atom_names)
+					and atom_names[neighbor] == outer_name
+					and res_ids[neighbor] == res_ids[node]
+				]
+				for oxygen_node in oxygen_candidates:
+					is_linked_oxygen = any(
+						neighbor < len(res_ids)
+						and res_ids[neighbor] != res_ids[oxygen_node]
+						for neighbor in G.neighbors(oxygen_node)
+					)
+					if is_linked_oxygen and outer_candidates:
+						torsions.append((outer_candidates[0], inner_node, node, oxygen_node))
 	
 	# Method 3: Additional rotatable bonds (for completeness)
 	# Look for other single bonds that might be rotatable
@@ -818,6 +975,47 @@ def save_torparts_npz(torsion_list: List[Torsion], bonds_df, atoms_df, output_pa
 	np.savez_compressed(output_path, a=torsion_list, b=anotherlist, allow_pickle=True)
 
 
+def _torsion_plot_table(data, torsion_cols: List[str], display_names: Dict[str, str]):
+	"""Long table (Value, Torsion, Frame) of the ridge plot: one row per torsion and frame.
+
+	This is the table the plot was always drawn from, built from whole columns.
+	It used to be filled value by value from ``data.iterrows()``, one Python
+	call per value. ``data.to_numpy()`` holds exactly the row values iterrows
+	yields (all columns in their common dtype), so the values are the same.
+	The torsion names are a categorical column whose categories are in order
+	of first appearance, the order seaborn derives from a column of strings:
+	the grid has the same rows and colours, and selecting the frames of one
+	torsion compares small integers instead of every string of the table
+	(seaborn does that for each pair of torsions, three times per figure).
+	Mixed (object) tables and duplicate column names take the former loop.
+	"""
+	import pandas as pd
+
+	matrix = data.to_numpy()
+	if matrix.dtype == object or len(set(data.columns)) != len(data.columns):
+		plot_data = []
+		for col in torsion_cols:
+			for _, row in data.iterrows():
+				plot_data.append({
+					'Value': row[col],
+					'Torsion': display_names[col],
+					'Frame': row['frame']
+				})
+		return pd.DataFrame(plot_data)
+	position = {name: index for index, name in enumerate(data.columns)}
+	names = [display_names[col] for col in torsion_cols]
+	return pd.DataFrame({
+		'Value': np.concatenate([matrix[:, position[col]] for col in torsion_cols]),
+		'Torsion': pd.Categorical.from_codes(
+			np.repeat(
+				[list(dict.fromkeys(names)).index(name) for name in names], len(data)
+			),
+			categories=list(dict.fromkeys(names)),
+		),
+		'Frame': np.tile(matrix[:, position['frame']], len(torsion_cols)),
+	})
+
+
 def plot_torsion_distribution(
 	torsion_csv_path: str,
 	output_path: str,
@@ -830,7 +1028,7 @@ def plot_torsion_distribution(
 	cluster representatives marked as vertical lines.
 	
 	Parameters:
-		torsion_csv_path: Path to torsions.csv file
+		torsion_csv_path: Path to torsions.parquet or legacy torsions.csv file
 		output_path: Path to save the distribution plot (SVG format)
 		cluster_representatives: List of frame indices for cluster representatives
 		level: Clustering level number for plot title
@@ -846,16 +1044,22 @@ def plot_torsion_distribution(
 	
 	storage = get_storage_manager()
 	if not (os.path.exists(torsion_csv_path) or storage.exists(torsion_csv_path)):
-		raise FileNotFoundError(f"Torsion CSV file not found: {torsion_csv_path}")
+		raise FileNotFoundError(f"Torsion table file not found: {torsion_csv_path}")
 	
 	# Read torsion data
-	if os.path.exists(torsion_csv_path):
+	if torsion_csv_path.endswith(".parquet"):
+		if os.path.exists(torsion_csv_path):
+			data = pd.read_parquet(torsion_csv_path)
+		else:
+			import io
+			data = pd.read_parquet(io.BytesIO(storage.read_binary(torsion_csv_path)))
+	elif os.path.exists(torsion_csv_path):
 		data = pd.read_csv(torsion_csv_path)
 	else:
 		with storage.open(torsion_csv_path, 'r') as fh:
 			data = pd.read_csv(fh)
 	if 'frame' not in data.columns:
-		raise ValueError("Torsions CSV must contain 'frame' column")
+		raise ValueError("Torsions table must contain 'frame' column")
 	
 	# Try to read info.json to get glycosidic torsion information
 	info_json_path = os.path.join(os.path.dirname(torsion_csv_path), 'info.json')
@@ -887,13 +1091,26 @@ def plot_torsion_distribution(
 			# Fallback: check for phi, psi, omega patterns
 			elif not glycosidic_original_names and any(angle in col for angle in ['phi', 'psi', 'omega']):
 				torsion_cols.append(col)
+			# Recognize structurally explicit phi/psi/omega labels when metadata is
+			# unavailable. Residue-local C6 torsions deliberately do not match.
+			elif col not in torsion_cols and not classify_glycosidic_from_name(col).startswith('other_'):
+				torsion_cols.append(col)
 	
 	if not torsion_cols:
-		# Monosaccharides and some edge cases may not have glycosidic torsions.
-		# Fall back to plotting all available torsions so the static tree is still complete.
-		torsion_cols = [col for col in data.columns if col != 'frame']
-		if not torsion_cols:
-			raise ValueError("No torsion columns found in CSV")
+		# Never substitute residue-local torsions into a glycosidic distribution
+		# plot. Emit a complete placeholder so static validation still succeeds.
+		os.makedirs(os.path.dirname(output_path), exist_ok=True)
+		with open(output_path, "w", encoding="utf-8") as handle:
+			handle.write(
+				'<svg xmlns="http://www.w3.org/2000/svg" width="720" height="120" '
+				'viewBox="0 0 720 120" role="img" aria-label="No glycosidic torsions">'
+				'<rect width="720" height="120" fill="white"/>'
+				'<text x="24" y="68" font-family="sans-serif" font-size="20" fill="#444">'
+				'No glycosidic torsions for this structure.'
+				'</text></svg>\n'
+			)
+		print(f"No-glycosidic-torsion placeholder saved to {output_path}")
+		return
 	
 	# Replace Greek letter names for better display
 	display_names = {}
@@ -906,16 +1123,7 @@ def plot_torsion_distribution(
 		display_names[col] = display_name
 	
 	# Prepare data for plotting
-	plot_data = []
-	for col in torsion_cols:
-		for _, row in data.iterrows():
-			plot_data.append({
-				'Value': row[col],
-				'Torsion': display_names[col],
-				'Frame': row['frame']
-			})
-	
-	df = pd.DataFrame(plot_data)
+	df = _torsion_plot_table(data, torsion_cols, display_names)
 	
 	# Create the plot
 	num_torsions = len(torsion_cols)
@@ -974,4 +1182,3 @@ def plot_torsion_distribution(
 	plt.close(g.figure)
 	
 	print(f"Torsion distribution plot saved to {output_path}")
-

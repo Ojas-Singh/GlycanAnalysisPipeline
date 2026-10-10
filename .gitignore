@@ -3,10 +3,9 @@ __pycache__/
 *$py.class
 .vscode
 .venv/
-tests/
-!tests/
-tests/*
-!tests/test_glymeta_glytoucan_repair.py
+# Tests are part of the repository; what they write is not.
+tests/__pycache__/
+tests/.pytest_cache/
 env/
 dummy_database_process/
 dummy_database_static/
@@ -39,3 +38,6 @@ static/
 GLYCOSHAPE_RDF/
 *.log
 .java/
+.cargo/
+.rustup/
+.crabwurcs/

@@ -353,6 +353,197 @@ def gmm_optimize_glycosidic_deviation(
 	return labels, max_clusters
 
 
+def _silhouette_rows(
+	X: np.ndarray,
+	labels_stack: np.ndarray,
+	n_labels: tuple,
+	blocks: list,
+	reduce_bytes: int = 16 * 2**20,
+) -> list:
+	"""Intra- and nearest-other-cluster distance sums of the rows of ``blocks``, per labeling.
+
+	``blocks`` are consecutive ``(first, last)`` row ranges. The distances of
+	a block of rows to all points are computed once, by the call
+	scikit-learn's silhouette makes.
+
+	scikit-learn then adds, for every row, the distances to the members of
+	each cluster with one ``np.bincount(labels, weights=row)``: a sum over the
+	members in index order, starting from zero. The same sums are taken here
+	for a few rows and all labelings at once, as the product of a 0/1 matrix
+	(one row per cluster of every labeling, one column per point) with the
+	transposed distances. The matrix is stored by columns, so the product
+	walks the points in index order and adds the distances of each point to
+	the running sums of its clusters, each term being 1.0 times a distance:
+	every sum receives its terms in the order bincount adds them and is the
+	bincount sum, bit for bit, in one pass over the distances and without a
+	Python call per row and labeling. ``reduce_bytes`` of distances are
+	reduced at a time.
+	"""
+	from scipy import sparse
+	from sklearn.metrics import pairwise_distances
+	from threadpoolctl import threadpool_limits
+
+	n_samples = X.shape[0]
+	n_labelings = len(n_labels)
+	start, stop = blocks[0][0], blocks[-1][1]
+	intra = [np.empty(stop - start) for _ in n_labels]
+	inter = [np.empty(stop - start) for _ in n_labels]
+	label_freqs = [np.bincount(labels_stack[index], minlength=n) for index, n in enumerate(n_labels)]
+	offsets = np.concatenate([[0], np.cumsum(n_labels)])
+	membership = sparse.csc_matrix(
+		(
+			np.ones(n_labelings * n_samples),
+			(
+				(labels_stack + offsets[:-1, None]).ravel(),
+				np.tile(np.arange(n_samples), n_labelings),
+			),
+		),
+		shape=(int(offsets[-1]), n_samples),
+	)
+	reduce_rows = max(1, int(reduce_bytes) // (8 * n_samples))
+	with threadpool_limits(limits=1):
+		for first, last in blocks:
+			rows = X if (first == 0 and last == n_samples) else X[first:last]
+			distances = pairwise_distances(rows, X, metric="euclidean")
+			distances.flat[first::n_samples + 1] = 0
+			for begin in range(0, last - first, reduce_rows):
+				end = min(begin + reduce_rows, last - first)
+				sums = membership @ np.ascontiguousarray(distances[begin:end].T)
+				for index, n_clusters in enumerate(n_labels):
+					labels = labels_stack[index]
+					cluster_distances = np.ascontiguousarray(sums[offsets[index]:offsets[index + 1]].T)
+					own = (np.arange(end - begin), labels[first + begin:first + end])
+					out = slice(first - start + begin, first - start + end)
+					intra[index][out] = cluster_distances[own]
+					cluster_distances[own] = np.inf
+					cluster_distances /= label_freqs[index]
+					inter[index][out] = cluster_distances.min(axis=1)
+	return [intra, inter]
+
+
+def _even_ranges(start: int, stop: int, parts: int) -> list:
+	"""``parts`` consecutive ranges of start:stop whose lengths differ by at most one."""
+	length = stop - start
+	edges = [start + length * index // parts for index in range(parts + 1)]
+	return [(first, last) for first, last in zip(edges, edges[1:]) if last > first]
+
+
+def silhouette_scores_shared(
+	X: np.ndarray,
+	labelings: list,
+	n_jobs: Optional[int] = None,
+	block_bytes: int = 8 * 2**20,
+) -> list:
+	"""``sklearn.metrics.silhouette_score(X, labels)`` for several labelings of the same points.
+
+	The silhouette needs every pairwise distance, and scikit-learn computes
+	them again for each call. Here each block of the distance matrix is
+	computed once and reduced for all labelings, and the blocks are spread
+	over ``n_jobs`` worker processes. The arithmetic is scikit-learn's
+	(``pairwise_distances`` per block, one ``np.bincount`` per row, the same
+	final formula), so the scores are the ones ``silhouette_score`` returns.
+
+	The blocks follow scikit-learn in the one place where the block shape
+	selects another BLAS routine. When scikit-learn computes the whole matrix
+	in one call (its working memory holds it: up to 11,585 points by default)
+	so does this function, in the calling process. Otherwise the rows are
+	split into blocks of about ``block_bytes`` of distances, of equal length
+	to within one row and never of a single row: a one-row product is not
+	computed by the matrix-matrix routine and can differ in the last bit.
+	A worker holds a few times ``block_bytes``.
+
+	Returns one score per labeling, or None where scikit-learn would refuse
+	(fewer than two labels, or as many labels as samples).
+	"""
+	from sklearn import get_config
+	from sklearn.utils import check_array
+
+	X = check_array(X)
+	n_samples = X.shape[0]
+	scores: list = [None] * len(labelings)
+	valid: list = []
+	encoded: list = []
+	for index, labels in enumerate(labelings):
+		classes, inverse = np.unique(np.asarray(labels), return_inverse=True)
+		if len(labels) == n_samples and 1 < len(classes) < n_samples:
+			valid.append(index)
+			encoded.append(inverse.astype(np.intp, copy=False))
+	if not valid:
+		return scores
+	labels_stack = np.ascontiguousarray(np.stack(encoded, axis=0))
+	n_labels = tuple(int(row.max()) + 1 for row in labels_stack)
+
+	n_jobs = _default_parallel_jobs() if n_jobs is None else max(1, int(n_jobs))
+	# rows of float64 distances that fit scikit-learn's working memory (pairwise_distances_chunked)
+	sklearn_chunk_rows = int(get_config()["working_memory"] * 2**20 // (8 * n_samples))
+	if sklearn_chunk_rows >= n_samples:
+		blocks = [(0, n_samples)]
+	else:
+		n_blocks = -(-8 * n_samples * n_samples // max(1, int(block_bytes)))
+		blocks = _even_ranges(0, n_samples, max(1, min(n_blocks, n_samples // 2)))
+	if n_jobs == 1 or len(blocks) == 1:
+		parts = [_silhouette_rows(X, labels_stack, n_labels, blocks)]
+	else:
+		tasks = [
+			blocks[first:last]
+			for first, last in _even_ranges(0, len(blocks), min(len(blocks), 4 * n_jobs))
+		]
+		parts = Parallel(n_jobs=n_jobs)(
+			delayed(_silhouette_rows)(X, labels_stack, n_labels, task) for task in tasks
+		)
+
+	for position, index in enumerate(valid):
+		labels = labels_stack[position]
+		label_freqs = np.bincount(labels)
+		intra = np.concatenate([part[0][position] for part in parts])
+		inter = np.concatenate([part[1][position] for part in parts])
+		denom = (label_freqs - 1).take(labels, mode="clip")
+		with np.errstate(divide="ignore", invalid="ignore"):
+			intra /= denom
+		samples = inter - intra
+		with np.errstate(divide="ignore", invalid="ignore"):
+			samples /= np.maximum(intra, inter)
+		scores[index] = float(np.mean(np.nan_to_num(samples)))
+	return scores
+
+
+def _nearest_center_labels(
+	points: np.ndarray,
+	centers: list,
+	block_rows: int = 4096,
+	rel_margin: float = 1e-9,
+) -> np.ndarray:
+	"""Index of the nearest center of every point, exactly as the reference loop gives it.
+
+	The reference is, for every point,
+	``np.argmin([np.linalg.norm(point - center) for center in centers])``:
+	one Python call per point and center. Here the distances are computed for
+	blocks of points at once. A vectorised norm can differ from the scalar one
+	in the last bit (different summation of the squares), which could only
+	change the answer when the two nearest centers are at the same distance
+	to within rounding. Those points (second-nearest not farther than the
+	nearest by more than ``rel_margin``, relative; rounding is ~1e-16) are
+	decided by the reference expression, so the labels are the reference ones.
+	"""
+	centers_arr = np.asarray(centers)
+	n_points = points.shape[0]
+	n_centers = centers_arr.shape[0]
+	labels = np.zeros(n_points, dtype=int)
+	for start in range(0, n_points, block_rows):
+		block = points[start:start + block_rows]
+		distances = np.linalg.norm(block[:, None, :] - centers_arr[None, :, :], axis=2)
+		labels[start:start + block.shape[0]] = np.argmin(distances, axis=1)
+		if n_centers > 1:
+			two_lowest = np.partition(distances, 1, axis=1)[:, :2]
+			sure = (two_lowest[:, 1] - two_lowest[:, 0]) > rel_margin * two_lowest[:, 1]
+		else:
+			sure = np.isfinite(distances[:, 0])
+		for row in np.flatnonzero(~sure):
+			point = block[row]
+			labels[start + row] = np.argmin([np.linalg.norm(point - center) for center in centers])
+	return labels
+
+
 def kcenter_coverage_clustering(
 	data: np.ndarray,
 	max_clusters: int = 128,
@@ -412,16 +603,18 @@ def kcenter_coverage_clustering(
 	center_indices.append(first_idx)
 	
 	logger.info(f"k-center: Starting with random center at index {first_idx}")
-	
+
 	# Greedy farthest-point selection until we have `max_clusters` centers.
 	# This ensures we always return the requested number of representatives
 	# (unless n_samples <= max_clusters which is handled above).
+	# The distance of every point to its nearest center is kept and updated
+	# with the newest center only: the same minimum over the same distances
+	# as recomputing all centers in every round, at 1/k of the work.
+	distances_to_centers = np.full(n_samples, np.inf)
 	for k in range(1, max_clusters):
 		# Find distances from each point to nearest existing center
-		distances_to_centers = np.full(n_samples, np.inf)
-		for center in centers:
-			distances = np.linalg.norm(data_scaled - center, axis=1)
-			distances_to_centers = np.minimum(distances_to_centers, distances)
+		distances = np.linalg.norm(data_scaled - centers[-1], axis=1)
+		distances_to_centers = np.minimum(distances_to_centers, distances)
 
 		# Select next center as the point farthest from all existing centers
 		farthest_idx = int(np.argmax(distances_to_centers))
@@ -434,16 +627,13 @@ def kcenter_coverage_clustering(
 
 		centers.append(data_scaled[farthest_idx])
 		center_indices.append(farthest_idx)
-	
+
 	n_clusters = len(centers)
 	logger.info(f"k-center: Final clustering with {n_clusters} centers")
-	
+
 	# Assign each point to nearest center
-	labels = np.zeros(n_samples, dtype=int)
-	for i, point in enumerate(data_scaled):
-		distances = [np.linalg.norm(point - center) for center in centers]
-		labels[i] = np.argmin(distances)
-	
+	labels = _nearest_center_labels(data_scaled, centers)
+
 	# # Log cluster sizes
 	# unique_labels, counts = np.unique(labels, return_counts=True)
 	# size_info = ", ".join([f"cluster {label}: {count} points" for label, count in zip(unique_labels, counts)])
@@ -777,6 +967,11 @@ def create_cluster_info_fast_big(
     return reps
 
 
+# Clusters of at least this many frames (and at most 5000, above which no grid
+# search is done) get a bandwidth grid search that is itself run in parallel.
+_GRID_PARALLEL_MIN_SIZE = 1000
+
+
 def create_cluster_info_fast(
     labels: np.ndarray,
     pca_df: pl.DataFrame,
@@ -877,10 +1072,12 @@ def create_cluster_info_fast(
     n_total = len(labels)
     logger.info(f"Pre-standardized PCA data: shape {pca_data_scaled.shape}")
 
-    def process_cluster(args, enable_profiling_local=False):
+    def process_cluster(args, enable_profiling_local=False, grid_jobs=1):
         """Process a single cluster: compute KDE rep if applicable, else fallback.
         
         Optimized: Lighter CV for small clusters, faster minimize.
+        grid_jobs is the n_jobs of the bandwidth grid search; the selected
+        bandwidth does not depend on it.
         """
         new_cluster_id, (old_cluster_id, size) = args
         indices = cluster_member_indices.get(int(old_cluster_id), np.array([], dtype=int))
@@ -899,42 +1096,62 @@ def create_cluster_info_fast(
         else:
             start_time = time.time() if enable_profiling_local else None
             try:
-                # Tuned GridSearchCV: Smaller grid/folds for speed, especially small clusters
-                if size < 10:
-                    cv_folds = 2  # Minimal CV for tiny clusters
-                    bandwidth_grid = np.linspace(0.1, 1.0, 5)  # Tiny grid: fast, still accurate
-                elif size < 20:
-                    cv_folds = 3
-                    bandwidth_grid = np.linspace(0.1, 1.0, 10)
+                # KDE bandwidth selection scales poorly with very large clusters
+                # (and GridSearchCV repeats that cost for every candidate). Fit
+                # on a deterministic, evenly distributed sample, then choose the
+                # closest representative from the complete cluster below.
+                max_kde_samples = 5000
+                if size > max_kde_samples:
+                    sample_positions = np.linspace(0, size - 1, max_kde_samples, dtype=int)
+                    kde_fit_data = cluster_data_scaled[sample_positions]
+                    logger.info(
+                        "KDE representative for cluster %s: sampling %s/%s frames",
+                        new_cluster_id,
+                        len(kde_fit_data),
+                        size,
+                    )
+                    # Grid-search cross-validation is quadratic in the number
+                    # of sampled frames. Avoid it for oversized trajectories.
+                    bandwidth = 0.5
+                    grid_time = 0.0
                 else:
-                    cv_folds = min(5, size // 5)  # Adaptive: fewer folds for medium
-                    bandwidth_grid = np.linspace(0.1, 1.0, 20)  # Reduced from 30
+                    # Tuned GridSearchCV for normal-sized clusters.
+                    kde_fit_data = cluster_data_scaled
+                    if size < 10:
+                        cv_folds = 2
+                        bandwidth_grid = np.linspace(0.1, 1.0, 5)
+                    elif size < 20:
+                        cv_folds = 3
+                        bandwidth_grid = np.linspace(0.1, 1.0, 10)
+                    else:
+                        cv_folds = min(5, size // 5)
+                        bandwidth_grid = np.linspace(0.1, 1.0, 20)
 
-                grid_start = time.time() if enable_profiling_local else None
-                grid = GridSearchCV(
-                    KernelDensity(kernel='gaussian'),
-                    {'bandwidth': bandwidth_grid},
-                    cv=cv_folds,
-                    n_jobs=1  # Sequential CV per cluster to avoid nested parallelism overhead on low cores
-                )
-                grid.fit(cluster_data_scaled)
-                bandwidth = float(grid.best_params_['bandwidth'])
-                grid_time = time.time() - grid_start if enable_profiling_local else 0
+                    grid_start = time.time() if enable_profiling_local else None
+                    grid = GridSearchCV(
+                        KernelDensity(kernel='gaussian'),
+                        {'bandwidth': bandwidth_grid},
+                        cv=cv_folds,
+                        n_jobs=grid_jobs,
+                    )
+                    grid.fit(kde_fit_data)
+                    bandwidth = float(grid.best_params_['bandwidth'])
+                    grid_time = time.time() - grid_start if enable_profiling_local else 0
 
                 # Fit KDE (fast)
                 kde_start = time.time() if enable_profiling_local else None
-                kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(cluster_data_scaled)
+                kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(kde_fit_data)
                 kde_time = time.time() - kde_start if enable_profiling_local else 0
 
                 # Optimized minimize: Better start, fewer iters, pre-compute bounds globally if possible
-                d = cluster_data_scaled.shape[1]
-                bounds = [(float(np.min(cluster_data_scaled[:, dim])), float(np.max(cluster_data_scaled[:, dim])))
+                d = kde_fit_data.shape[1]
+                bounds = [(float(np.min(kde_fit_data[:, dim])), float(np.max(kde_fit_data[:, dim])))
                           for dim in range(d)]  # Per-cluster bounds (fast)
 
                 opt_start = time.time() if enable_profiling_local else None
                 result = minimize(
                     lambda x: -kde_model.score_samples([x])[0],
-                    np.mean(cluster_data_scaled, axis=0),  # Centroid start: converges faster
+                    np.mean(kde_fit_data, axis=0),  # Centroid start: converges faster
                     bounds=bounds,
                     method='L-BFGS-B',
                     options={'maxiter': 50, 'ftol': 1e-6}  # Reduced iters/tol for speed
@@ -980,11 +1197,28 @@ def create_cluster_info_fast(
         # Sequential for debugging
         reps_list = [process_cluster(arg, enable_profiling) for arg in cluster_args]
     else:
+        # The bandwidth grid search of a cluster is 100 KDE fits whose cost
+        # grows with the square of the cluster size, and one cluster is one
+        # task: with a few large clusters most workers would wait for the
+        # largest one. Clusters with a costly grid search are therefore taken
+        # one after the other here, each with its fits spread over the
+        # workers; all others go to the workers as whole clusters, as before.
+        large_grid = [
+            position for position, (_, (_, size)) in enumerate(cluster_args)
+            if _GRID_PARALLEL_MIN_SIZE <= size <= 5000 and size >= min_cluster_size_for_kde
+        ]
+        whole = [position for position in range(len(cluster_args)) if position not in set(large_grid)]
+        reps_list = [None] * len(cluster_args)
         # Partial for profiling flag
         process_with_profile = partial(process_cluster, enable_profiling_local=enable_profiling)
-        reps_list = Parallel(n_jobs=n_jobs, backend=parallel_backend, prefer='threads' if parallel_backend == 'threading' else None, verbose=0 if not enable_profiling else 1)(
-            delayed(process_with_profile)(arg) for arg in cluster_args
-        )
+        if whole:
+            whole_results = Parallel(n_jobs=n_jobs, backend=parallel_backend, prefer='threads' if parallel_backend == 'threading' else None, verbose=0 if not enable_profiling else 1)(
+                delayed(process_with_profile)(cluster_args[position]) for position in whole
+            )
+            for position, result in zip(whole, whole_results):
+                reps_list[position] = result
+        for position in large_grid:
+            reps_list[position] = process_cluster(cluster_args[position], enable_profiling, grid_jobs=n_jobs)
 
     # Filter None and sort (though already ordered)
     reps = [r for r in reps_list if r is not None]
@@ -1488,6 +1722,7 @@ __all__ = [
 	"pca_conformation_landscape",
 	"gmm_optimize_silhouette",
 	"gmm_optimize_glycosidic_deviation",
+	"silhouette_scores_shared",
 	"kcenter_coverage_clustering",
 	"create_cluster_info",
 	"create_cluster_info_fast",

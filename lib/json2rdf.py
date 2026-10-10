@@ -3,7 +3,10 @@ import json
 from rdflib import Graph, Literal, URIRef, Namespace, BNode
 from rdflib.namespace import RDF, RDFS, XSD, DCTERMS, OWL, SKOS
 import os # Import os for file path handling
+import logging
 from lib.storage import get_storage_manager
+
+logger = logging.getLogger(__name__)
 
 # --- Define Namespaces (Best Practice with rdf.glycoshape.org) ---
 GS = Namespace("http://rdf.glycoshape.org/ontology/")          # Ontology/vocabulary terms
@@ -34,7 +37,7 @@ def add_literal(graph, subject, predicate, obj, datatype=None):
                     literal_value = Literal(str(obj), datatype=datatype)
                 graph.add((subject, predicate, literal_value))
             except (ValueError, TypeError) as e:
-                print(f"Warning: Could not convert value '{obj}' to {datatype} for {subject} {predicate}. Adding as string. Error: {e}")
+                logger.warning("Could not convert %r to %s for %s %s; adding as string: %s", obj, datatype, subject, predicate, e)
                 graph.add((subject, predicate, Literal(str(obj), datatype=XSD.string)))
         # Infer datatype if not provided
         else:
@@ -196,7 +199,7 @@ def process_glycan_variant(glycan_variant_uri, data, g):
                         add_literal(g, motif_uri, RDFS.label, motif_label)
                         add_literal(g, motif_uri, SKOS.prefLabel, motif_label)
             else:
-                print(f"Warning: Unexpected motif format in {glycan_variant_uri}: {motif}")
+                logger.warning("Unexpected motif format in %s: %r", glycan_variant_uri, motif)
 
     # --- Structural Features: Termini ---
     termini = data.get("termini")
@@ -328,31 +331,31 @@ def convert_glycoshape_to_rdf(input_path, output_path):
     g_all.bind("chebi", CHEBI)
 
     # Read JSON data
-    print(f"Reading JSON data from: {input_path}")
+    logger.info("Reading JSON data from: %s", input_path)
     try:
         storage = get_storage_manager()
         with storage.open(input_path, 'r') as file:
             data = json.load(file)
     except FileNotFoundError:
-        print(f"Error: Input file not found at {input_path}")
+        logger.error("Input file not found at %s", input_path)
         return None
     except json.JSONDecodeError as e:
-        print(f"Error decoding JSON from {input_path}: {e}")
+        logger.error("Error decoding JSON from %s: %s", input_path, e)
         return None
 
     if not isinstance(data, dict):
-        print(f"Error: Expected top-level JSON structure to be a dictionary, but found {type(data)}.")
+        logger.error("Expected top-level JSON structure to be a dictionary, but found %s", type(data))
         return None
 
-    print(f"Processing {len(data)} entries...")
+    logger.info("Processing %s entries", len(data))
     entry_count = 0
     
     for main_glycan_id, entry_data in data.items():
         entry_count += 1
-        print(f"Processing entry {entry_count}/{len(data)}: {main_glycan_id}")
+        logger.debug("Processing entry %s/%s: %s", entry_count, len(data), main_glycan_id)
 
         if not isinstance(entry_data, dict):
-            print(f"Warning: Skipping entry '{main_glycan_id}' because its value is not a dictionary.")
+            logger.warning("Skipping entry %r because its value is not a dictionary", main_glycan_id)
             continue
 
         # Create the main resource URI
@@ -402,12 +405,12 @@ def convert_glycoshape_to_rdf(input_path, output_path):
                     g_all.add((variant_uri, GS.isAnomerOf, archetype_uri))
 
     # Write the graph
-    print(f"\nSerializing RDF graph to: {output_path}")
+    logger.info("Serializing RDF graph to: %s", output_path)
     try:
         g_all.serialize(destination=output_path, format='turtle')
-        print(f"Successfully wrote RDF data to {output_path}")
+        logger.info("Successfully wrote RDF data to %s", output_path)
     except Exception as e:
-        print(f"Error serializing RDF graph: {e}")
+        logger.error("Error serializing RDF graph: %s", e)
         return None
 
     return g_all
@@ -417,9 +420,9 @@ def main():
     input_file = config.output_path / "GLYCOSHAPE.json"
     output_file = config.output_path / "GLYCOSHAPE_RDF.ttl"
 
-    print("\n--- Starting RDF Conversion with Best Practices ---")
+    logger.info("Starting RDF conversion")
     convert_glycoshape_to_rdf(input_file, output_file)
-    print("--- RDF Conversion Finished ---")
+    logger.info("RDF conversion finished")
 
 
 if __name__ == "__main__":

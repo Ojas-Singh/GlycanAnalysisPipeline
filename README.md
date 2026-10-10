@@ -4,6 +4,19 @@ Glycan conformations analysis pipeline for [GlycoShape Database](https://glycosh
 
 <img src="docs/Figure.jpg" alt="Schematic overview of Glycan Analysis Pipeline (GAP) used to build the GlycoShape Glycan Database (GDB). Panel a) Multiple uncorrelated replica molecular dynamics (MD) simulations are performed for each glycan in the GDB, to comprehensively sample its structural dynamics. The resulting MD frames are then transformed into a graph matrix representation, as depicted in Panel b), simplified by flattening the lower half as shown in Panel c). This step enables a dimensionality reduction via principal component analysis (PCA), shown in Panel d). These data are clustered by Gaussian Mixture Model (GMM) and the results of which are displayed in terms of cluster distributions, see Panel e). Panel f) Representative 3D structures for each cluster are selected based on KDE maxima, along with comprehensive torsion angle profiles for the highest populated clusters, showing the wide breadth of the conformational space covered by GAP. Panel g) Structures derived from GAP are clearly presented on the GlycoShape GDB web platform, in addition to biological and chemical information." style="zoom: 33%;" />
 
+## At a glance 🗺️
+
+GAP takes the trajectories of one glycan (all its simulations, dry) and produces a database entry: the conformational landscape (PCA), clusters at two levels of detail with their populations, representative structures (Level 1: the main conformers; Level 2: a finer coverage of the landscape), torsion statistics and the files the GlycoShape website serves.
+
+| Stage | What it does | Where it runs | Section |
+|---|---|---|---|
+| Raw archive | One entry per glycan, named by its GLYCAM name: `trajectory.xtc` at the precision of the source, `topology.pdb`, `structure.mol2`, `manifest.json` with checksums | Anywhere; object storage keeps it under `raw/<GLYCAM name>/` | [Raw trajectory archive](#raw-trajectory-archive) |
+| Analysis of one entry | Store, PCA, clustering, torsions, representative structures; a self-contained result folder with `result.json` | A compute node, without network | [One entry on a compute node](#one-entry-on-a-compute-node) |
+| Whole-database runs | The same analysis over a data directory, then the static folder with identifiers and metadata | Login node and Slurm array | [Running](#running-), [Staged Oracle/Slurm workflow](#staged-oracleslurm-workflow) |
+| Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
+
+Level 3 (a coverage set of up to 512 structures) is no longer produced by default; `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3` brings it back, and folders that still contain it are accepted.
+
 ## Installation 💻
 
 The pipeline uses Python 3.10 and uv (a fast Python package manager) for dependency management.
@@ -36,6 +49,8 @@ If you prefer manual installation:
    - Linux/macOS: `source .venv/bin/activate`
    - Windows: `.venv\Scripts\activate`
 5. Install dependencies: `uv pip install -r requirements.txt`
+6. Install the crabWURCS CLI (requires Rust/Cargo):
+   `cargo install --git https://github.com/Ojas-Singh/crabWURCS --rev d6145803ce5977eb4fb9ab785f3a242f63e0036b --locked crabwurcs-cli`
 
 ## Configure ⚙️
 
@@ -55,18 +70,47 @@ export GLYTOUCAN_API_KEY=your_api_key
 export GLYCOSHAPE_RDF_DIR=/scratch/os1e24/GlycanAnalysisPipeline/GLYCOSHAPE_RDF
 export GLYCOSHAPE_GAP_LOG=/scratch/os1e24/GlycanAnalysisPipeline/logs/GlycoShape_GAP.log
 export GLYCOSHAPE_MAX_WORKERS=1
+export GLYCOSHAPE_STATIC_WORKERS=8
 export GLYCOSHAPE_UPLOAD_WORKERS=1
 export GLYCOSHAPE_STORE_FRAMES_BUFFER=128
 export GLYCOSHAPE_STORE_FRAME_CHUNK=128
+export GLYCOSHAPE_CLUSTER_LEVELS=1,2
+export GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM=3.0
+export GLYCOSHAPE_FRAME_QUALITY_BLOCK_FRAMES=1024
+export GLYCOSHAPE_SNFG_RENDERER=crabwurcs
+# Optional when crabwurcs is not on PATH:
+export GLYCOSHAPE_CRABWURCS_BIN=/path/to/crabwurcs
 export POCKETBASE_URL=http://localhost:8090
 export POCKETBASE_TOKEN=your_pocketbase_token
 ```
 
 Ensure the required directories and files exist, or modify the paths as needed.
 
-With `GLYCOSHAPE_ORACLE_PAR_URL` set, the pipeline reads input data from the bucket `data` prefix, stages process files locally under `process/`, writes final static files locally under `static/`, and uploads generated artifacts back to the bucket `process/` and `static/` prefixes. The serving machine should mirror the bucket `static/` prefix independently; this pipeline no longer assumes the serving instance can directly read `GLYCOSHAPE_OUTPUT_DIR`.
+`GLYCOSHAPE_SNFG_RENDERER` controls static `snfg.svg` generation. It defaults to
+`crabwurcs`, which renders the submitted GLYCAM notation directly. Set it to
+`glycodraw` to retain the previous glycowork `GlycoDraw` renderer. `install.sh`
+installs a project-local crabWURCS binary when the default renderer is selected;
+`GLYCOSHAPE_CRABWURCS_BIN` can instead point to an existing installation.
+The same executable is also used as a local fallback for IUPAC/SMILES → WURCS
+and WURCS → extended-IUPAC conversion when the remote format service cannot
+represent a glycan.
 
-For the current login-node limits, keep worker fan-out low. The defaults in `.env` use one worker and smaller frame buffers so PCA, clustering, and uploads run without changing the analysis methods.
+With `GLYCOSHAPE_ORACLE_PAR_URL` set, use the staged workflow below: download the bucket `data/` prefix to local storage on a login node, process local data on AMD Slurm nodes, then build and upload only `static/` from a login node. `process/` is deliberately local-only and must not be uploaded to Oracle.
+
+`GLYCOSHAPE_CLUSTER_LEVELS` (or `--levels`) is the set of clustering levels
+that is computed, required by the completeness checks and exported: `1,2`
+(the default) or `1,2,3`. See [Clustering levels](#clustering-levels).
+
+`GLYCOSHAPE_STORE_FRAME_CHUNK` is the number of frames per Zarr chunk of
+`process/<glycan>/data/coords.zarr`; `0` (the default) is one chunk for the
+whole trajectory. `GLYCOSHAPE_STORE_FRAMES_BUFFER` is only how many parsed
+frames are handed over at a time: whatever its value, every chunk is
+compressed and written once.
+
+`GLYCOSHAPE_MAX_WORKERS` controls numerical fan-out inside one glycan.
+`GLYCOSHAPE_STATIC_WORKERS` separately controls how many glycans static-only
+mode rebuilds concurrently and defaults to 8. Set it to `1` for serial
+debugging or lower it on a memory-constrained login node.
 
 When `POCKETBASE_URL` and either `POCKETBASE_TOKEN` or `POCKETBASE_ADMIN_TOKEN` are set, the pipeline uses PocketBase `glycan_submission` records as the submission metadata source for `glystatic` and related metadata helpers. The CSV inventory remains the fallback when PocketBase is unset, unavailable, or missing a record.
 
@@ -80,7 +124,314 @@ Run modes:
 
 - `incremental` (default): new or incomplete glycans run fully; completed glycans skip v2/process/glystatic and only sync static locally when needed.
 - `refresh-static`: completed glycans sync static locally and refresh metadata without process downloads.
-- `fresh`: recomputes v2 and glystatic even when bucket outputs already exist. `--update` is kept as an alias for this mode.
+- `fresh`: recomputes v2 and glystatic even when bucket outputs already exist. `--update` is kept as an alias for this mode except when `--mode process-only` or `--mode static-only` is explicitly selected.
+- `process-only`: runs local `data/` to local `process/` only, skips glystatic/glymeta/PocketBase/Oracle upload/finalization, and is suitable for Slurm nodes without internet access. For a single entry with a self-contained result folder see [One entry on a compute node](#one-entry-on-a-compute-node).
+- `static-only`: rebuilds local `static/` from existing local `process/` outputs, skips already complete GS folders unless `--update` is passed, skips v2/process and Oracle sync/upload, runs glymeta best-effort for rebuilt glycans, and refreshes final database artifacts.
+
+### Clustering levels
+
+Level 1 is the GMM clustering into five clusters, Level 2 the k-center
+coverage set (5 to 128 structures, from the conformational entropy). Level 3,
+the k-center set of up to 512 structures, is no longer published and is off by
+default: with levels `1,2` nothing of it is computed, written, required or
+exported, in the process stage and in the static stage. Levels 1 and 2 do not
+depend on it (each k-center run seeds the generator itself), so they are the
+same with and without it.
+
+- `--levels 1,2,3` (or `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3`) restores Level 3
+  everywhere: clustering, `output/level_3/`, `torsion_level_3_reps`, the
+  `level_3_cluster` / `level_3_center` columns of `torsion_all`, `info.json`
+  and the completeness checks.
+- Existing `process/` and `static/` folders that contain Level 3 are complete
+  under either setting and are not recomputed by an incremental run.
+- The static stage writes only the configured levels: `--mode static-only
+  --update` with levels `1,2` rebuilds `static/GSxxxxx/` without Level 3 from a
+  `process/` folder that has it (no `output/level_3/`, no
+  `torsion_level_3_reps.csv`, no Level 3 columns in `torsion_all.csv`, no
+  Level 3 entries in `info.json` and `data.json`).
+- A `process/` folder made with levels `1,2` is incomplete under `1,2,3`; a
+  process run then adds Level 3 and rewrites what is indexed by clusters.
+- A forced process run (`--update`) with levels `1,2` on a folder that has
+  Level 3 leaves the old `output/level_3/` and `torsion_level_3_reps.parquet`
+  files in place; they are ignored.
+
+Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
+
+Before PCA, the store step repairs connectivity using chemically plausible
+bonds observed at covalent distance in the trajectory. It then excludes only
+frames containing non-finite coordinates or a recovered covalent bond longer
+than `GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM` (default 3.0 Å). Inter-frame atom
+movement and whole-molecule translation are diagnostic only. Frame provenance
+is recorded in `data/frame_quality.parquet`, `data/frame_map.parquet`, and
+`data/frame_filter.json`.
+
+```bash
+python main.py --mode process-only --data-dir data --process-dir process
+python main.py --mode process-only --glycan DGalpa1-OH --data-dir data --process-dir process --update
+```
+
+Audit old data and optionally rebuild only entries with rejected frames,
+repaired topology, or stale/missing frame-quality metadata:
+
+```bash
+.venv/bin/python scripts/audit_and_rebuild_broken_frames.py \
+  --data-dir data --process-dir process --report frame_quality_audit.json
+
+.venv/bin/python scripts/audit_and_rebuild_broken_frames.py \
+  --data-dir data --process-dir process --rebuild
+
+# AMD Slurm equivalent; set REBUILD=1 after reviewing the audit.
+sbatch slurm/audit_rebuild_broken_frames_amd.sh
+REBUILD=1 sbatch slurm/audit_rebuild_broken_frames_amd.sh
+```
+
+After process-only jobs finish, rebuild website-serving files on a login node:
+
+```bash
+python main.py --mode static-only --glycan DGalpa1-OH --process-dir process --output-dir static
+python main.py --mode static-only --process-dir process --output-dir static
+```
+
+Static-only mode discovers complete local `process/<glycan>/` folders, skips incomplete ones, and rebuilds independent glycans concurrently (8 at a time by default). It auto-skips already complete `static/GSxxxxx/` folders, converts Parquet exports back to the website CSV filenames for rebuilt glycans, copies representative structures/SVGs and PCA landscape files, then rebuilds `static/GLYCOSHAPE.json`, `static/GLYCOSHAPE_RDF.ttl`, and archive artifacts. Pass `--update` to force overwriting/refreshing existing GS folders. It ignores `GLYCOSHAPE_ORACLE_PAR_URL`; no Oracle upload or sync is performed.
+
+## Staged Oracle/Slurm workflow
+
+Run these commands from the repository checkout. The download and publish stages run on a login node; only the processing stage runs on the AMD Slurm partition.
+
+```bash
+# Login node: mirror Oracle data/ locally. This only downloads source files.
+./scripts/run_staged_pipeline.sh download
+
+# Login node: submit local data/ -> local process/ jobs on four AMD nodes.
+sbatch slurm/process_only_amd.sh
+
+# Login node, after every array task succeeds: local process/ -> local static/,
+# then publish only static/ to Oracle.
+./scripts/run_staged_pipeline.sh publish
+```
+
+The script defaults to `#SBATCH --array=1-4`. A Slurm array creates four independent array tasks (`1`, `2`, `3`, and `4`); each task requests one AMD node with 64 CPUs, so this means four machines and 256 CPUs when all tasks run concurrently. The array number is a shard ID, not a glycan ID. The sorted glycan list is distributed round-robin: task 1 receives entries 1, 5, 9, …; task 2 receives 2, 6, 10, …; and so on. With the current defaults, each node processes 16 glycans at once and assigns four CPUs to each glycan (`16 × 4 = 64`). Across four simultaneously running nodes, up to 64 glycans are processed at once.
+
+The plain `sbatch slurm/process_only_amd.sh` command uses that four-node default. To choose a different number of shards/nodes, override the embedded array setting—for example, `sbatch --array=1-8 slurm/process_only_amd.sh` creates eight tasks. Actual simultaneous execution still depends on scheduler capacity and account limits; Slurm may queue some array tasks. `NJOBS` changes concurrent glycans per node and `WORKERS` changes CPUs per glycan, but `NJOBS × WORKERS` must not exceed the 64 allocated CPUs.
+
+The normal workflow is incremental: `download` preserves existing local source files; the Slurm stage reuses complete local `process/` results; and `static-only` skips complete `static/GSxxxxx/` folders. To deliberately recompute assigned glycans, submit with `FORCE_UPDATE=1 sbatch slurm/process_only_amd.sh`. For a subset, pass one or more `--glycan <name>` arguments to `download`; then submit the normal Slurm script. `publish --skip-existing` retains existing Oracle objects, while the default overwrites files in the `static/` prefix.
+
+The login-node scripts are deliberately scoped as follows:
+
+- `scripts/download_data_from_oracle.py`: Oracle `data/` → local `data/` only.
+- `slurm/process_only_amd.sh`: local `data/` → local `process/` only; it unsets the Oracle PAR URL.
+- `scripts/upload_static_to_oracle.py`: local `static/` → Oracle `static/` only.
+
+Source directory names under `data/` are opaque storage keys and need not be GLYCAM names. When present, `data/<storage-key>/name.json` supplies the authoritative `indexOrderedSequence` used by processing. Use `scripts/upload_data_to_oracle.py --glycan <storage-key> --file name.json` to publish a corrected mapping without re-uploading a simulation PDB.
+
+## One entry on a compute node
+
+After a simulation job has written its trajectories, the same job can analyse
+them on its node, without network access and without any service (no
+PocketBase, no GlyTouCan or format services, no object storage):
+
+```bash
+.venv/bin/python scripts/run_entry.py <entry> <result-folder> [--workers N] [--levels 1,2] [--force]
+```
+
+`<entry>` is an archive entry (`manifest.json`, `trajectory.xtc`,
+`topology.pdb`, `structure.mol2`) or a folder with `simulation.pdb` and
+`structure.mol2`. The files of an archive entry are checked against the sizes
+and SHA-256 of its manifest first (`--no-verify-input` checks sizes only). The
+worker count is `--workers`, else `SLURM_CPUS_PER_TASK`, else
+`GLYCOSHAPE_MAX_WORKERS`, else the cores the process may run on; it sets the
+BLAS/OpenMP threads and the worker processes of the run, whatever the job
+environment says. In a job script:
+
+```bash
+#SBATCH --cpus-per-task=64
+...                                             # the simulation and the conversion to an archive entry
+"$GAP/.venv/bin/python" "$GAP/scripts/run_entry.py" "$ARCHIVE/$FOLDER" "$RESULTS/$FOLDER" || exit 1
+```
+
+`slurm/run_entry_amd.sh` runs it as a job of its own. Exit status: `0` done,
+`1` the analysis failed (the step and the message are printed, and are in
+`result.json` and `run.log`), `2` the input or the result folder cannot be
+used (message printed; nothing is computed).
+
+The result folder is self-contained:
+
+```
+<result-folder>/
+  result.json           status; input (kind, path, atoms, frames, size and SHA-256 of every file; for an
+                        archive entry these are the hashes of its manifest, with the SHA-256 of the
+                        coordinates and of the source simulation.pdb); pipeline (commit, SHA-256 of the
+                        sources, package versions); settings (levels, workers, thresholds); seconds per step;
+                        frame-quality summary (frames read, kept, rejected, bonds recovered); analysis summary
+                        (entropy, clusters, sizes and representative frames per level); size and SHA-256 of
+                        every file produced; what is left to publishing
+  run.log               the log of the run
+  input/                manifest.json, info.json, name.json of the entry (the small files, not the trajectory)
+  process/<folder>/     the processed data: data/, embedding/, output/ exactly as in process/<glycan>/
+  static/               the part of static/GSxxxxx/ that follows from the trajectory alone:
+    output/info.json, torparts.npz
+    output/pca.csv, torsion_glycosidic.csv, torsion_all.csv, torsion_level_1_reps.csv, torsion_level_2_reps.csv
+    output/level_1/, level_2/     dist.svg, GLYCAM/alpha.pdb, GLYCAM/beta.pdb, PDB/alpha.pdb, PDB/beta.pdb
+    landscape/pca_model.joblib, landscape_metadata.json, preprocessing.npz
+```
+
+`result.json` has status `running` while the run is in progress, so a job that
+is killed leaves a folder that says so. Running the command again on a result
+folder returns at once when the result is current (same input files, levels,
+bond threshold and code); otherwise `process/`, `static/` and `input/` in it
+are replaced, never completed. A folder that is not empty and holds no
+`result.json` of this tool is refused.
+
+Deliberately left to publishing, because it needs identifiers, submission
+metadata or the network:
+
+- the GlycoShape ID and with it the folder name `static/GSxxxxx`;
+- `data.json` (names, IUPAC, WURCS, GlyTouCan accessions, composition, motifs,
+  simulation metadata), `glygen.json`, `glycosmos.json`, `snfg.svg`;
+- the GlycoShape `REMARK` block with the GlyTouCan ID and the IUPAC name at
+  the top of the PDB files: the files in `static/output/level_*/` are exactly
+  the published files without that block (their first line is `REMARK
+  GLYCAN MULTI-MODEL PDB ...`);
+- `GLYCOSHAPE.json`, `GlycoShape.zip`, `GLYCOSHAPE_RDF.ttl`,
+  `sync_manifest.json`, and any upload.
+
+Publishing can start from either half of the result: run the static stage on
+the processed data (`python main.py --mode static-only --process-dir
+<result-folder>/process ...`, which writes the same files plus the ones
+above), or copy `static/` to `static/GSxxxxx/` and add the files above.
+`lib/static_ready.py` is the single implementation of the shared files; the
+static stage calls it. The static stage takes the GLYCAM name from the name of
+the process folder, which for an archive entry with a long name is the
+shortened folder name: the name to publish under is `glycam_name` in
+`result.json`.
+
+The analysis of one entry needs memory for one matrix of 8 bytes x frames x
+atom pairs of the PCA landscape (pairs of the heavy atoms outside the reducing
+`ROH`, at most 300 atoms): 18.8 GB for the 159,940 retained frames of a
+329-atom glycan (172 such atoms, 14,706 pairs), 0.8 GB for 50,005 frames of a
+97-atom one (62 atoms, 1,891 pairs). Everything else is small next to it.
+
+## Raw trajectory archive
+
+The raw data can be kept in a compact archive instead of multi-model PDB text. One entry is one glycan:
+
+```
+<archive>/
+  index.json                 one record per entry (names, folders, counts, sizes, SHA-256)
+  conversion_report.json     the last converter run; entries that failed are under "failed" with the reason
+  <folder>/
+    trajectory.xtc           all frames in source order; XTC precision 10000 (0.0001 nm = 0.001 Å)
+    topology.pdb             header, first frame and records after the last frame (CONECT, ...), verbatim lines
+    structure.mol2           unchanged
+    info.json, name.json     unchanged, when the source has them
+    manifest.json            GLYCAM name, atoms, frames, box, size and SHA-256 of every file and of the
+                             source simulation.pdb, what the verification measured, converter version/date
+```
+
+- **Coordinates are exact.** They go from the PDB columns to the XTC as integers of 0.001 Å, so the archive holds the digits of the source; `-0.000` is stored as `0.000` and counted in the manifest. Step and time of a frame are its index from 0 (the source has no times). The box of each frame is the `CRYST1` in force at that frame, so a file made of several runs written one after the other keeps the box of each run, and the manifest lists the frame at which each starts (as it does for `END` and other records found between frames). The 1 × 1 × 1 Å placeholder cell that PDB writers emit when there is no box is recorded in the manifest and `topology.pdb` but not written as a box.
+- **Names.** An entry is identified by its full GLYCAM name: `glycam_name` in the manifest and the index, and `raw/<GLYCAM name>/` as object-storage key prefix (`lib.archive.object_key_prefix`). The name comes from `name.json` when the source folder has one, from `info.json` when the folder is named by a GlyTouCan ID, and is the folder name otherwise. `<folder>` is the GLYCAM name when that is a usable directory name (at most 255 bytes, no `/`); otherwise it is the first 200 bytes of the name, `~`, and the first 16 hex digits of the SHA-256 of the name (`lib.archive.entry_folder_name`). Always read the name from `manifest.json`, not from the folder.
+- **Names from outside.** `--names FILE` gives the converter a JSON object of source folder name to GLYCAM name, for example `{"G60371DN": "DNeup5Aca2-3[...]DGlcpNAcb1-OH"}` for a folder whose `info.json` spells the name differently. Such a name takes precedence over `name.json`, `info.json` and the folder name, and the manifest records `"glycam_name_from": "names-file"` (a different name in `name.json` or `info.json` is listed under `warnings`). A folder that is not under `--data-dir` is an error. If the same source folder was converted before under another name, that entry stays and the run ends with a non-zero status (`SUPERSEDED ...` on stderr, `superseded` in the report, and the index reports two entries for one source folder); add `--remove-superseded` to delete it once the new entry is in place. Pass the same `--names` to `--verify-only --data-dir`; without it the name of such an entry is not compared with the source (`glycam_name_checked` is false in the report) and everything else is.
+- **Verification.** Before an entry gets its final name the XTC is read back and every coordinate is compared with the source text; `manifest.json` records the number compared, the number that differ (always 0 for a published entry) and the largest difference in Å between the stored float and the decimal number of the text. A sample of frames (`--check-frames`, default 100) is also re-read from the source with plain `float()` as an independent check. A source that cannot be represented is not converted and is listed in the report: a frame with another atom count or other atom records, a truncated file, a coordinate that the XTC does not return exactly (possible only from 5120 Å on).
+
+```bash
+# Convert (resumable: entries whose manifest verifies are skipped; the source is only read)
+.venv/bin/python scripts/convert_data_to_archive.py --data-dir data --archive-dir archive --workers 8
+
+# Give a source folder its GLYCAM name from outside and drop the entry it had under the old name
+.venv/bin/python scripts/convert_data_to_archive.py --data-dir data --archive-dir archive \
+  --glycan G60371DN --names names.json --remove-superseded
+
+# One 64-core AMD node; DATA_DIR and ARCHIVE_DIR are at the top of the script.
+# VERIFY=1 runs the verification below instead, with every frame re-read from the source.
+# NAMES_FILE=names.json passes --names.
+mkdir -p logs/slurm && sbatch slurm/convert_data_to_archive_amd.sh
+
+# Verify an archive: files against manifests, and with --data-dir every coordinate against the source
+.venv/bin/python scripts/convert_data_to_archive.py --verify-only --archive-dir archive --data-dir data --workers 8
+```
+
+The pipeline reads either layout: point `--data-dir` at the archive and the store step streams frames from `trajectory.xtc` (`lib.glystore.store_from_archive`) with the same result as from `simulation.pdb`; folders with `simulation.pdb` keep working. Archive entries are read from the local filesystem only. In Python, `lib.archive.ArchiveEntry(path).iter_frames(chunk=1024)` yields `(frames, atoms, 3)` float32 arrays in Å, and `lib.archive.verify_entry(path, source_dir)` checks one entry. The XTC is written with MDTraj (`mdtraj==1.10.3` in `requirements.txt`); an existing `.venv` needs `uv pip install -r requirements.txt` once.
+
+## S3 storage (Cloudflare R2)
+
+`GLYCOSHAPE_STORAGE=s3` selects S3-compatible object storage instead of the Oracle PAR bucket. Without it nothing changes: Oracle when `GLYCOSHAPE_ORACLE_PAR_URL` is set, local folders otherwise. `GLYCOSHAPE_STORAGE=local` forces local folders. Put the settings in the environment or in `.env` (not committed); the secret goes to the client only and is never logged. The client is `boto3` (pinned in `requirements.txt`; an existing `.venv` needs `uv pip install -r requirements.txt` once; it adds four packages, 16 MB to download and 31 MB installed, nearly all of it `botocore`).
+
+| Variable | Default | |
+|---|---|---|
+| `GLYCOSHAPE_STORAGE` | unset | `s3`, `oracle` or `local` |
+| `GLYCOSHAPE_S3_ENDPOINT` | required | `https://<account id>.r2.cloudflarestorage.com` |
+| `GLYCOSHAPE_S3_ACCESS_KEY_ID`, `GLYCOSHAPE_S3_SECRET_ACCESS_KEY` | required | an R2 API token that may read and write objects in the buckets below |
+| `GLYCOSHAPE_S3_REGION` | `auto` | |
+| `GLYCOSHAPE_S3_ADDRESSING_STYLE` | `path` | `path`, `virtual` or `auto` |
+| `GLYCOSHAPE_S3_RAW_BUCKET`, `GLYCOSHAPE_S3_RAW_PREFIX` | `glycoshape-archive`, `raw` | archive entries `raw/<GLYCAM name>/...` and `raw/index.json` |
+| `GLYCOSHAPE_S3_PROCESS_BUCKET`, `GLYCOSHAPE_S3_PROCESS_PREFIX` | `glycoshape-archive`, `process` | kept for `process/<GLYCAM name>/...`; no command uploads there yet |
+| `GLYCOSHAPE_S3_STATIC_BUCKET`, `GLYCOSHAPE_S3_STATIC_PREFIX` | `glycoshape-database`, `static` | the published static database |
+| `GLYCOSHAPE_S3_STAGING_PREFIX` | `publish-staging` | in the static bucket, outside the static prefix: where changed files wait during a publish |
+| `GLYCOSHAPE_S3_MAX_ATTEMPTS` | `8` | attempts per request; connection errors, throttling (HTTP 429 included) and 5xx answers are retried with exponential backoff and jitter |
+| `GLYCOSHAPE_S3_MULTIPART_THRESHOLD_MB`, `GLYCOSHAPE_S3_MULTIPART_CHUNK_MB` | `64`, `32` | a larger file is uploaded in parts of this size |
+| `GLYCOSHAPE_S3_TRANSFER_CONCURRENCY` | `4` | parts of one file in transfer at the same time |
+| `GLYCOSHAPE_S3_CHECKSUMS` | `when_required` | `when_supported` lets the client add a CRC32 to every upload, where the service accepts that |
+
+Every object is uploaded with its SHA-256 as metadata (`x-amz-meta-sha256`); "unchanged" below always means that the stored size and this value are those of the local manifest. Files are streamed, never read into memory.
+
+With S3 selected, `main.py` runs `--mode process-only` and `--mode static-only`, on local folders as always, and refuses the modes that read and publish through the storage layer. Use the staged workflow:
+
+```bash
+# Login node: raw entries -> data/ (all entries of raw/index.json, or --glycan '<GLYCAM name>'; repeatable)
+./scripts/run_staged_pipeline.sh download --workers 8
+
+# Login node: submit local data/ -> local process/, as for Oracle
+sbatch slurm/process_only_amd.sh
+
+# Login node, after every task succeeded: local process/ -> local static/, then publish what changed
+./scripts/run_staged_pipeline.sh publish
+.venv/bin/python scripts/static_s3.py check
+```
+
+`run_staged_pipeline.sh` (and `continue_rebuild_after_slurm.sh`, `publish_after_slurm.sh`) ask `lib/config.py` which storage is selected, so the same commands serve Oracle and S3; the compute-node jobs set `GLYCOSHAPE_STORAGE=local`.
+
+### Raw archive: `scripts/archive_s3.py`
+
+```bash
+# Upload an archive directory (the one convert_data_to_archive.py wrote, with its index.json)
+.venv/bin/python scripts/archive_s3.py upload --archive-dir archive --workers 8 --dry-run
+.venv/bin/python scripts/archive_s3.py upload --archive-dir archive --workers 8
+.venv/bin/python scripts/archive_s3.py compare --archive-dir archive        # listing against index.json, any time
+
+# Download: every entry of the stored index, or entries by GLYCAM name
+.venv/bin/python scripts/archive_s3.py download --archive-dir data --workers 8
+.venv/bin/python scripts/archive_s3.py download --archive-dir data --glycan 'DManpa1-2DManpa1-OH'
+```
+
+- **Keys.** `raw/<GLYCAM name>/<file>`, with the name of the entry's `manifest.json`, not of its local folder (which is shortened for long names). `--glycan` takes the GLYCAM name; for `upload` also the entry folder or the source folder.
+- **Upload.** A file is skipped when the stored object is unchanged, hashed before it is sent and refused when it is not what its manifest says. The files of an entry go first and its `manifest.json` last, and when a file of an entry that is already stored has to be replaced, the stored manifest is deleted first; so an entry with a manifest in the storage is complete. Afterwards the listing of `raw/` is compared with `index.json` (keys and sizes) and the stored manifest of every entry with the SHA-256 that the index records; `raw/index.json` is uploaded only when every entry of the index is there. The exit status is non-zero when one of the entries that were to be uploaded failed or is not complete in the storage. `index.json` has to describe the archive: run the converter again after changing an entry.
+- **Download.** Each file is downloaded into `data/.staging/`, hashed and compared with the manifest; the entry folder (`lib.archive.entry_folder_name`) appears only when all of it verified. Without `--glycan` the stored index says which entries there are and pins the manifest of each; an entry named with `--glycan` is verified against its own manifest only, so it can be fetched while the index is still the one of an earlier upload. The folder is an archive entry that `main.py --mode process-only --data-dir data --glycan <folder>` processes; the command prints it. An entry that is already there with the same manifest and whose files verify is skipped (`--trust-local` compares sizes instead of hashing them again). A folder that is not an archive entry is never written into.
+- **Resume** by running the same command again. `--report FILE` writes what was done as JSON. An interrupted multipart upload leaves parts in the bucket that the service removes after its lifecycle period (seven days by default on R2).
+
+### Static database: `scripts/static_s3.py`
+
+```bash
+.venv/bin/python scripts/static_s3.py publish --static-dir static --dry-run   # what would be sent
+.venv/bin/python scripts/static_s3.py publish --static-dir static --workers 16
+.venv/bin/python scripts/static_s3.py check              # read back as the website does: download and hash everything
+.venv/bin/python scripts/static_s3.py check --quick      # sizes and SHA-256 metadata only
+```
+
+The website reads `static/sync_manifest.json` and then downloads the files it lists, comparing size and SHA-256 of each; one mismatch or missing object fails its run (and leaves its own database alone). `publish` therefore sends only what `sync_manifest.json` lists, refuses a manifest the website would refuse (for example one that lists a hidden file) or that does not describe the local files, and works in this order:
+
+1. **New files** (no object under that key) are uploaded to their keys. No published manifest lists them, so no reader fetches them.
+2. **Changed files** are uploaded to `publish-staging/static/<SHA-256>`, outside the published prefix.
+3. Changed files are **copied inside the storage** from the staging prefix onto their keys.
+4. The listing is compared with the manifest and **`sync_manifest.json` is written last**, as one object.
+5. The staging objects are deleted; `--delete-stale` also deletes objects under `static/` that the manifest no longer lists (they are only counted otherwise).
+
+If the upload is interrupted in step 1 or 2, which is where the time goes, the published prefix is exactly what it was: the old manifest and every file it lists. Step 3 cannot be made invisible, because two objects cannot be replaced at once: from the first copy until the manifest is written, the published manifest describes files that have been replaced. A website that already has the published `global_hash` does nothing in that window; one that is behind fails its verification, keeps its database and retries. Run `publish` again after any interruption: it continues from what is stored. Without a published manifest (the first publish) there is no reader, and files are replaced in place.
+
+`publish` exits non-zero when it stopped, and also when the manifest was written but step 5 failed (it says which). `check` exits non-zero and lists the files that are missing or differ. `--quick` trusts the SHA-256 metadata, so it does not notice an object whose content was changed by other means; the full check does.
+
+### Tests
+
+`python -m pytest tests` runs the unit tests of the storage, the transfers and the publish order on an in-memory client. The integration tests need boto3 and a local S3-compatible server and are skipped without one: a MinIO container is started for the session when Docker has a MinIO image (it is removed afterwards and nothing is pulled), and the moto server when `moto[s3]`, `flask` and `flask-cors` are installed. MinIO refuses a key with a segment longer than 255 bytes, so the 267-character GLYCAM name is tested against moto. `GLYCOSHAPE_TEST_S3_ENDPOINT`, `GLYCOSHAPE_TEST_S3_ACCESS_KEY_ID` and `GLYCOSHAPE_TEST_S3_SECRET_ACCESS_KEY` name another throwaway server instead (see `tests/conftest.py`).
 
 ## Login Node Run
 
@@ -96,6 +447,12 @@ To run and safely close SSH:
 ```bash
 ./install.sh --run --background -- --mode incremental
 tail -f logs/GlycoShape_GAP.log
+
+# Normal (cleans up after upload)
+./install.sh --run --background -- --mode incremental
+
+# Keep everything local
+./install.sh --run --background -- --mode incremental --keep-local
 ```
 
 The background launcher writes the process ID to `logs/GlycoShape_GAP.pid`. The old automatic poweroff behavior has been removed.

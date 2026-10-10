@@ -17,6 +17,8 @@ import sys
 import logging
 import argparse
 import time
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +59,7 @@ from lib.storage import get_storage_manager, reset_storage_manager
 from lib.glystatic import get_glycan_metadata, process_glycan as glystatic_process_glycan
 from lib.glymeta import GlycanMetadataProcessor
 from lib.glybake import GlycoShapeBaker
+from lib import name_utils
 from lib.v2 import run_glycan_analysis, get_glycan_status, Chem as V2_RDKIT_CHEM
 
 
@@ -67,7 +70,12 @@ class GlycanPipelineRunner:
         "torparts.npz",
         "info.json",
     )
-    REQUIRED_GLYSTATIC_LEVELS = ("level_1", "level_2", "level_3")
+
+    @property
+    def REQUIRED_GLYSTATIC_LEVELS(self):
+        """Level folders a complete process/static folder must have (config.cluster_levels)."""
+        return tuple(f"level_{level}" for level in config.cluster_levels)
+
     REQUIRED_GLYSTATIC_LEVEL_FILES = (
         "dist.svg",
         "PDB/alpha.pdb",
@@ -87,9 +95,6 @@ class GlycanPipelineRunner:
         "torparts.npz",
         "torsion_all.csv",
         "torsion_glycosidic.csv",
-        "torsion_level_1_reps.csv",
-        "torsion_level_2_reps.csv",
-        "torsion_level_3_reps.csv",
     )
     LOG_TAIL_STEP_ORDER = (
         ("input_files", "input_files"),
@@ -112,7 +117,7 @@ class GlycanPipelineRunner:
             process_dir: Directory for storing processing outputs (data, embedding, output)
             output_dir: Directory for final database output
             force_update: Whether to force recomputation of existing results
-            mode: Run mode: incremental, refresh-static, or fresh
+            mode: Run mode: incremental, refresh-static, fresh, process-only, or static-only
         """
         self.data_dir = data_dir
         self.process_dir = process_dir 
@@ -128,9 +133,10 @@ class GlycanPipelineRunner:
         self.storage.mkdir(self.process_dir)
         self.storage.mkdir(self.output_dir)
         
-        # Initialize PocketBase client (optional)
+        # Initialize PocketBase client (optional). Process-only mode must be able
+        # to run on Slurm nodes without internet access.
         self.pb_client = None
-        if config.use_pocketbase:
+        if config.use_pocketbase and self.mode != "process-only":
             try:
                 from lib.pocketbase import GLYCAN_COLLECTION, get_pocketbase_client
                 client = get_pocketbase_client()
@@ -157,6 +163,13 @@ class GlycanPipelineRunner:
         self._remote_process_complete: Set[str] = set()
         self._remote_static_data_dirs: Set[str] = set()
         self._pocketbase_by_glycan: Dict[str, Dict[str, Any]] = {}
+        self._static_only_complete_index: Optional[Dict[str, str]] = None
+        self._static_only_incomplete_index: Dict[str, List[str]] = {}
+        self._wurcs_glytoucan_cache: Dict[str, Optional[str]] = {}
+        self._iupac_wurcs_cache: Dict[str, Optional[str]] = {}
+        # PocketBase writes are short but use a shared client/session. Keep
+        # those writes serialized while expensive glystatic work stays parallel.
+        self._glymeta_lock = threading.Lock()
     
     def _remote_output_base(self) -> str:
         """Return the remote base prefix for outputs.
@@ -259,14 +272,27 @@ class GlycanPipelineRunner:
                 }
 
         process_base = self._remote_process_base()
+        process_files: Dict[str, set] = {}
         for obj in self._list_storage_files_complete(process_base):
             key = self._normalize_storage_key(obj)
-            if not key.endswith("/output/info.json"):
+            if not key.startswith(process_base.rstrip("/") + "/"):
                 continue
-            rel = key[len(process_base.rstrip("/") + "/"):] if key.startswith(process_base.rstrip("/") + "/") else key
+            rel = key[len(process_base.rstrip("/") + "/"):]
             glycan_name = rel.split("/", 1)[0]
-            if glycan_name:
-                self._remote_process_complete.add(glycan_name)
+            if not glycan_name:
+                continue
+            if glycan_name not in process_files:
+                process_files[glycan_name] = set()
+            if rel.endswith("/output/info.json"):
+                process_files[glycan_name].add("info")
+            elif rel.endswith("/embedding/pca_conformation_landscape.parquet"):
+                process_files[glycan_name].add("pca")
+            elif rel.endswith("/embedding/landscape/pca_model.joblib"):
+                process_files[glycan_name].add("pca_model")
+        self._remote_process_complete = {
+            name for name, files in process_files.items()
+            if "info" in files and "pca" in files and "pca_model" in files
+        }
 
         output_base = self._remote_output_base()
         for obj in self._list_storage_files_complete(output_base):
@@ -707,7 +733,34 @@ class GlycanPipelineRunner:
         required_files = list(self.LOG_TAIL_TOP_LEVEL_FILES)
         required_files.extend(f"output/{name}" for name in self.LOG_TAIL_OUTPUT_FILES)
         for level_name in self.REQUIRED_GLYSTATIC_LEVELS:
+            required_files.append(f"output/torsion_{level_name}_reps.csv")
             required_files.extend(f"output/{level_name}/{rel_path}" for rel_path in self.REQUIRED_GLYSTATIC_LEVEL_FILES)
+        return required_files
+
+    def _get_static_only_required_files(self) -> List[str]:
+        """Return essential artifacts required to skip a static-only rebuild.
+
+        GlyGen/GlyCosmos records and SNFG diagrams are optional network
+        enrichments.  Their absence must not trigger a costly rebuild.
+        """
+        required_files = [
+            "output/info.json",
+            "output/pca.csv",
+            "output/torparts.npz",
+            "output/torsion_all.csv",
+            "output/torsion_glycosidic.csv",
+        ]
+        for level_name in self.REQUIRED_GLYSTATIC_LEVELS:
+            required_files.append(f"output/torsion_{level_name}_reps.csv")
+            required_files.extend(
+                f"output/{level_name}/{rel_path}"
+                for rel_path in self.REQUIRED_GLYSTATIC_LEVEL_FILES
+            )
+        required_files.extend([
+            "landscape/pca_model.joblib",
+            "landscape/landscape_metadata.json",
+            "landscape/preprocessing.npz",
+        ])
         return required_files
 
     def _collect_static_output_files(self, output_dir: Optional[str]) -> List[str]:
@@ -1034,15 +1087,430 @@ class GlycanPipelineRunner:
                     # Check for required files
                     pdb_file = f"{item_name}/{item_name}.pdb"
                     mol2_file = f"{item_name}/{item_name}.mol2"
+                    alt_pdb_file = f"{item_name}/simulation.pdb"
+                    alt_mol2_file = f"{item_name}/structure.mol2"
                     
-                    if self.storage.exists(pdb_file, self.data_dir) and self.storage.exists(mol2_file, self.data_dir):
+                    ok_named = self.storage.exists(pdb_file, self.data_dir) and self.storage.exists(mol2_file, self.data_dir)
+                    ok_alt = self.storage.exists(alt_pdb_file, self.data_dir) and self.storage.exists(alt_mol2_file, self.data_dir)
+                    # Archive entry (lib/archive.py): manifest.json + trajectory.xtc + structure.mol2
+                    ok_archive = (
+                        self.storage.exists(f"{item_name}/manifest.json", self.data_dir)
+                        and self.storage.exists(f"{item_name}/trajectory.xtc", self.data_dir)
+                        and self.storage.exists(alt_mol2_file, self.data_dir)
+                    )
+                    if ok_named or ok_alt or ok_archive:
                         glycan_dirs.append(item_name)
                         logger.info(f"Found glycan: {item_name}")
                     else:
-                        logger.warning(f"Skipping {item_name}: missing required files (.pdb and .mol2)")
+                        logger.warning(f"Skipping {item_name}: missing required files (.pdb/.mol2 or simulation.pdb/structure.mol2)")
                     
         logger.info(f"Discovered {len(glycan_dirs)} glycan directories")
         return sorted(glycan_dirs)
+
+    def run_process_only_glycan(self, glycan_name: str) -> Dict[str, bool]:
+        """Run only the v2/process stage for a single glycan."""
+        # ``process-only`` is also the incremental worker used by the AMD
+        # array.  Do not call v2 for folders that already have every required
+        # process artifact: in particular, an old folder without the new
+        # frame-quality provenance must be handled by the selective
+        # maintenance command, not silently restaged as part of an
+        # incremental new-glycan run.  ``--update`` remains the explicit way
+        # to force a recomputation.
+        if not self.force_update:
+            try:
+                if self.check_v2_completion(glycan_name):
+                    logger.info("Process output already complete for %s; skipping incremental process-only run", glycan_name)
+                    return {"v2": True, "skipped": True}
+            except Exception as exc:
+                logger.debug("Could not check existing process output for %s; processing it: %s", glycan_name, exc)
+
+        logger.info(f"Starting process-only run for glycan: {glycan_name}")
+        started_at = time.perf_counter()
+        ok = self.run_v2_analysis(glycan_name)
+        logger.info(f"Process-only v2 stage completed in {time.perf_counter() - started_at:.3f}s")
+        return {"v2": ok}
+
+    def run_process_only_pipeline(self) -> Dict[str, Any]:
+        """Run v2/process generation for all discovered glycans without static/network phases."""
+        results: Dict[str, Any] = {
+            "total_glycans": 0,
+            "successful_glycans": 0,
+            "failed_glycans": 0,
+            "glycan_results": {},
+            "finalization_success": False,
+            "step_statistics": {"v2_success": 0},
+        }
+
+        glycan_names = self.discover_glycans()
+        results["total_glycans"] = len(glycan_names)
+        if not glycan_names:
+            logger.warning("No glycans found to process")
+            return results
+
+        logger.info(f"Starting process-only processing of {len(glycan_names)} glycans")
+        for i, glycan_name in enumerate(glycan_names, 1):
+            logger.info(f"Processing glycan {i}/{len(glycan_names)}: {glycan_name}")
+            glycan_results = self.run_process_only_glycan(glycan_name)
+            results["glycan_results"][glycan_name] = glycan_results
+            if glycan_results.get("v2"):
+                results["successful_glycans"] += 1
+                results["step_statistics"]["v2_success"] += 1
+            else:
+                results["failed_glycans"] += 1
+
+        logger.info("=" * 60)
+        logger.info("PROCESS-ONLY COMPLETION SUMMARY")
+        logger.info(f"Total glycans: {results['total_glycans']}")
+        logger.info(f"Successful: {results['successful_glycans']}")
+        logger.info(f"Failed: {results['failed_glycans']}")
+        logger.info("=" * 60)
+        return results
+
+    def _static_only_missing_requirements(self, glycan_name: str) -> List[str]:
+        """Return missing local process artifacts required to rebuild static output."""
+        process_glycan_dir = Path(str(self.process_dir)) / glycan_name
+        required_files = [
+            "output/info.json",
+            "output/torparts.npz",
+            "embedding/exports/pca.parquet",
+            "embedding/exports/torsion_all.parquet",
+            "embedding/exports/torsion_glycosidic.parquet",
+            "embedding/landscape/pca_model.joblib",
+            "embedding/landscape/landscape_metadata.json",
+            "embedding/landscape/preprocessing.npz",
+        ]
+
+        for level_name in self.REQUIRED_GLYSTATIC_LEVELS:
+            required_files.extend([
+                f"output/{level_name}/alpha.pdb",
+                f"output/{level_name}/beta.pdb",
+                f"output/{level_name}/dist.svg",
+                f"embedding/exports/torsion_{level_name}_reps.parquet",
+            ])
+
+        missing = []
+        if not process_glycan_dir.is_dir():
+            return [str(process_glycan_dir)]
+        for rel_path in required_files:
+            if not (process_glycan_dir / rel_path).exists():
+                missing.append(rel_path)
+        return missing
+
+    def _static_only_output_missing_requirements(self, output_dir: Path, glycan_name: str) -> List[str]:
+        """Return missing or invalid local static artifacts for a completed GS folder."""
+        missing: List[str] = []
+        if not output_dir.is_dir():
+            return [str(output_dir)]
+
+        data_json = output_dir / "data.json"
+        if not data_json.is_file():
+            return ["data.json"]
+
+        try:
+            with open(data_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            return [f"data.json unreadable: {exc}"]
+
+        archetype = data.get("archetype", {}) if isinstance(data, dict) else {}
+        if not isinstance(archetype, dict):
+            missing.append("data.json archetype")
+        elif not self._matches_glycan_name(archetype, glycan_name):
+            missing.append("data.json archetype name mismatch")
+        # A GlyTouCan registration can be pending.  A registered GS00xxx ID is
+        # sufficient to resume static output without redoing network stages.
+        # Reject historic name-hash fallback IDs such as GSDE2A13.
+        elif not re.fullmatch(r"GS\d{5}", str(archetype.get("ID") or "").strip()):
+            missing.append("data.json registered GlycoShape ID")
+
+        # If a prior static build happened while GlyTouCan registration was
+        # pending, the file manifest is complete but metadata is stale. In
+        # incremental static mode, rebuild only when GlyTouCan now resolves for
+        # an existing WURCS. If it still does not resolve, keep it skippable.
+        if isinstance(data, dict):
+            for variant in ("archetype", "alpha", "beta"):
+                entry = data.get(variant)
+                if not isinstance(entry, dict):
+                    continue
+                motifs = entry.get("motifs")
+                if not isinstance(motifs, list):
+                    continue
+                if any(isinstance(motif, dict) and "iupac" not in motif for motif in motifs):
+                    missing.append(f"data.json {variant} motif IUPAC")
+                    break
+
+            for variant in ("archetype", "alpha", "beta"):
+                entry = data.get(variant)
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("glytoucan"):
+                    continue
+
+                wurcs = str(entry.get("wurcs") or "").strip()
+                if not wurcs:
+                    # Some older static builds predate the MolWURCS fallback,
+                    # so data.json may have IUPAC but no WURCS. If WURCS is
+                    # now calculable, mark the folder stale so a normal
+                    # incremental static run rewrites data.json.
+                    iupac = str(entry.get("iupac") or "").strip()
+                    if not iupac:
+                        continue
+                    if iupac not in self._iupac_wurcs_cache:
+                        calculated_wurcs = None
+                        try:
+                            _, calculated_wurcs = name_utils.iupac2wurcs_glytoucan(iupac)
+                        except Exception:
+                            calculated_wurcs = None
+                        if not calculated_wurcs:
+                            try:
+                                smiles = name_utils.iupac2smiles(iupac)
+                                calculated_wurcs = name_utils.smiles2wurcs(smiles) if smiles else None
+                            except Exception:
+                                calculated_wurcs = None
+                        self._iupac_wurcs_cache[iupac] = calculated_wurcs
+                    if self._iupac_wurcs_cache[iupac]:
+                        missing.append(f"data.json {variant} WURCS now calculable")
+                        break
+                    continue
+
+                if wurcs not in self._wurcs_glytoucan_cache:
+                    self._wurcs_glytoucan_cache[wurcs] = name_utils.wurcs2glytoucan(wurcs)
+                if self._wurcs_glytoucan_cache[wurcs]:
+                    missing.append(f"data.json {variant} GlyTouCan now registered")
+                    break
+
+        for rel_path in self._get_static_only_required_files():
+            if not (output_dir / rel_path).is_file():
+                missing.append(rel_path)
+        return missing
+
+    def _build_static_only_completion_index(self) -> None:
+        """Index complete local static outputs by glycan name for resumable static-only runs."""
+        if self._static_only_complete_index is not None:
+            return
+
+        complete: Dict[str, str] = {}
+        incomplete: Dict[str, List[str]] = {}
+        output_root = Path(str(self.output_dir))
+        if not output_root.exists():
+            self._static_only_complete_index = complete
+            self._static_only_incomplete_index = incomplete
+            return
+
+        for data_json in sorted(output_root.glob("GS*/data.json")):
+            output_dir = data_json.parent
+            try:
+                with open(data_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as exc:
+                incomplete[output_dir.name] = [f"data.json unreadable: {exc}"]
+                continue
+
+            archetype = data.get("archetype", {}) if isinstance(data, dict) else {}
+            glycan_name = ""
+            if isinstance(archetype, dict):
+                glycan_name = str(archetype.get("name") or archetype.get("glycam") or "").strip()
+            if not glycan_name:
+                incomplete[output_dir.name] = ["data.json archetype name"]
+                continue
+
+            missing = self._static_only_output_missing_requirements(output_dir, glycan_name)
+            if missing:
+                incomplete[glycan_name] = missing
+                continue
+
+            complete[glycan_name] = str(output_dir)
+            self._cache_static_output_dir(glycan_name, str(output_dir))
+
+        self._static_only_complete_index = complete
+        self._static_only_incomplete_index = incomplete
+        logger.info(
+            "Indexed local static outputs for static-only resume: %d complete, %d incomplete",
+            len(complete),
+            len(incomplete),
+        )
+
+    def _find_static_only_complete_output_dir(self, glycan_name: str) -> Optional[str]:
+        """Return a complete local static output directory for a glycan, if present."""
+        self._build_static_only_completion_index()
+        return (self._static_only_complete_index or {}).get(glycan_name)
+
+    def discover_static_only_glycans(self) -> tuple[List[str], Dict[str, List[str]]]:
+        """Discover complete local process folders eligible for static rebuild."""
+        process_root = Path(str(self.process_dir))
+        eligible: List[str] = []
+        skipped: Dict[str, List[str]] = {}
+
+        logger.info(f"Discovering static-only candidates in process directory: {process_root}")
+        if not process_root.exists():
+            logger.error(f"Process directory does not exist: {process_root}")
+            return eligible, skipped
+
+        for glycan_dir in sorted(p for p in process_root.iterdir() if p.is_dir()):
+            glycan_name = glycan_dir.name
+            missing = self._static_only_missing_requirements(glycan_name)
+            if missing:
+                skipped[glycan_name] = missing
+            else:
+                eligible.append(glycan_name)
+
+        logger.info(
+            "Discovered %d static-only eligible glycans and %d incomplete process folders",
+            len(eligible),
+            len(skipped),
+        )
+        return eligible, skipped
+
+    def run_static_only_glycan(self, glycan_name: str) -> Dict[str, bool]:
+        """Rebuild local static output from an existing local process folder."""
+        results = {
+            "glystatic": False,
+            "glymeta": False,
+            "skipped": False,
+        }
+        missing = self._static_only_missing_requirements(glycan_name)
+        if missing:
+            logger.warning(f"Skipping static-only rebuild for {glycan_name}; missing process artifacts: {', '.join(missing)}")
+            return results
+
+        if not self.force_update:
+            complete_output_dir = self._find_static_only_complete_output_dir(glycan_name)
+            if complete_output_dir:
+                logger.info(f"Static-only output already complete for {glycan_name} in {complete_output_dir}; skipping")
+                results["glystatic"] = True
+                results["glymeta"] = True
+                results["skipped"] = True
+                return results
+
+        logger.info(f"Starting static-only rebuild for glycan: {glycan_name}")
+        started_at = time.perf_counter()
+        glystatic_result = self.run_glystatic(glycan_name, check_existing=False)
+        results["glystatic"] = bool(glystatic_result.get("success"))
+        logger.info(f"Static-only glystatic stage completed in {time.perf_counter() - started_at:.3f}s")
+
+        if not results["glystatic"]:
+            logger.error(f"Static-only rebuild failed at glystatic for {glycan_name}")
+            return results
+
+        try:
+            glymeta_started_at = time.perf_counter()
+            results["glymeta"] = self.run_glymeta(
+                glycan_name,
+                output_dir=str(glystatic_result.get("final_output_dir") or "") or None,
+            )
+            logger.info(f"Static-only glymeta stage completed in {time.perf_counter() - glymeta_started_at:.3f}s")
+        except Exception as exc:
+            logger.warning(f"Static-only glymeta failed for {glycan_name}: {exc}")
+
+        logger.info(f"Successfully completed static-only rebuild for glycan: {glycan_name}")
+        return results
+
+    def run_static_only_pipeline(self) -> Dict[str, Any]:
+        """Rebuild static outputs from complete local process folders only."""
+        results: Dict[str, Any] = {
+            "total_glycans": 0,
+            "eligible_glycans": 0,
+            "skipped_glycans": 0,
+            "successful_glycans": 0,
+            "failed_glycans": 0,
+            "skipped_complete": 0,
+            "glycan_results": {},
+            "skipped_incomplete": {},
+            "finalization_success": False,
+            "step_statistics": {
+                "glystatic_success": 0,
+                "glymeta_success": 0,
+                "static_skip": 0,
+            },
+        }
+
+        if not self.force_update:
+            self._build_static_only_completion_index()
+
+        glycan_names, skipped = self.discover_static_only_glycans()
+        results["eligible_glycans"] = len(glycan_names)
+        results["skipped_glycans"] = len(skipped)
+        results["total_glycans"] = len(glycan_names) + len(skipped)
+        results["skipped_incomplete"] = skipped
+
+        if skipped:
+            logger.warning("Skipping %d incomplete process folders during static-only rebuild", len(skipped))
+            for glycan_name, missing in list(skipped.items())[:20]:
+                logger.warning(f"  {glycan_name}: missing {', '.join(missing)}")
+            if len(skipped) > 20:
+                logger.warning("  ... and %d more incomplete folders", len(skipped) - 20)
+
+        if not glycan_names:
+            logger.warning("No complete process folders found for static-only rebuild")
+            return results
+
+        worker_count = min(len(glycan_names), max(1, int(config.static_workers)))
+        logger.info(
+            "Starting static-only rebuild of %d glycans with %d concurrent workers",
+            len(glycan_names),
+            worker_count,
+        )
+
+        def record_result(glycan_name: str, glycan_results: Dict[str, bool], completed: int) -> None:
+            results["glycan_results"][glycan_name] = glycan_results
+
+            if glycan_results.get("skipped"):
+                results["skipped_complete"] += 1
+                results["step_statistics"]["static_skip"] += 1
+            elif glycan_results.get("glystatic"):
+                results["successful_glycans"] += 1
+                results["step_statistics"]["glystatic_success"] += 1
+                if glycan_results.get("glymeta"):
+                    results["step_statistics"]["glymeta_success"] += 1
+            else:
+                results["failed_glycans"] += 1
+            logger.info(
+                "Static-only progress: %d/%d complete (%d rebuilt, %d skipped, %d failed)",
+                completed,
+                len(glycan_names),
+                results["successful_glycans"],
+                results["skipped_complete"],
+                results["failed_glycans"],
+            )
+
+        if worker_count == 1:
+            for i, glycan_name in enumerate(glycan_names, 1):
+                logger.info(f"Rebuilding static glycan {i}/{len(glycan_names)}: {glycan_name}")
+                record_result(glycan_name, self.run_static_only_glycan(glycan_name), i)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="glystatic") as executor:
+                future_map = {
+                    executor.submit(self.run_static_only_glycan, glycan_name): glycan_name
+                    for glycan_name in glycan_names
+                }
+                for completed, future in enumerate(as_completed(future_map), 1):
+                    glycan_name = future_map[future]
+                    try:
+                        glycan_results = future.result()
+                    except Exception as exc:
+                        logger.exception("Unhandled static-only failure for %s: %s", glycan_name, exc)
+                        glycan_results = {"glystatic": False, "glymeta": False, "skipped": False}
+                    record_result(glycan_name, glycan_results, completed)
+
+        if results["successful_glycans"] > 0 or results["skipped_complete"] > 0:
+            logger.info("Starting database finalization after static-only rebuild...")
+            results["finalization_success"] = self.run_database_finalization()
+        else:
+            logger.warning("No static outputs were successfully rebuilt, skipping finalization")
+
+        logger.info("=" * 60)
+        logger.info("STATIC-ONLY COMPLETION SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Total local process folders: {results['total_glycans']}")
+        logger.info(f"Eligible process folders: {results['eligible_glycans']}")
+        logger.info(f"Skipped incomplete folders: {results['skipped_glycans']}")
+        logger.info(f"Skipped complete static folders: {results['skipped_complete']}")
+        logger.info(f"Successful static rebuilds: {results['successful_glycans']}")
+        logger.info(f"Failed static rebuilds: {results['failed_glycans']}")
+        logger.info(f"Glymeta successes: {results['step_statistics']['glymeta_success']}/{results['successful_glycans']}")
+        logger.info(f"Database finalization: {'Success' if results['finalization_success'] else 'Failed'}")
+        logger.info("=" * 60)
+        return results
     
     def run_v2_analysis(self, glycan_name: str) -> bool:
         """Run v2 analysis for a single glycan.
@@ -1527,7 +1995,8 @@ class GlycanPipelineRunner:
             json_path = f"{candidate_dir}/data.json"
                 
             # Update metadata for this specific glycan
-            success = self.metadata_processor.update_glycan_metadata(json_path)
+            with self._glymeta_lock:
+                success = self.metadata_processor.update_glycan_metadata(json_path)
             
             if success:
                 self._upload_local_static_output_if_oracle(candidate_dir, glycan_name)
@@ -1614,7 +2083,9 @@ class GlycanPipelineRunner:
                 logger.info(f"v2 analysis already complete for {glycan_name}, skipping")
                 results["v2"] = True
             else:
-                # Run v2 and upload process dir to Oracle if enabled
+                # Sync existing process data from Oracle so only missing steps run
+                if config.use_oracle_storage:
+                    self._sync_remote_process_dir_to_local(glycan_name)
                 stage_started_at = time.perf_counter()
                 v2_ok = self.run_v2_analysis(glycan_name)
                 stage_durations["v2"] = round(time.perf_counter() - stage_started_at, 3)
@@ -1705,17 +2176,25 @@ class GlycanPipelineRunner:
             
             # Validate that we have processed glycans
             processed_glycans = []
-            try:
-                base = self._remote_output_base()
-                candidates = self._list_storage_files_complete(base)
-            except Exception:
-                candidates = []
-            for cand in candidates:
-                key_raw = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
-                if not key_raw.endswith('/data.json') and not key_raw.endswith('data.json'):
-                    continue
-                key = str(Path(key_raw).parent)
-                processed_glycans.append(key.split('/')[-1])
+            if config.use_oracle_storage:
+                try:
+                    base = self._remote_output_base()
+                    candidates = self._list_storage_files_complete(base)
+                except Exception:
+                    candidates = []
+                for cand in candidates:
+                    key_raw = cand.as_posix() if hasattr(cand, 'as_posix') else str(cand)
+                    if not key_raw.endswith('/data.json') and not key_raw.endswith('data.json'):
+                        continue
+                    key = str(Path(key_raw).parent)
+                    processed_glycans.append(key.split('/')[-1])
+            else:
+                local_output_dir = Path(str(self.output_dir))
+                processed_glycans = sorted(
+                    data_json.parent.name
+                    for data_json in local_output_dir.glob("GS*/data.json")
+                    if data_json.is_file()
+                )
             
             if not processed_glycans:
                 logger.warning("No processed glycans found in output directory")
@@ -1762,6 +2241,13 @@ class GlycanPipelineRunner:
                         logger.error(f"json2rdf conversion failed with exception: {e}")
                         return False
 
+            try:
+                logger.info("Creating static sync manifest")
+                self.baker.create_sync_manifest()
+            except Exception as e:
+                logger.error(f"Failed to create static sync manifest: {e}")
+                return False
+
             # In Oracle mode, upload/update the key finalization artifacts
             if config.use_oracle_storage:
                 try:
@@ -1770,6 +2256,9 @@ class GlycanPipelineRunner:
                         "GLYCOSHAPE_RDF.ttl",  # from json2rdf
                         "GLYCOSHAPE.json",     # from baker
                         "missing_glytoucan.txt",
+                        "missing_wurcs.txt",
+                        "missing_glytoucan_no_wurcs_gags.tsv",
+                        "sync_manifest.json",
                     ]
                     for fname in artifacts:
                         local_path = Path(str(self.output_dir)) / fname
@@ -1905,13 +2394,13 @@ def main():
     parser.add_argument(
         '--update', 
         action='store_true',
-        help='Force recomputation of existing results (alias for --mode fresh)'
+        help='Force recomputation of existing results; outside process-only/static-only this is an alias for --mode fresh'
     )
     parser.add_argument(
         '--mode',
-        choices=("incremental", "refresh-static", "fresh"),
+        choices=("incremental", "refresh-static", "fresh", "process-only", "static-only"),
         default="incremental",
-        help='Run mode: incremental skips completed glycans, refresh-static updates completed static metadata only, fresh recomputes everything'
+        help='Run mode: incremental skips completed glycans, refresh-static updates completed static metadata only, fresh recomputes everything, process-only runs local v2/process without static/network phases, static-only rebuilds local static from local process outputs'
     )
     parser.add_argument(
         '--glycan', 
@@ -1924,11 +2413,60 @@ def main():
         action='store_true',
         help='Check status of glycans instead of running pipeline'
     )
-    
+    parser.add_argument(
+        '--keep-local',
+        action='store_true',
+        help='Keep local copies of process and static files (do not clean up after Oracle upload)'
+    )
+    parser.add_argument(
+        '--levels',
+        type=config.parse_cluster_levels,
+        default=None,
+        help='Clustering levels to compute, require and export: 1,2 (default, or GLYCOSHAPE_CLUSTER_LEVELS) or 1,2,3'
+    )
+
     args = parser.parse_args()
-    if args.update:
+    if args.levels is not None:
+        config.cluster_levels = args.levels
+    logger.info(f"Clustering levels: {','.join(str(level) for level in config.cluster_levels)}")
+    if args.update and args.mode not in ("process-only", "static-only"):
         args.mode = "fresh"
     
+    if args.keep_local:
+        os.environ["GLYCOSHAPE_CLEANUP_PROCESS_FILES"] = "false"
+        config.cleanup_process_files = "false"
+        logger.info("Keep-local mode enabled: process files will be preserved after Oracle upload")
+
+    if args.mode in ("process-only", "static-only"):
+        os.environ.pop("GLYCOSHAPE_ORACLE_PAR_URL", None)
+        os.environ["GLYCOSHAPE_STORAGE"] = "local"
+        config.storage_backend = "local"
+        config.oracle_par_url = None
+        config.use_oracle_storage = False
+        config.data_dir = Path(args.data_dir or config.data_dir)
+        config.process_dir = Path(args.process_dir or config.process_dir)
+        config.output_dir = Path(args.output_dir or config.output_dir)
+        config.rdf_path = Path(config.rdf_path)
+        config.inventory_path = Path(config.inventory_path)
+        if args.mode == "process-only":
+            config.use_pocketbase = False
+            config.pocketbase_url = ""
+            config.pocketbase_token = ""
+        reset_storage_manager()
+        if args.mode == "process-only":
+            logger.info("Process-only mode enabled: using local storage and skipping static/network phases")
+        else:
+            logger.info("Static-only mode enabled: using local storage and skipping v2/Oracle sync/upload")
+    elif config.storage_backend == "s3":
+        # The modes that read and publish through the storage layer know the
+        # Oracle layout only: raw archive entries are read from local folders,
+        # and static output must be published manifest-last (scripts/static_s3.py).
+        logger.error(
+            "GLYCOSHAPE_STORAGE=s3 supports --mode process-only and --mode static-only (local folders); "
+            "use scripts/run_staged_pipeline.sh download and publish to transfer"
+        )
+        sys.exit(2)
+
     # Initialize storage based on configuration
     if not config.initialize_storage():
         logger.error("Failed to initialize storage. Exiting.")
@@ -2006,9 +2544,19 @@ def main():
         elif args.glycan:
             # Process single glycan (for testing)
             logger.info(f"Processing single glycan: {args.glycan}")
-            results = runner.run_single_glycan_pipeline(args.glycan)
+            if args.mode == "process-only":
+                results = runner.run_process_only_glycan(args.glycan)
+            elif args.mode == "static-only":
+                results = runner.run_static_only_glycan(args.glycan)
+            else:
+                results = runner.run_single_glycan_pipeline(args.glycan)
             
-            if all(results.values()):
+            if args.mode == "static-only":
+                single_success = bool(results.get("glystatic"))
+            else:
+                single_success = all(results.values())
+
+            if single_success:
                 logger.info(f"Single glycan pipeline completed successfully")
                 sys.exit(0)
             else:
@@ -2016,10 +2564,25 @@ def main():
                 sys.exit(1)
         else:
             # Process all glycans
-            results = runner.run_full_pipeline()
+            if args.mode == "process-only":
+                results = runner.run_process_only_pipeline()
+            elif args.mode == "static-only":
+                results = runner.run_static_only_pipeline()
+            else:
+                results = runner.run_full_pipeline()
             
             # Exit with appropriate code
-            if results["successful_glycans"] > 0 and results["finalization_success"]:
+            if args.mode == "process-only" and results["successful_glycans"] > 0 and results["failed_glycans"] == 0:
+                logger.info("Process-only Glycan Analysis Pipeline completed successfully")
+                sys.exit(0)
+            elif (
+                args.mode == "static-only"
+                and (results["successful_glycans"] > 0 or results.get("skipped_complete", 0) > 0)
+                and results["finalization_success"]
+            ):
+                logger.info("Static-only Glycan Analysis Pipeline completed successfully")
+                sys.exit(0)
+            elif results["successful_glycans"] > 0 and results["finalization_success"]:
                 logger.info("Glycan Analysis Pipeline completed successfully")
                 sys.exit(0)
             else:

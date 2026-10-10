@@ -18,3 +18,5 @@ polars==1.33.1
 zarr==2.18.3 
 requests>=2.31.0 
 python-dotenv>=1.0.0
+mdtraj==1.10.3
+boto3==1.43.111
