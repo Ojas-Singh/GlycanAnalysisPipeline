@@ -122,6 +122,32 @@ def _append_frames(zarr_arr, xyz_frames: np.ndarray):
     zarr_arr.resize(tuple(new_shape))
     zarr_arr[fcount:fcount + k, :, :] = xyz_frames.astype(np.float32, copy=False)
 
+def _append_in_whole_chunks(zarr_arr, blocks: Iterable[np.ndarray]) -> None:
+    """Append blocks of frames so that every Zarr chunk is compressed once.
+
+    An append that ends inside a chunk makes the next one read, decompress,
+    extend and recompress that chunk. With one chunk for the trajectory (the
+    default) and appends of 128 frames that is the whole growing trajectory
+    every time. Frames are therefore held back until whole chunks can be
+    written; what is left at the end is written once.
+    """
+    frame_chunk = int(zarr_arr.chunks[0])
+    pending: List[np.ndarray] = []
+    pending_frames = 0
+    for block in blocks:
+        if block.shape[0] == 0:
+            continue
+        pending.append(block)
+        pending_frames += block.shape[0]
+        if pending_frames >= frame_chunk:
+            ready = np.concatenate(pending, axis=0) if len(pending) > 1 else pending[0]
+            whole = (pending_frames // frame_chunk) * frame_chunk
+            _append_frames(zarr_arr, ready[:whole])
+            pending = [ready[whole:]] if whole < pending_frames else []
+            pending_frames -= whole
+    if pending_frames:
+        _append_frames(zarr_arr, np.concatenate(pending, axis=0) if len(pending) > 1 else pending[0])
+
 # -------------------------
 # PDB streaming parser (MODEL/ENDMDL)
 # Minimal fields: serial, name, res_name, res_seq (res_id), chain_id, element, x,y,z
@@ -147,9 +173,15 @@ def _parse_pdb_atom_line(line: str):
         element = "".join([c for c in name if c.isalpha()])[:1].upper()
     return serial, name, element, res_name, res_id, chain_u8, x, y, z
 
-def _iter_models(pdb_path: str):
-    """Yield lists of ATOM/HETATM lines per MODEL. If no MODEL/ENDMDL found, yield one model of all atoms."""
+def _iter_models(pdb_path: str, counts: Optional[dict] = None):
+    """Yield lists of ATOM/HETATM lines per MODEL. If no MODEL/ENDMDL found, yield one model of all atoms.
+
+    When the iterator is exhausted, counts["frames"] is what _count_pdb_frames
+    returns for the file, obtained in the same pass.
+    """
     has_model = False
+    model_count = 0
+    saw_atoms = False
     current: List[str] = []
     storage = get_storage_manager()
     with storage.open(pdb_path, "r") as fh:
@@ -157,13 +189,17 @@ def _iter_models(pdb_path: str):
             rec = line[:6]
             if rec.startswith("MODEL"):
                 has_model = True
+                model_count += 1
                 current = []
             elif rec.startswith("ENDMDL"):
                 if current:
                     yield current
                 current = []
             elif rec.startswith("ATOM  ") or rec.startswith("HETATM"):
+                saw_atoms = True
                 current.append(line)
+        if counts is not None:
+            counts["frames"] = max(1, model_count) if has_model else (1 if saw_atoms else 0)
         # file end
         if not has_model:
             # treat entire file as single model
@@ -208,7 +244,8 @@ def store_from_pdb(
     """
     _ensure_dir(frame_data_dir)
 
-    frame_iter = _iter_models(pdb_path)
+    counts: dict = {}
+    frame_iter = _iter_models(pdb_path, counts)
 
     # Parse first model to construct topology
     try:
@@ -309,32 +346,39 @@ def store_from_pdb(
 
     _parquet_write(bonds_df, os.path.join(frame_data_dir, "bonds.parquet"))
 
-    # Create coords store. A non-positive/unspecified frame chunk requests a
-    # single chunk spanning the trajectory, reducing filesystem metadata files.
-    if frame_chunk is None or frame_chunk <= 0:
-        frame_chunk = _count_pdb_frames(pdb_path)
-        if frame_chunk < 1:
-            raise ValueError("No trajectory frames found in PDB")
-    _, z = _create_coords_store(frame_data_dir, n_atoms=n_atoms, frame_chunk=frame_chunk)
-
-    # Buffered append logic
-    buffer: List[np.ndarray] = [xyz0]
-    frame_count = 1
     if frames_buffer < 1:
         raise ValueError("frames_buffer must be >=1")
-    for model in frame_iter:
-        if len(model) != n_atoms:
-            raise ValueError(f"Frame {frame_count}: atom count changed ({len(model)} vs {n_atoms}).")
-        xyz_list = [_parse_pdb_atom_line(L)[6:9] for L in model]  # x,y,z only
-        xyz = np.asarray(xyz_list, dtype=np.float32)
-        buffer.append(xyz)
-        frame_count += 1
-        if len(buffer) >= frames_buffer:
-            _append_frames(z, np.stack(buffer, axis=0))
-            buffer.clear()
-    # flush remainder
-    if buffer:
-        _append_frames(z, np.stack(buffer, axis=0))
+
+    def frame_blocks():
+        """Parsed frames in blocks of frames_buffer, the first model included."""
+        buffer: List[np.ndarray] = [xyz0]
+        frame_index = 1
+        for model in frame_iter:
+            if len(model) != n_atoms:
+                raise ValueError(f"Frame {frame_index}: atom count changed ({len(model)} vs {n_atoms}).")
+            xyz_list = [_parse_pdb_atom_line(L)[6:9] for L in model]  # x,y,z only
+            buffer.append(np.asarray(xyz_list, dtype=np.float32))
+            frame_index += 1
+            if len(buffer) >= frames_buffer:
+                yield np.stack(buffer, axis=0)
+                buffer = []
+        if buffer:
+            yield np.stack(buffer, axis=0)
+
+    # Create coords store. A non-positive/unspecified frame chunk requests a
+    # single chunk spanning the trajectory, reducing filesystem metadata files.
+    # Its length is only known at the end of the file, so the frames are
+    # parsed first (one pass over the text) and the chunk is written once.
+    if frame_chunk is None or frame_chunk <= 0:
+        blocks = list(frame_blocks())
+        frame_chunk = int(counts["frames"])
+        if frame_chunk < 1:
+            raise ValueError("No trajectory frames found in PDB")
+    else:
+        blocks = frame_blocks()
+    _, z = _create_coords_store(frame_data_dir, n_atoms=n_atoms, frame_chunk=frame_chunk)
+    _append_in_whole_chunks(z, blocks)
+    frame_count = int(z.shape[0])
 
     # Write a tiny frames.parquet with just count (handy for sanity checks)
     pl.DataFrame({"n_frames": [frame_count]}).write_parquet(
@@ -438,19 +482,7 @@ def store_from_archive(
     # Coordinates: every frame from the XTC, appended in whole Zarr chunks so
     # that no chunk is decompressed and rewritten.
     _, z = _create_coords_store(frame_data_dir, n_atoms=entry.n_atoms, frame_chunk=frame_chunk)
-    pending: List[np.ndarray] = []
-    pending_frames = 0
-    for block in entry.iter_frames(chunk=max(int(frames_buffer), 1024)):
-        pending.append(block)
-        pending_frames += block.shape[0]
-        if pending_frames >= frame_chunk:
-            ready = np.concatenate(pending, axis=0) if len(pending) > 1 else pending[0]
-            whole = (pending_frames // frame_chunk) * frame_chunk
-            _append_frames(z, ready[:whole])
-            pending = [ready[whole:]] if whole < pending_frames else []
-            pending_frames -= whole
-    if pending_frames:
-        _append_frames(z, np.concatenate(pending, axis=0))
+    _append_in_whole_chunks(z, entry.iter_frames(chunk=max(int(frames_buffer), 1024)))
     if z.shape[0] != n_frames:
         raise ValueError(f"Archive entry yielded {z.shape[0]} frames, manifest says {n_frames}.")
 

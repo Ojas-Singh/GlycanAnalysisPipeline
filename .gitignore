@@ -24,6 +24,10 @@ tests/*
 !tests/test_static_publish.py
 !tests/test_s3_integration.py
 !tests/test_staged_workflow.py
+!tests/test_process_equalities.py
+!tests/synthetic_glycan.py
+!tests/test_levels_setting.py
+!tests/test_entry_run.py
 env/
 dummy_database_process/
 dummy_database_static/

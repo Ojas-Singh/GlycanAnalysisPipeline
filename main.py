@@ -70,7 +70,12 @@ class GlycanPipelineRunner:
         "torparts.npz",
         "info.json",
     )
-    REQUIRED_GLYSTATIC_LEVELS = ("level_1", "level_2", "level_3")
+
+    @property
+    def REQUIRED_GLYSTATIC_LEVELS(self):
+        """Level folders a complete process/static folder must have (config.cluster_levels)."""
+        return tuple(f"level_{level}" for level in config.cluster_levels)
+
     REQUIRED_GLYSTATIC_LEVEL_FILES = (
         "dist.svg",
         "PDB/alpha.pdb",
@@ -90,9 +95,6 @@ class GlycanPipelineRunner:
         "torparts.npz",
         "torsion_all.csv",
         "torsion_glycosidic.csv",
-        "torsion_level_1_reps.csv",
-        "torsion_level_2_reps.csv",
-        "torsion_level_3_reps.csv",
     )
     LOG_TAIL_STEP_ORDER = (
         ("input_files", "input_files"),
@@ -731,6 +733,7 @@ class GlycanPipelineRunner:
         required_files = list(self.LOG_TAIL_TOP_LEVEL_FILES)
         required_files.extend(f"output/{name}" for name in self.LOG_TAIL_OUTPUT_FILES)
         for level_name in self.REQUIRED_GLYSTATIC_LEVELS:
+            required_files.append(f"output/torsion_{level_name}_reps.csv")
             required_files.extend(f"output/{level_name}/{rel_path}" for rel_path in self.REQUIRED_GLYSTATIC_LEVEL_FILES)
         return required_files
 
@@ -746,11 +749,9 @@ class GlycanPipelineRunner:
             "output/torparts.npz",
             "output/torsion_all.csv",
             "output/torsion_glycosidic.csv",
-            "output/torsion_level_1_reps.csv",
-            "output/torsion_level_2_reps.csv",
-            "output/torsion_level_3_reps.csv",
         ]
         for level_name in self.REQUIRED_GLYSTATIC_LEVELS:
+            required_files.append(f"output/torsion_{level_name}_reps.csv")
             required_files.extend(
                 f"output/{level_name}/{rel_path}"
                 for rel_path in self.REQUIRED_GLYSTATIC_LEVEL_FILES
@@ -2417,8 +2418,17 @@ def main():
         action='store_true',
         help='Keep local copies of process and static files (do not clean up after Oracle upload)'
     )
+    parser.add_argument(
+        '--levels',
+        type=config.parse_cluster_levels,
+        default=None,
+        help='Clustering levels to compute, require and export: 1,2 (default, or GLYCOSHAPE_CLUSTER_LEVELS) or 1,2,3'
+    )
 
     args = parser.parse_args()
+    if args.levels is not None:
+        config.cluster_levels = args.levels
+    logger.info(f"Clustering levels: {','.join(str(level) for level in config.cluster_levels)}")
     if args.update and args.mode not in ("process-only", "static-only"):
         args.mode = "fresh"
     

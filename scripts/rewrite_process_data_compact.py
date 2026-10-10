@@ -271,8 +271,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.frame_chunk < 1:
-        raise SystemExit("--frame-chunk must be >= 1")
+    if args.frame_chunk < 0:
+        raise SystemExit("--frame-chunk must be >= 0 (0: one chunk for the whole trajectory, the default)")
     if args.frames_buffer < 1:
         raise SystemExit("--frames-buffer must be >= 1")
     if args.jobs < 1:

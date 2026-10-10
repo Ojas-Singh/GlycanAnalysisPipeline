@@ -975,6 +975,47 @@ def save_torparts_npz(torsion_list: List[Torsion], bonds_df, atoms_df, output_pa
 	np.savez_compressed(output_path, a=torsion_list, b=anotherlist, allow_pickle=True)
 
 
+def _torsion_plot_table(data, torsion_cols: List[str], display_names: Dict[str, str]):
+	"""Long table (Value, Torsion, Frame) of the ridge plot: one row per torsion and frame.
+
+	This is the table the plot was always drawn from, built from whole columns.
+	It used to be filled value by value from ``data.iterrows()``, one Python
+	call per value. ``data.to_numpy()`` holds exactly the row values iterrows
+	yields (all columns in their common dtype), so the values are the same.
+	The torsion names are a categorical column whose categories are in order
+	of first appearance, the order seaborn derives from a column of strings:
+	the grid has the same rows and colours, and selecting the frames of one
+	torsion compares small integers instead of every string of the table
+	(seaborn does that for each pair of torsions, three times per figure).
+	Mixed (object) tables and duplicate column names take the former loop.
+	"""
+	import pandas as pd
+
+	matrix = data.to_numpy()
+	if matrix.dtype == object or len(set(data.columns)) != len(data.columns):
+		plot_data = []
+		for col in torsion_cols:
+			for _, row in data.iterrows():
+				plot_data.append({
+					'Value': row[col],
+					'Torsion': display_names[col],
+					'Frame': row['frame']
+				})
+		return pd.DataFrame(plot_data)
+	position = {name: index for index, name in enumerate(data.columns)}
+	names = [display_names[col] for col in torsion_cols]
+	return pd.DataFrame({
+		'Value': np.concatenate([matrix[:, position[col]] for col in torsion_cols]),
+		'Torsion': pd.Categorical.from_codes(
+			np.repeat(
+				[list(dict.fromkeys(names)).index(name) for name in names], len(data)
+			),
+			categories=list(dict.fromkeys(names)),
+		),
+		'Frame': np.tile(matrix[:, position['frame']], len(torsion_cols)),
+	})
+
+
 def plot_torsion_distribution(
 	torsion_csv_path: str,
 	output_path: str,
@@ -1082,16 +1123,7 @@ def plot_torsion_distribution(
 		display_names[col] = display_name
 	
 	# Prepare data for plotting
-	plot_data = []
-	for col in torsion_cols:
-		for _, row in data.iterrows():
-			plot_data.append({
-				'Value': row[col],
-				'Torsion': display_names[col],
-				'Frame': row['frame']
-			})
-	
-	df = pd.DataFrame(plot_data)
+	df = _torsion_plot_table(data, torsion_cols, display_names)
 	
 	# Create the plot
 	num_torsions = len(torsion_cols)
