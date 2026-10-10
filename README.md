@@ -353,21 +353,31 @@ The raw data can be kept in a compact archive instead of multi-model PDB text. O
 
 ```
 <archive>/
-  index.json                 one record per entry (names, folders, counts, sizes, SHA-256)
-  conversion_report.json     the last converter run; entries that failed are under "failed" with the reason
+  index.json                 one record per entry (names, folders, counts, sizes, SHA-256); "repaired" names
+                             the entries of damaged sources
+  conversion_report.json     the last converter run; entries that failed are under "failed" with the reason,
+                             entries of damaged sources under "repaired"
   <folder>/
     trajectory.xtc           all frames in source order; XTC precision 10000 (0.0001 nm = 0.001 Å)
     topology.pdb             header, first frame and records after the last frame (CONECT, ...), verbatim lines
     structure.mol2           unchanged
     info.json, name.json     unchanged, when the source has them
     manifest.json            GLYCAM name, atoms, frames, box, size and SHA-256 of every file and of the
-                             source simulation.pdb, what the verification measured, converter version/date
+                             source simulation.pdb, what the verification measured, converter version/date;
+                             for a damaged source also "source_irregularities"
 ```
 
 - **Coordinates are exact.** They go from the PDB columns to the XTC as integers of 0.001 Å, so the archive holds the digits of the source; `-0.000` is stored as `0.000` and counted in the manifest. Step and time of a frame are its index from 0 (the source has no times). The box of each frame is the `CRYST1` in force at that frame, so a file made of several runs written one after the other keeps the box of each run, and the manifest lists the frame at which each starts (as it does for `END` and other records found between frames). The 1 × 1 × 1 Å placeholder cell that PDB writers emit when there is no box is recorded in the manifest and `topology.pdb` but not written as a box.
 - **Names.** An entry is identified by its full GLYCAM name: `glycam_name` in the manifest and the index, and `raw/<GLYCAM name>/` as object-storage key prefix (`lib.archive.object_key_prefix`). The name comes from `name.json` when the source folder has one, from `info.json` when the folder is named by a GlyTouCan ID, and is the folder name otherwise. `<folder>` is the GLYCAM name when that is a usable directory name (at most 255 bytes, no `/`); otherwise it is the first 200 bytes of the name, `~`, and the first 16 hex digits of the SHA-256 of the name (`lib.archive.entry_folder_name`). Always read the name from `manifest.json`, not from the folder.
 - **Names from outside.** `--names FILE` gives the converter a JSON object of source folder name to GLYCAM name, for example `{"G60371DN": "DNeup5Aca2-3[...]DGlcpNAcb1-OH"}` for a folder whose `info.json` spells the name differently. Such a name takes precedence over `name.json`, `info.json` and the folder name, and the manifest records `"glycam_name_from": "names-file"` (a different name in `name.json` or `info.json` is listed under `warnings`). A folder that is not under `--data-dir` is an error. If the same source folder was converted before under another name, that entry stays and the run ends with a non-zero status (`SUPERSEDED ...` on stderr, `superseded` in the report, and the index reports two entries for one source folder); add `--remove-superseded` to delete it once the new entry is in place. Pass the same `--names` to `--verify-only --data-dir`; without it the name of such an entry is not compared with the source (`glycam_name_checked` is false in the report) and everything else is.
 - **Verification.** Before an entry gets its final name the XTC is read back and every coordinate is compared with the source text; `manifest.json` records the number compared, the number that differ (always 0 for a published entry) and the largest difference in Å between the stored float and the decimal number of the text. A sample of frames (`--check-frames`, default 100) is also re-read from the source with plain `float()` as an independent check. A source that cannot be represented is not converted and is listed in the report: a frame with another atom count or other atom records, a truncated file, a coordinate that the XTC does not return exactly (possible only from 5120 Å on).
+- **Damaged sources (`--repair`).** Without `--repair` a source has to be regular. With it the converter also archives a source that is damaged in one of these ways, and in no other:
+  - *A frame without `ENDMDL`*: the next `MODEL` record, or the end of the file, comes first. Its records have to be those of the first frame, in order, as far as they go, each a whole line; after them there may be one line that is the beginning of the record expected there (the line the cut went through), which never counts as an atom record. With fewer atom records than the first frame the frame is **dropped** (`incomplete_frame`) and every complete frame is kept in source order; with all of them it is **kept** (`frame_without_endmdl`), since only the `ENDMDL` is missing and its coordinates are checked like those of any frame. When one run was cut in the middle of a line and the next run appended, the `CRYST1` of the next run stands on that line (`ATOCRYST1 ...`); it is read as the record it is, so the frames after the cut get their own box. This holds wherever the cut fell in an atom, `TER` or `MODEL` record; text on the line of a whole `ENDMDL` or `END` record is not looked at, with or without `--repair` (a run cut exactly behind that word would lose the `CRYST1` of the next one unnoticed: such a file has one `MODEL` restart more than `CRYST1` records).
+  - *A `MODEL` record that no atom record follows* (`model_record_without_frame`), for example at the end of the file.
+  - *Frames that `ENDMDL` ends and no `MODEL` record starts* (`frame_without_model_record`).
+
+  Refused with `--repair` too: a frame that `ENDMDL` ends with another atom count, atom records that are not those of the first frame (also in a cut frame), an unreadable coordinate, a first frame that is not complete, atom records with neither `MODEL` before nor `ENDMDL` after them, text other than `CRYST1` on a cut line, and a source in which more than 1000 frames or `MODEL` records are of the first two kinds (each is listed in the manifest). The manifest of a repaired entry has `source_irregularities`: `frames_in_source`, `frames_kept`, `frames_dropped`, `bytes_ignored`, `truncated` (the file ends inside a frame) and `items`, one per frame or record in source order with `kind`, `action` (`dropped`, `kept`, `ignored`), `source_frame` (its index among the frames of the source), `frames_kept_before` (the frames of the archive before it, which is the index of the next frame of the archive), `offset` and `bytes` (its place in `simulation.pdb`), the SHA-256 of those bytes, `bytes_ignored`, `atoms_found` against `atoms_expected`, `cut_line_bytes`, `followed_by`, and for the frame the file ends in `file_truncated` and `file_size`; the frames without `MODEL` record follow as one item with their count, indices and offsets. `frames`, the steps of the XTC, `box.cells[].first_frame` and `records_between_frames.*.before_frame` count the frames of the archive; `warnings` says that the entry was repaired. A manifest without `source_irregularities` is that of a regular source, and a regular source is converted to the same bytes with and without `--repair`. Verification is the same for the frames that are kept, and the record is checked against the file a second way: the `MODEL` and `ENDMDL` records are located by a search of its bytes, their numbers have to be those the record implies, the n-th `ENDMDL` has to lie in the bytes the n-th frame of the archive was read from (frames kept without one aside), and every item is read at its offset (its place among the frames, no `ENDMDL`, SHA-256, number of whole atom records). `index.json` lists the repaired entries under `repaired` and gives the record of each a `repaired` summary; the report has `repaired`, and the run prints a `REPAIRED` line per entry. A rerun skips a repaired entry like any other, with or without `--repair`; `--verify-only --data-dir` reads each source the way its manifest says.
+- **MODEL numbers** are not kept: a frame is its position in the trajectory, whatever the number on its `MODEL` record (they wrap, restart with every run, or are missing). The manifest summarises them under `source.model_numbers` (first, last, largest, whether they count up by one); `-1` there stands for a record without a number, and for a repaired source such records are counted under `model_records_without_number` with an example of their text.
 
 ```bash
 # Convert (resumable: entries whose manifest verifies are skipped; the source is only read)
@@ -377,9 +387,14 @@ The raw data can be kept in a compact archive instead of multi-model PDB text. O
 .venv/bin/python scripts/convert_data_to_archive.py --data-dir data --archive-dir archive \
   --glycan G60371DN --names names.json --remove-superseded
 
+# Archive damaged sources as well (here from a directory of their own, into an archive that has the other
+# entries): index.json is written again for the whole archive, --report leaves its conversion_report.json alone
+.venv/bin/python scripts/convert_data_to_archive.py --data-dir damaged --archive-dir archive --workers 3 \
+  --repair --report archive/conversion_report.repaired.json
+
 # One 64-core AMD node; DATA_DIR and ARCHIVE_DIR are at the top of the script.
 # VERIFY=1 runs the verification below instead, with every frame re-read from the source.
-# NAMES_FILE=names.json passes --names.
+# NAMES_FILE=names.json passes --names, REPAIR=1 passes --repair.
 mkdir -p logs/slurm && sbatch slurm/convert_data_to_archive_amd.sh
 
 # Verify an archive: files against manifests, and with --data-dir every coordinate against the source

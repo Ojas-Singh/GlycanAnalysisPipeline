@@ -19,6 +19,19 @@ Run one conversion per archive directory at a time.  ``--verify-only``
 re-checks existing entries instead (against the source when ``--data-dir`` is
 given) and writes ``verification_report.json``.
 
+``--repair`` archives a source that is damaged in one of a few known ways
+instead of refusing it: a frame that the file cuts short (it is dropped; every
+complete frame is kept, in order), frames without a MODEL record, a MODEL
+record without a frame.  The manifest of such an entry says what was wrong
+under ``source_irregularities``; ``index.json`` and the report list these
+entries under ``repaired``.  A source that needs no repair is converted to the
+same entry with and without it.
+
+``--report FILE`` writes the report of this run there instead of
+``conversion_report.json`` (``verification_report.json``) of the archive
+directory, which every run replaces: use it to add entries to an archive
+whose report is to stay.
+
 ``--names FILE`` names source folders from outside: a JSON object of source
 folder name to GLYCAM name.  It takes precedence over ``name.json``,
 ``info.json`` and the folder name, and the manifest records ``names-file`` as
@@ -79,6 +92,7 @@ def _convert_one(
             check_frames=options["check_frames"],
             block_bytes=options["block_bytes"],
             name_override=name_override,
+            repair=options["repair"],
         )
         manifest = result["manifest"]
         archive_size = sum(item["size"] for item in manifest["files"].values())
@@ -94,6 +108,9 @@ def _convert_one(
             archive_size=archive_size,
             warnings=manifest.get("warnings", []),
         )
+        repaired = archive.repair_summary(manifest)
+        if repaired is not None:   # also for an entry that is skipped: it was repaired when it was converted
+            row["repaired"] = repaired
         timing = result["timing"]
         if timing:
             megabytes = manifest["source"]["size"] / 1e6
@@ -252,6 +269,12 @@ def _progress(done: int, total: int, row: Dict[str, Any]) -> None:
         detail = "manifest verifies"
     else:
         detail = row.get("reason", "")
+    if "repaired" in row:
+        repaired = row["repaired"]
+        detail += (
+            f"; REPAIRED: {row['frames']} of {repaired['frames_in_source']} frames of the source kept, "
+            + ", ".join(f"{count} {kind}" for kind, count in repaired["counts"].items())
+        )
     print(f"[{done}/{total}] {row['status']:9s} {label}: {detail}", flush=True)
 
 
@@ -277,6 +300,9 @@ def _convert(args: argparse.Namespace) -> int:
         raise SystemExit(f"--data-dir does not exist: {data_dir}")
     if archive_dir == data_dir or data_dir in archive_dir.parents or archive_dir in data_dir.parents:
         raise SystemExit("--archive-dir must be outside --data-dir (the source is never written to).")
+    report_path = args.report.resolve() if args.report else archive_dir / REPORT_FILE
+    if data_dir in report_path.parents:
+        raise SystemExit("--report must be outside --data-dir (the source is never written to).")
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     requested = list(args.glycan)
@@ -291,6 +317,7 @@ def _convert(args: argparse.Namespace) -> int:
         "force": args.force,
         "check_frames": args.check_frames,
         "block_bytes": args.block_mb << 20,
+        "repair": args.repair,
     }
     started = time.perf_counter()
     argument_lists = [(task["source_dir"], str(archive_dir), options, task["name_override"]) for task in tasks]
@@ -322,6 +349,18 @@ def _convert(args: argparse.Namespace) -> int:
     converted = sorted((r for r in rows if r["status"] == "converted"), key=lambda r: r["source_folder"])
     skipped = sorted((r for r in rows if r["status"] == "skipped"), key=lambda r: r["source_folder"])
     failed = sorted((r for r in rows if r["status"] == "failed"), key=lambda r: r["source_folder"])
+    repaired = [
+        {
+            "source_folder": r["source_folder"],
+            "glycam_name": r["glycam_name"],
+            "folder": r["folder"],
+            "status": r["status"],
+            "frames": r["frames"],
+            **r["repaired"],
+        }
+        for r in converted + skipped if "repaired" in r
+    ]
+    repaired.sort(key=lambda r: r["source_folder"])
     source_bytes = sum(r["source_size"] for r in converted)
     cpu_seconds = sum(r["cpu_seconds"] for r in converted)
     report = {
@@ -330,6 +369,7 @@ def _convert(args: argparse.Namespace) -> int:
         "data_dir": str(data_dir),
         "archive_dir": str(archive_dir),
         "names_file": str(args.names.resolve()) if args.names else None,
+        "repair": bool(args.repair),
         "superseded": superseded,
         "workers": args.workers,
         "wall_seconds": round(elapsed, 3),
@@ -344,19 +384,28 @@ def _convert(args: argparse.Namespace) -> int:
         "index_entries": index["entries"],
         "index_problems": problems,
         "failed": failed,
+        "repaired": repaired,
         "converted": converted,
         "skipped": [r["source_folder"] for r in skipped],
     }
-    report_path = archive_dir / REPORT_FILE
     temporary = report_path.with_name(report_path.name + ".tmp")
     temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(report_path)
 
     print(
         f"converted={len(converted)} skipped={len(skipped)} failed={len(failed)} "
-        f"in {elapsed:.1f} s; index.json lists {index['entries']} entries; report: {report_path}",
+        f"in {elapsed:.1f} s; index.json lists {index['entries']} entries"
+        + (f", {len(index['repaired'])} of them repaired" if index["repaired"] else "")
+        + f"; report: {report_path}",
         flush=True,
     )
+    for row in repaired:
+        print(
+            f"REPAIRED {row['source_folder']} ({row['status']}): {row['frames']} of {row['frames_in_source']} "
+            f"frames of the source kept, {row['bytes_ignored']} bytes not archived; "
+            + ", ".join(f"{count} {kind}" for kind, count in row["counts"].items()),
+            file=sys.stderr,
+        )
     for row in failed:
         print(f"FAILED {row['source_folder']}: {row.get('reason', '')}", file=sys.stderr)
     for problem in problems:
@@ -404,7 +453,7 @@ def _verify(args: argparse.Namespace) -> int:
         "failed": bad,
         "reports": reports,
     }
-    report_path = archive_dir / VERIFICATION_REPORT_FILE
+    report_path = args.report.resolve() if args.report else archive_dir / VERIFICATION_REPORT_FILE
     temporary = report_path.with_name(report_path.name + ".tmp")
     temporary.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     temporary.replace(report_path)
@@ -434,6 +483,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Convert again even when the entry verifies.")
     parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Archive a source with a frame that the file cuts short (the frame is dropped), with frames "
+        "without a MODEL record or with a MODEL record without a frame, and record it in the manifest "
+        "(source_irregularities). Without it such a source fails.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="Write the report of this run to this file instead of conversion_report.json "
+        "(verification_report.json with --verify-only) in --archive-dir.",
+    )
+    parser.add_argument(
         "--check-frames",
         type=int,
         default=archive.DEFAULT_CHECK_FRAMES,
@@ -453,6 +515,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error("--block-mb must be at least 1")
     if not args.verify_only and args.data_dir is None:
         parser.error("--data-dir is required unless --verify-only is given")
+    if args.report is not None and not args.report.resolve().parent.is_dir():
+        parser.error(f"--report: no such directory: {args.report.resolve().parent}")
     return args
 
 

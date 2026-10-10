@@ -21,6 +21,12 @@
 # The job ends with a non-zero status when an entry failed; the reasons are in
 # ${ARCHIVE_DIR}/conversion_report.json under "failed" and in the error log.
 #
+# A source with a frame that the file cuts short, or with frames without a
+# MODEL record, fails unless REPAIR=1 is given (--repair): it is then archived
+# without the cut frame and listed under "repaired" in the report and in
+# index.json, and its manifest says what was wrong:
+#   REPAIR=1 sbatch --export=ALL slurm/convert_data_to_archive_amd.sh
+#
 # Afterwards, to compare every coordinate of every entry with the source text
 # a second time (reads the whole source again; writes verification_report.json):
 #   VERIFY=1 sbatch --export=ALL slurm/convert_data_to_archive_amd.sh
@@ -45,6 +51,7 @@ else
     CHECK_FRAMES="${CHECK_FRAMES:-100}"
 fi
 FORCE="${FORCE:-0}"                      # 1: convert again even when an entry verifies
+REPAIR="${REPAIR:-0}"                    # 1: archive damaged sources and record the damage (--repair)
 GLYCAN_FILE="${GLYCAN_FILE:-}"           # optional file with source folder names, one per line
 NAMES_FILE="${NAMES_FILE:-}"             # optional JSON object, source folder name -> GLYCAM name (--names)
 
@@ -80,6 +87,9 @@ if [[ "${VERIFY}" == "1" ]]; then
     args+=(--verify-only)
 elif [[ "${FORCE}" == "1" ]]; then
     args+=(--force)
+fi
+if [[ "${REPAIR}" == "1" && "${VERIFY}" != "1" ]]; then
+    args+=(--repair)
 fi
 if [[ -n "${GLYCAN_FILE}" ]]; then
     args+=(--glycan-file "${GLYCAN_FILE}")
