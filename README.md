@@ -154,6 +154,9 @@ same with and without it.
 - A forced process run (`--update`) with levels `1,2` on a folder that has
   Level 3 leaves the old `output/level_3/` and `torsion_level_3_reps.parquet`
   files in place; they are ignored.
+- A published `static/` database that has Level 3 is turned into the one
+  without it, with no `process/` data and no recomputation, by
+  [`scripts/static_drop_levels.py`](#static-database-without-level-3-scriptsstatic_drop_levelspy).
 
 Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
 
@@ -193,6 +196,39 @@ python main.py --mode static-only --process-dir process --output-dir static
 ```
 
 Static-only mode discovers complete local `process/<glycan>/` folders, skips incomplete ones, and rebuilds independent glycans concurrently (8 at a time by default). It auto-skips already complete `static/GSxxxxx/` folders, converts Parquet exports back to the website CSV filenames for rebuilt glycans, copies representative structures/SVGs and PCA landscape files, then rebuilds `static/GLYCOSHAPE.json`, `static/GLYCOSHAPE_RDF.ttl`, and archive artifacts. Pass `--update` to force overwriting/refreshing existing GS folders. It ignores `GLYCOSHAPE_ORACLE_PAR_URL`; no Oracle upload or sync is performed.
+
+### Static database without Level 3: `scripts/static_drop_levels.py`
+
+```bash
+.venv/bin/python scripts/static_drop_levels.py --source static --dest static-l12 --workers 8
+.venv/bin/python scripts/static_s3.py publish --static-dir static-l12 --dry-run     # then publish it
+```
+
+Writes a static database that was built with Levels 1, 2 and 3 as the one the pipeline builds with levels `1,2` (`--levels`, default `1,2`), into a new folder. Nothing is recomputed, no `process/` data, service or network is needed, GlycoShape IDs and metadata stay as they are, and the source is only read (a source from which the `output/level_3/` folders were already deleted gives the same result).
+
+Per glycan folder, in `--workers` processes:
+
+| Files | What happens |
+|---|---|
+| `glygen.json`, `glycosmos.json`, `snfg.svg`, `landscape/*`, `output/torparts.npz`, `output/pca.csv`, `output/torsion_glycosidic.csv`, `output/level_{1,2}/*`, `output/torsion_level_{1,2}_reps.csv` | kept: hard-linked (copied on another file system, or with `--copy`) |
+| `output/info.json` | rewritten without the Level 3 entries (`lib.static_ready.info_json_for_levels`) |
+| `output/torsion_all.csv` (any table with `level_3_cluster` / `level_3_center` columns) | rewritten without those columns (`lib.static_ready.csv_for_levels`) |
+| `data.json` | rewritten without `archetype.cluster_levels.level_3` (`lib.static_ready.save_glycan_data`) |
+| `output/level_3/*`, `output/torsion_level_3_reps.csv` | dropped |
+| `GSxxxxx.zip` | built again at the end: it holds `data.json` (and Level 1 only) |
+| anything else | kept and listed as `extra` in the report; hidden files are left out, because the website refuses a manifest that lists one |
+
+The three rewritten files are written by the functions the static stage uses, so they are byte for byte what `main.py --mode static-only --update` writes with levels `1,2` from the process folder the published one was made of (`data.json`: the published one without that entry, in the same format). A folder is built in a staging folder, checked for every file the pipeline requires for these levels, and renamed into the destination: the destination only ever holds finished folders.
+
+When every folder is there the root files are written in the order of the finalization, with its functions: `GLYCOSHAPE.json` (from the `data.json` files), every `GSxxxxx.zip` and `GlycoShape.zip`, and `sync_manifest.json` last. `GLYCOSHAPE_RDF.ttl` and the `missing_*` lists do not depend on the levels and are copied as they are; so is any other root file, which the report lists. The manifest is then validated with the rules of the publisher and of the website, and has to list exactly the files of the new folder.
+
+- **Resume** by running the same command again: a glycan folder that is in the destination is finished and skipped. A glycan that fails (for example an unreadable `info.json`, or a folder that lacks a Level 1 or 2 file) is reported and left out, the others are done, the root files are not written and the exit status is 1. Delete `sync_manifest.json` in the destination to have the root files written again.
+- **Nothing else is written into the destination.** Staging folders, the per-glycan records, a lock and `report.json` (per glycan: files kept, rewritten, dropped, bytes before and after) are in the work folder, `<dest>.work` unless `--work-dir` names another (on the file system of the destination). It can be deleted afterwards.
+- **Hard links.** A kept file of a glycan folder is one file with two names. This tool never writes into one, and neither do the static stage and the finalization run on local folders (the files they rewrite in place, which are the root files and `data.json`, are copied here, not linked). Anything else that edits such a file in place in one database changes the other: delete the source afterwards, or use `--copy`.
+- **Not byte-reproducible**, here as in the pipeline: the archives carry the modification times of their members (the new `data.json`), `sync_manifest.json` its `generated_at` and the times of the files, and `GLYCOSHAPE_RDF.ttl`, had it been converted again, would be the same graph with its lines in another order. Everything else is.
+- **The source is checked on the way.** Every file that is taken from it, kept or read to be rewritten, is compared with the SHA-256 that the `sync_manifest.json` of the source records, and the new `GLYCOSHAPE.json` with the one of the source (equal but for `cluster_levels.level_3`). A difference is a warning in the output and in the report: the source is then not the database its manifest describes (an incomplete copy, a file changed afterwards).
+
+A database of the size of the published one (1,001 glycans, 29 GB without the Level 3 structures, of which 13 GB `torsion_all.csv` and 4.5 GB `info.json`) took one minute with 8 workers and 2 GB of memory, half of it for the glycan folders and half for the archives and the manifest; eight glycans of the largest size in work together took 5 GB. `--skip-finalize` stops after the glycan folders.
 
 ## Staged Oracle/Slurm workflow
 

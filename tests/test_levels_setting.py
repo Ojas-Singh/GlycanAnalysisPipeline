@@ -420,6 +420,48 @@ def test_static_stage_keeps_level_3_when_configured(runs, tmp_path):
         "level_1", "level_2", "level_3"]
 
 
+@pytest.mark.parametrize("level_3_folder", ["present", "removed"])
+def test_dropping_level_3_from_a_static_folder_gives_the_static_stage_without_it(runs, tmp_path, level_3_folder):
+    """lib/static_levels.py on a static folder with Level 3 against the static stage with levels 1,2."""
+    from lib import static_levels
+
+    with cluster_levels((1, 2, 3)):
+        published = static_stage(runs["with_3"], tmp_path / "published")
+    with cluster_levels((1, 2)):
+        rebuilt = static_stage(runs["with_3"], tmp_path / "rebuilt")           # from the same process folder
+        from_new = static_stage(runs["default"], tmp_path / "from_new")        # from one made without Level 3
+    assert len(files_of(published)) == 30 and len(files_of(rebuilt)) == 24
+    if level_3_folder == "removed":
+        shutil.rmtree(published / "output" / "level_3")
+    before = {name: (content, (published / name).stat().st_mtime_ns) for name, content in files_of(published).items()}
+
+    report = static_levels.drop_levels(
+        tmp_path / "published", tmp_path / "reduced", levels=(1, 2), finalize=False, log=lambda message: None)
+    assert report["ok"], report["error"]
+    reduced = files_of(tmp_path / "reduced" / "GS00042")
+    assert reduced == files_of(rebuilt)                                        # byte for byte, the same 24 files
+    record = report["glycans"]["GS00042"]
+    assert record["rewritten"] == ["data.json", "output/info.json", "output/torsion_all.csv"]
+    assert len(record["kept"]) == 21 and len(record["dropped"]) == (6 if level_3_folder == "present" else 1)
+    assert before == {name: (content, (published / name).stat().st_mtime_ns) for name, content in files_of(published).items()}
+
+    new = files_of(from_new)
+    assert sorted(new) == sorted(reduced)
+    for name in new:
+        if name.endswith("dist.svg"):                                          # ids are salted per figure
+            assert comparable_svg(reduced[name]) == comparable_svg(new[name]), name
+        else:
+            assert reduced[name] == new[name], name
+
+    # then the root files: the folder is complete for the pipeline and accepted by the publisher
+    report = static_levels.drop_levels(tmp_path / "published", tmp_path / "reduced", levels=(1, 2), log=lambda message: None)
+    assert report["ok"] and report["finalized"] and report["totals"]["skipped"] == 1
+    assert report["root"]["checks"]["manifest"]["accepted_by_the_publisher"]
+    final = files_of(tmp_path / "reduced" / "GS00042")
+    assert {name: content for name, content in final.items() if name != "GS00042.zip"} == reduced
+    assert json.loads(files_of(tmp_path / "reduced")["GLYCOSHAPE.json"]) == {"GS00042": json.loads(reduced["data.json"])}
+
+
 def test_completeness_checks_of_the_runner_follow_the_setting(runs, tmp_path):
     from lib.storage import get_storage_manager
     from main import GlycanPipelineRunner
