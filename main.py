@@ -1091,7 +1091,13 @@ class GlycanPipelineRunner:
                     
                     ok_named = self.storage.exists(pdb_file, self.data_dir) and self.storage.exists(mol2_file, self.data_dir)
                     ok_alt = self.storage.exists(alt_pdb_file, self.data_dir) and self.storage.exists(alt_mol2_file, self.data_dir)
-                    if ok_named or ok_alt:
+                    # Archive entry (lib/archive.py): manifest.json + trajectory.xtc + structure.mol2
+                    ok_archive = (
+                        self.storage.exists(f"{item_name}/manifest.json", self.data_dir)
+                        and self.storage.exists(f"{item_name}/trajectory.xtc", self.data_dir)
+                        and self.storage.exists(alt_mol2_file, self.data_dir)
+                    )
+                    if ok_named or ok_alt or ok_archive:
                         glycan_dirs.append(item_name)
                         logger.info(f"Found glycan: {item_name}")
                     else:

@@ -22,14 +22,17 @@ if str(REPO_ROOT) not in sys.path:
 # which is unavailable from AMD nodes.
 os.environ["GLYCOSHAPE_ORACLE_PAR_URL"] = ""
 
-from lib import config
+from lib import archive, config
 from lib.frame_quality import filter_broken_frames, quality_manifest_is_current
 from lib.glypdbio import parse_mol2_bonds
-from lib.glystore import store_from_pdb
+from lib.glystore import store_trajectory
 from lib.v2 import run_glycan_analysis
 
 
 def _input_paths(glycan_dir: Path) -> tuple[Path, Path]:
+    archive_inputs = archive.entry_inputs(glycan_dir)
+    if archive_inputs is not None:
+        return Path(archive_inputs["trajectory_path"]), Path(archive_inputs["mol2_path"])
     name = glycan_dir.name
     named = (glycan_dir / f"{name}.pdb", glycan_dir / f"{name}.mol2")
     alternate = (glycan_dir / "simulation.pdb", glycan_dir / "structure.mol2")
@@ -74,7 +77,7 @@ def _audit_one(
     # The temporary path does not need to contain the sequence.
     with tempfile.TemporaryDirectory(prefix="gap-frame-audit-") as temporary:
         stored = Path(temporary) / "data"
-        store_from_pdb(
+        store_trajectory(
             str(pdb_path),
             str(stored),
             get_connectivity=parse_mol2_bonds(mol2_path),

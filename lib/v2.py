@@ -36,7 +36,8 @@ import joblib  # type: ignore
 
 from lib import config
 from lib.storage import get_storage_manager
-from lib.glystore import store_from_pdb
+from lib import archive
+from lib.glystore import store_trajectory
 from lib.glypdbio import parse_mol2_bonds
 from lib.frame_quality import (
     FrameQualityResult,
@@ -446,7 +447,7 @@ def step_store(
     temporary.mkdir(parents=True)
 
     try:
-        store_from_pdb(
+        store_trajectory(
             pdb_path,
             str(temporary),
             get_connectivity=parse_mol2_bonds(mol2_path),
@@ -2163,6 +2164,14 @@ class GlycanAnalysisPipeline:
 
         pdb_path = default_pdb if storage.exists(default_pdb) else (alt_pdb if storage.exists(alt_pdb) else default_pdb)
         mol2_path = default_mol2 if storage.exists(default_mol2) else (alt_mol2 if storage.exists(alt_mol2) else default_mol2)
+
+        # An archive entry (lib/archive.py) carries its GLYCAM name in the
+        # manifest and its frames in trajectory.xtc; the store step reads both.
+        archive_inputs = archive.entry_inputs(input_glycan_dir)
+        if archive_inputs is not None:
+            glycam_name = archive_inputs["glycam_name"]
+            pdb_path = archive_inputs["trajectory_path"]
+            mol2_path = archive_inputs["mol2_path"]
 
         return {
             'input_glycan_dir': input_glycan_dir,  # For reading input files

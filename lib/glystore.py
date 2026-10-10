@@ -399,3 +399,75 @@ def store_from_memory(
         compression="zstd",
         statistics=True,
     )
+
+# -------------------------
+# Archive entries (lib/archive.py): trajectory.xtc + topology.pdb
+# -------------------------
+def store_from_archive(
+    entry_path: str,
+    frame_data_dir: str,
+    get_connectivity: Optional[Callable[[pl.DataFrame], Iterable[Tuple[int, int]]]] = None,
+    connectivity_kind: str = "serial",
+    frames_buffer: int = 1,
+    frame_chunk: Optional[int] = None,
+) -> None:
+    """
+    Same outputs as store_from_pdb for an archive entry (its folder, or its
+    trajectory.xtc). Frames are streamed from the XTC; nothing is read as text
+    except topology.pdb, the first frame of the source.
+    """
+    from lib.archive import ArchiveEntry
+
+    if frames_buffer < 1:
+        raise ValueError("frames_buffer must be >=1")
+    entry = ArchiveEntry(entry_path)
+    n_frames = entry.n_frames
+    if frame_chunk is None or frame_chunk <= 0:
+        frame_chunk = n_frames
+
+    # atoms.parquet and bonds.parquet: the PDB code path on the first frame.
+    store_from_pdb(
+        str(entry.topology_path),
+        frame_data_dir,
+        get_connectivity=get_connectivity,
+        connectivity_kind=connectivity_kind,
+        frames_buffer=1,
+        frame_chunk=1,
+    )
+
+    # Coordinates: every frame from the XTC, appended in whole Zarr chunks so
+    # that no chunk is decompressed and rewritten.
+    _, z = _create_coords_store(frame_data_dir, n_atoms=entry.n_atoms, frame_chunk=frame_chunk)
+    pending: List[np.ndarray] = []
+    pending_frames = 0
+    for block in entry.iter_frames(chunk=max(int(frames_buffer), 1024)):
+        pending.append(block)
+        pending_frames += block.shape[0]
+        if pending_frames >= frame_chunk:
+            ready = np.concatenate(pending, axis=0) if len(pending) > 1 else pending[0]
+            whole = (pending_frames // frame_chunk) * frame_chunk
+            _append_frames(z, ready[:whole])
+            pending = [ready[whole:]] if whole < pending_frames else []
+            pending_frames -= whole
+    if pending_frames:
+        _append_frames(z, np.concatenate(pending, axis=0))
+    if z.shape[0] != n_frames:
+        raise ValueError(f"Archive entry yielded {z.shape[0]} frames, manifest says {n_frames}.")
+
+    pl.DataFrame({"n_frames": [n_frames]}).write_parquet(
+        os.path.join(frame_data_dir, "frames.parquet"),
+        compression="zstd",
+        statistics=True,
+    )
+
+
+def store_trajectory(trajectory_path: str, frame_data_dir: str, **kwargs) -> None:
+    """Store step for either input: an archive entry or a multi-frame PDB."""
+    from lib import archive
+
+    path = str(trajectory_path)
+    entry_dir = os.path.dirname(path) if os.path.basename(path) == archive.TRAJECTORY_FILE else path
+    if archive.is_archive_entry(entry_dir):
+        store_from_archive(entry_dir, frame_data_dir, **kwargs)
+    else:
+        store_from_pdb(path, frame_data_dir, **kwargs)

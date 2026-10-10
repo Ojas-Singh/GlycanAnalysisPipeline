@@ -27,7 +27,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.glypdbio import parse_mol2_bonds
-from lib.glystore import store_from_pdb
+from lib import archive
+from lib.glystore import store_trajectory
 from lib.storage import reset_storage_manager
 
 
@@ -195,6 +196,10 @@ def _rewrite_one(
     try:
         pdb_path = source_dir / "simulation.pdb"
         mol2_path = source_dir / "structure.mol2"
+        archive_inputs = archive.entry_inputs(source_dir)
+        if archive_inputs is not None:
+            pdb_path = Path(archive_inputs["trajectory_path"])
+            mol2_path = Path(archive_inputs["mol2_path"])
         if not pdb_path.exists():
             raise FileNotFoundError(f"missing {pdb_path}")
         if not mol2_path.exists():
@@ -212,7 +217,7 @@ def _rewrite_one(
         tmp_dir.mkdir(parents=True)
         process_glycan_dir.mkdir(parents=True, exist_ok=True)
 
-        store_from_pdb(
+        store_trajectory(
             str(pdb_path),
             str(tmp_dir),
             get_connectivity=parse_mol2_bonds(mol2_path),
