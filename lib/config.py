@@ -71,12 +71,64 @@ def _int_env(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+def _choice_env(name: str, default: str, choices: set[str]) -> str:
+    raw = os.environ.get(name, default).strip().lower()
+    if raw in choices:
+        return raw
+    logger.warning(
+        "Invalid %s=%r; expected one of %s, using %s",
+        name,
+        raw,
+        ", ".join(sorted(choices)),
+        default,
+    )
+    return default
+
+
+def _float_env(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
 # Login-node/resource configuration. These values keep the same pipeline
 # methods while bounding local CPU fan-out and in-memory frame buffering.
 max_workers = _int_env("GLYCOSHAPE_MAX_WORKERS", 1)
+# Static-only work is primarily independent file conversion and network I/O.
+# Keep it separate from the per-glycan numerical worker count so a login/node
+# can rebuild several glycans concurrently without increasing BLAS fan-out.
+static_workers = _int_env("GLYCOSHAPE_STATIC_WORKERS", 8)
 store_frames_buffer = _int_env("GLYCOSHAPE_STORE_FRAMES_BUFFER", 128)
-store_frame_chunk = _int_env("GLYCOSHAPE_STORE_FRAME_CHUNK", store_frames_buffer)
+# One coordinate chunk per trajectory by default. Set a positive value only
+# when intentionally trading fewer metadata files for bounded chunk size.
+store_frame_chunk = _int_env("GLYCOSHAPE_STORE_FRAME_CHUNK", 0, minimum=0)
+max_covalent_bond_angstrom = _float_env(
+    "GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM", 3.0, minimum=0.1
+)
+frame_quality_block_frames = _int_env(
+    "GLYCOSHAPE_FRAME_QUALITY_BLOCK_FRAMES", 1024, minimum=1
+)
 upload_workers = _int_env("GLYCOSHAPE_UPLOAD_WORKERS", 1)
+
+# Static SNFG rendering. crabWURCS is the default; set the renderer to
+# "glycodraw" to retain the previous glycowork implementation. The executable
+# can be an absolute path or a command available on PATH.
+snfg_renderer = _choice_env(
+    "GLYCOSHAPE_SNFG_RENDERER",
+    "crabwurcs",
+    {"crabwurcs", "glycodraw"},
+)
+_local_crabwurcs = base_dir / ".crabwurcs" / "bin" / "crabwurcs"
+_default_crabwurcs = str(_local_crabwurcs) if _local_crabwurcs.is_file() else "crabwurcs"
+crabwurcs_executable = (
+    os.environ.get("GLYCOSHAPE_CRABWURCS_BIN", _default_crabwurcs).strip()
+    or _default_crabwurcs
+)
 
 for thread_var in (
     "OMP_NUM_THREADS",
@@ -192,7 +244,11 @@ def get_storage_info() -> dict:
         "max_workers": max_workers,
         "store_frames_buffer": store_frames_buffer,
         "store_frame_chunk": store_frame_chunk,
+        "max_covalent_bond_angstrom": max_covalent_bond_angstrom,
+        "frame_quality_block_frames": frame_quality_block_frames,
         "upload_workers": upload_workers,
+        "snfg_renderer": snfg_renderer,
+        "crabwurcs_executable": crabwurcs_executable if snfg_renderer == "crabwurcs" else None,
     }
 
 

@@ -2,12 +2,14 @@ import lib.config as config
 from pathlib import Path
 import shutil
 import logging
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 import zipfile
 import glob
 import json
 import requests
-from typing import Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional
+from lib import name_utils
 from lib.storage import get_storage_manager
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +28,124 @@ class GlycoShapeBaker:
         """
         self.database_dir = Path(database_dir)
         self.logger = logging.getLogger(self.__class__.__name__)
+
+    @staticmethod
+    def _file_hash_info(path: Path) -> Dict[str, Any]:
+        """Return stable hash metadata for a file."""
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+
+        stat = path.stat()
+        return {
+            "sha256": digest.hexdigest(),
+            "size": size,
+            "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+
+    @staticmethod
+    def _aggregate_hash(entries: List[str]) -> str:
+        """Hash sorted manifest entry lines into one deterministic digest."""
+        digest = hashlib.sha256()
+        for entry in sorted(entries):
+            digest.update(entry.encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def create_sync_manifest(self, output_name: str = "sync_manifest.json") -> Path:
+        """Create a static sync manifest for fast Oracle-to-host updates.
+
+        The manifest is intentionally self-contained:
+        - root_files covers top-level static artifacts such as GLYCOSHAPE.json
+        - glycans[GSxxxxx].hash is the quick folder-level update key
+        - glycans[GSxxxxx].files is the exact file list for download/verification
+        """
+        root = self.database_dir
+        manifest_path = root / output_name
+
+        root_files: Dict[str, Dict[str, Any]] = {}
+        for file_path in sorted(root.iterdir()):
+            if not file_path.is_file() or file_path.name == output_name:
+                continue
+            info = self._file_hash_info(file_path)
+            root_files[file_path.name] = {
+                "path": file_path.name,
+                "sha256": info["sha256"],
+                "size": info["size"],
+                "mtime": info["mtime"],
+            }
+
+        glycans: Dict[str, Dict[str, Any]] = {}
+        for glycan_dir in sorted(root.glob("GS*")):
+            if not glycan_dir.is_dir():
+                continue
+
+            glycan_id = glycan_dir.name
+            files: Dict[str, Dict[str, Any]] = {}
+            aggregate_entries: List[str] = []
+            total_size = 0
+
+            for file_path in sorted(p for p in glycan_dir.rglob("*") if p.is_file()):
+                rel_to_glycan = file_path.relative_to(glycan_dir).as_posix()
+                rel_to_static = file_path.relative_to(root).as_posix()
+                info = self._file_hash_info(file_path)
+                total_size += info["size"]
+                files[rel_to_glycan] = {
+                    "path": rel_to_static,
+                    "sha256": info["sha256"],
+                    "size": info["size"],
+                    "mtime": info["mtime"],
+                }
+                aggregate_entries.append(f"{rel_to_glycan}\0{info['sha256']}\0{info['size']}")
+
+            glycans[glycan_id] = {
+                "hash": self._aggregate_hash(aggregate_entries),
+                "file_count": len(files),
+                "total_size": total_size,
+                "data_json_sha256": files.get("data.json", {}).get("sha256"),
+                "zip_sha256": files.get(f"{glycan_id}.zip", {}).get("sha256"),
+                "files": files,
+            }
+
+        global_entries = [
+            f"root/{name}\0{info['sha256']}\0{info['size']}"
+            for name, info in root_files.items()
+        ] + [
+            f"glycan/{glycan_id}\0{info['hash']}\0{info['file_count']}\0{info['total_size']}"
+            for glycan_id, info in glycans.items()
+        ]
+
+        manifest: Dict[str, Any] = {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "hash_algorithm": "sha256",
+            "static_prefix": "static",
+            "manifest_path": output_name,
+            "manifest_excludes": [output_name],
+            "global_hash": self._aggregate_hash(global_entries),
+            "glycan_count": len(glycans),
+            "root_files": root_files,
+            "glycans": glycans,
+        }
+
+        tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        tmp_path.replace(manifest_path)
+
+        self.logger.info(
+            "Created sync manifest %s with %d glycans and %d root files",
+            manifest_path,
+            len(glycans),
+            len(root_files),
+        )
+        return manifest_path
         
     def create_individual_glycan_archive(self, glycan_dir: Path) -> bool:
         """Create archive for individual glycan with new structure.
@@ -214,6 +334,38 @@ class GlycoShapeBaker:
                 data = json.load(f)
 
             missing_entries = []
+            unresolved_wurcs_entries = []
+            calculated_wurcs_by_glycan = {}
+
+            def calculate_wurcs_from_iupac(glycan_id: str, entry_type: str, iupac: str):
+                calculated_glytoucan, calculated_wurcs = name_utils.iupac2wurcs_glytoucan(iupac)
+                if calculated_wurcs:
+                    return calculated_glytoucan, calculated_wurcs
+
+                try:
+                    smiles = name_utils.iupac2smiles(iupac)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"Failed to calculate SMILES for {glycan_id} ({entry_type}) from IUPAC {iupac}: {exc}"
+                    )
+                    return calculated_glytoucan, None
+
+                if not smiles:
+                    return calculated_glytoucan, None
+
+                calculated_wurcs = name_utils.smiles2wurcs(smiles)
+                if calculated_wurcs:
+                    variants = name_utils.get_wurcs_variants(calculated_wurcs)
+                    if variants:
+                        calculated_wurcs_by_glycan[glycan_id] = {
+                            "archetype": variants[0],
+                            "alpha": variants[1],
+                            "beta": variants[2],
+                        }
+                        calculated_wurcs = calculated_wurcs_by_glycan[glycan_id].get(entry_type) or calculated_wurcs
+                    calculated_glytoucan = calculated_glytoucan or name_utils.wurcs2glytoucan(calculated_wurcs)
+
+                return calculated_glytoucan, calculated_wurcs
             
             # Check both archetype and alpha/beta entries
             for glycan_id, glycan_data in data.items():
@@ -229,18 +381,75 @@ class GlycoShapeBaker:
                     entry = glycan_data.get(entry_type, {})
                     wurcs = entry.get("wurcs")
                     glytoucan = entry.get("glytoucan")
+                    iupac = entry.get("iupac")
                     
+                    if not wurcs and not glytoucan and iupac:
+                        try:
+                            calculated_wurcs = calculated_wurcs_by_glycan.get(glycan_id, {}).get(entry_type)
+                            calculated_glytoucan = None
+                            if not calculated_wurcs:
+                                calculated_glytoucan, calculated_wurcs = calculate_wurcs_from_iupac(glycan_id, entry_type, iupac)
+                        except Exception as exc:
+                            calculated_glytoucan, calculated_wurcs = None, None
+                            self.logger.warning(
+                                f"Failed to calculate WURCS for {glycan_id} ({entry_type}) from IUPAC {iupac}: {exc}"
+                            )
+                        if calculated_glytoucan:
+                            glytoucan = calculated_glytoucan
+                        if calculated_wurcs:
+                            wurcs = calculated_wurcs
+
                     if wurcs and not glytoucan:
-                        missing_entries.append(wurcs)
-                        self.logger.info(f"Missing GlyTouCan ID for {glycan_id} ({entry_type}): {wurcs}")
+                        if wurcs not in missing_entries:
+                            missing_entries.append(wurcs)
+                    elif not wurcs and not glytoucan:
+                        unresolved_wurcs_entries.append({
+                            "glycoshape_id": glycan_id,
+                            "variant": entry_type,
+                            "iupac": entry.get("iupac") or "",
+                            "glycam": entry.get("glycam") or entry.get("name") or "",
+                        })
+
+            # Stored static JSON may predate an accession, and generated WURCS
+            # can be structurally valid but non-canonical. Recheck canonical
+            # WURCS in batches before calling anything a registration candidate.
+            lookup_candidates = [
+                wurcs for wurcs in missing_entries
+                if str(wurcs).startswith("WURCS=2.0/")
+            ]
+            resolved_by_wurcs = name_utils.wurcs2glytoucan_many(lookup_candidates)
+            missing_entries = [
+                wurcs for wurcs in missing_entries
+                if not resolved_by_wurcs.get(wurcs)
+            ]
 
             # Write missing entries to file
             output_path = f"{self.database_dir}/{output_file}"
             storage = get_storage_manager()
             with storage.open(output_path, 'w') as f:
                 f.write("\n".join(missing_entries))
+                if missing_entries:
+                    f.write("\n")
+
+            unresolved_output_path = f"{self.database_dir}/missing_wurcs.txt"
+            with storage.open(unresolved_output_path, 'w') as f:
+                f.write("glycoshape_id\tvariant\tiupac\tglycam\n")
+                for unresolved in unresolved_wurcs_entries:
+                    f.write(
+                        "\t".join([
+                            unresolved["glycoshape_id"],
+                            unresolved["variant"],
+                            unresolved["iupac"],
+                            unresolved["glycam"],
+                        ]) + "\n"
+                    )
                 
             self.logger.info(f"Found {len(missing_entries)} WURCS entries missing GlyTouCan IDs")
+            if unresolved_wurcs_entries:
+                self.logger.warning(
+                    f"Found {len(unresolved_wurcs_entries)} entries missing both WURCS and GlyTouCan; "
+                    f"wrote {unresolved_output_path}"
+                )
             
         except Exception as e:
             self.logger.error(f"Failed to extract missing GlyTouCan IDs: {str(e)}")

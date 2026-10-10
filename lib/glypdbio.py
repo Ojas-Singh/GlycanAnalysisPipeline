@@ -8,7 +8,6 @@ from lib.storage import get_storage_manager
 
 
 import numpy as np
-import networkx as nx
 import polars as pl
 import zarr
 
@@ -113,6 +112,85 @@ def load_frame_xyz(out_dir: str, frame_idx: int) -> np.ndarray:
     if frame_idx < 0 or frame_idx >= z.shape[0]:
         raise IndexError(f"frame_idx {frame_idx} out of range [0, {z.shape[0]-1}]")
     return z[frame_idx, :, :]  # (n_atoms, 3)
+
+
+def normalize_anomeric_residue_name(residue_name: str, target_anomer: str) -> str:
+    """Return a GLYCAM residue code with the requested alpha/beta suffix.
+
+    GLYCAM reducing-residue codes normally encode the anomer in their final
+    letter (for example ``4YA``/``4YB``).  A few source structures contain the
+    opposite code even though the sequence/name says otherwise.  Only an
+    explicit final ``A``/``B`` is changed; modified or unsupported codes such
+    as ``4YS`` and ``0PD`` are preserved because their anomeric counterpart
+    cannot be inferred safely from the code alone.
+    """
+    name = str(residue_name)
+    target = str(target_anomer).strip().lower()
+    if target not in {"alpha", "beta"} or not name:
+        return name
+    suffix = "A" if target == "alpha" else "B"
+    if name[-1] in {"A", "B"}:
+        return name[:-1] + suffix
+    return name
+
+
+def normalize_anomeric_residue_names(
+    residue_names: List[str],
+    residue_ids: List[int],
+    target_anomer: str,
+    reducing_residue_id: int = 2,
+) -> List[str]:
+    """Normalize all atoms in the reducing residue to ``target_anomer``.
+
+    The same residue name must be used for every atom in a PDB residue.  This
+    helper is intentionally conservative: it changes only reducing-residue
+    names whose GLYCAM code has an unambiguous A/B suffix.
+    """
+    names = list(residue_names)
+    root_indices = [
+        index for index, residue_id in enumerate(residue_ids)
+        if int(residue_id) == int(reducing_residue_id)
+    ]
+    if not root_indices:
+        return names
+
+    root_name = names[root_indices[0]]
+    normalized = normalize_anomeric_residue_name(root_name, target_anomer)
+    if normalized == root_name:
+        return names
+    for index in root_indices:
+        names[index] = normalized
+    return names
+
+
+def flip_anomeric_residue_names(
+    residue_names: List[str],
+    residue_ids: List[int],
+    reducing_residue_id: int = 2,
+) -> List[str]:
+    """Toggle an unambiguous A/B reducing-residue code.
+
+    This is kept as the backwards-compatible operation for callers that only
+    request a geometric flip.  Callers that know the target output should use
+    :func:`normalize_anomeric_residue_names` instead.
+    """
+    names = list(residue_names)
+    root_indices = [
+        index for index, residue_id in enumerate(residue_ids)
+        if int(residue_id) == int(reducing_residue_id)
+    ]
+    if not root_indices:
+        return names
+    root_name = str(names[root_indices[0]])
+    if root_name and root_name[-1] in {"A", "B"}:
+        target = "beta" if root_name[-1] == "A" else "alpha"
+        return normalize_anomeric_residue_names(
+            names,
+            residue_ids,
+            target,
+            reducing_residue_id=reducing_residue_id,
+        )
+    return names
 
 
 # -------------------------
@@ -241,7 +319,8 @@ def get_conformation_landscape(
     sample_size: int = 200,
     seed: int = 0,
     chunk_size: int = 1000,
-) -> np.ndarray:
+    return_atom_indices: bool = False,
+):
     """Fast conformational landscape matrix.
 
     Returns a 2D array with shape (n_frames, n_distances) where each row is the
@@ -260,18 +339,23 @@ def get_conformation_landscape(
             - "noH_fast": Use non-H atoms, sample up to `sample_size` if too many (default)
             - "noH": Use all non-H atoms without sampling
             - "all": Use all atoms (including hydrogens)
+            - "noH_noROH_fast": Use non-H atoms excluding ROH residue, sample up to `sample_size`
+            - "noH_noROH": Use all non-H atoms excluding ROH residue, without sampling
         sample_size: Maximum number of atoms to include for sampling methods (default 200).
-                    Only used when method="noH_fast" and there are more non-H atoms than this limit.
+                    Only used when method is "noH_fast" or "noH_noROH_fast" and there are
+                    more eligible atoms than this limit.
         seed: RNG seed for reproducible sampling (only used with sampling methods).
         chunk_size: Number of frames to process in each memory-efficient chunk (default 1000).
                     Reduces peak memory usage for large trajectories by processing frames in batches.
+        return_atom_indices: If True, return (landscape, chosen_atom_indices) tuple instead
+                    of just the landscape array.
 
     Notes:
         - If <2 eligible atoms, returns an array of shape (n_frames, 0).
         - Uses vectorized operations for optimal performance.
     """
-    if method not in ["noH_fast", "noH", "all"]:
-        raise ValueError(f"method must be one of ['noH_fast', 'noH', 'all'], got '{method}'")
+    if method not in ["noH_fast", "noH", "all", "noH_noROH_fast", "noH_noROH"]:
+        raise ValueError(f"method must be one of ['noH_fast', 'noH', 'all', 'noH_noROH_fast', 'noH_noROH'], got '{method}'")
 
     z = load_coords(out_dir)  # expected shape (n_frames, n_atoms, 3)
     # Ensure we have a numpy array with float32 dtype to avoid large float64
@@ -306,26 +390,42 @@ def get_conformation_landscape(
             elems = [str(x).strip().upper() for x in atoms["element"].to_list()]
             non_h_mask = np.array([not e.startswith("H") for e in elems], dtype=bool)
             all_indices = np.nonzero(non_h_mask)[0]
+    elif method in ["noH_noROH_fast", "noH_noROH"]:
+        # Use non-hydrogen atoms excluding ROH residue (anomer-independent)
+        if "element" not in atoms.columns:
+            all_indices = np.arange(z.shape[1], dtype=int)
+        else:
+            elems = [str(x).strip().upper() for x in atoms["element"].to_list()]
+            res_names = [str(x) for x in atoms["res_name"].to_list()]
+            mask = np.array([
+                not e.startswith("H") and r != "ROH"
+                for e, r in zip(elems, res_names)
+            ], dtype=bool)
+            all_indices = np.nonzero(mask)[0]
     else:
         raise ValueError(f"Unsupported method: {method}")
 
     if all_indices.size < 2:
+        if return_atom_indices:
+            return np.zeros((n_frames, 0), dtype=float), np.array([], dtype=int)
         return np.zeros((n_frames, 0), dtype=float)
 
-    # Apply sampling if method is noH_fast and we have too many atoms
-    # If noH_fast but not enough atoms to warrant sampling, behave like noH method
-    if method == "noH_fast" and all_indices.size > int(sample_size):
+    # Apply sampling if method is a *_fast variant and we have too many atoms
+    is_fast = method in ("noH_fast", "noH_noROH_fast")
+    if is_fast and all_indices.size > int(sample_size):
         rng = np.random.default_rng(int(seed))
         chosen = rng.choice(all_indices, size=int(sample_size), replace=False)
         chosen.sort()  # keep deterministic ordering for reproducibility of pair index mapping
     else:
-        # For noH method or noH_fast with few atoms, use all available indices
+        # For non-fast method or fast with few atoms, use all available indices
         chosen = all_indices
 
     m = chosen.size
     # Number of pair distances per frame
     n_pairs = m * (m - 1) // 2
     if n_pairs == 0:
+        if return_atom_indices:
+            return np.zeros((n_frames, 0), dtype=float), chosen
         return np.zeros((n_frames, 0), dtype=float)
 
     # Gather coordinates subset: shape (n_frames, m, 3)
@@ -350,7 +450,10 @@ def get_conformation_landscape(
     # Concatenate all chunks
     dist_mat = np.vstack(dist_chunks)
     # Guarantee C-contiguous output
-    return np.ascontiguousarray(dist_mat)
+    landscape = np.ascontiguousarray(dist_mat)
+    if return_atom_indices:
+        return landscape, chosen
+    return landscape
 
 # -------------------------
 # PDB writer
@@ -381,28 +484,129 @@ def _pdb_atom_line(
         f"\n"
     )
 
-def _pdb_conect_block(serials_np: np.ndarray, bonds_df: pl.DataFrame) -> str:
-    if bonds_df.is_empty():
+def _complete_bond_pairs_from_geometry(
+    atoms_df: pl.DataFrame,
+    bonds_df: pl.DataFrame,
+    xyz: np.ndarray,
+) -> np.ndarray:
+    """Return stored bonds supplemented by unambiguous covalent-distance bonds.
+
+    MOL2 is authoritative. Geometry is only used to restore omitted bonds, most
+    commonly hydrogen or carbohydrate ring/substituent bonds. Conservative
+    covalent radii and valence limits prevent nearby non-bonded atoms from being
+    connected.
+    """
+    n_atoms = len(atoms_df)
+    existing: set[tuple[int, int]] = set()
+    if not bonds_df.is_empty():
+        for a, b in bonds_df.select(["a", "b"]).iter_rows():
+            a_i, b_i = int(a), int(b)
+            if not (0 <= a_i < n_atoms and 0 <= b_i < n_atoms):
+                raise ValueError(
+                    "Cannot complete PDB connectivity: stored bond references atom "
+                    f"index outside 0..{n_atoms - 1}: {(a_i, b_i)}"
+                )
+            if a_i != b_i:
+                existing.add(tuple(sorted((a_i, b_i))))
+
+    coords = np.asarray(xyz, dtype=float)
+    if coords.shape != (n_atoms, 3):
+        return np.asarray(sorted(existing), dtype=np.int32).reshape((-1, 2))
+
+    elements = [str(value).strip().upper() for value in atoms_df["element"].to_list()]
+    radii = {"H": 0.31, "C": 0.76, "N": 0.71, "O": 0.66, "F": 0.57,
+             "P": 1.07, "S": 1.05, "CL": 1.02, "BR": 1.20, "I": 1.39}
+    max_degree = {"H": 1, "C": 4, "N": 4, "O": 2, "F": 1,
+                  "P": 6, "S": 6, "CL": 1, "BR": 1, "I": 1}
+    degree = [0] * n_atoms
+    for a, b in existing:
+        degree[a] += 1
+        degree[b] += 1
+
+    candidates: list[tuple[float, int, int]] = []
+    for i in range(n_atoms):
+        elem_i = elements[i]
+        radius_i = radii.get(elem_i)
+        if radius_i is None:
+            continue
+        for j in range(i + 1, n_atoms):
+            if (i, j) in existing:
+                continue
+            elem_j = elements[j]
+            radius_j = radii.get(elem_j)
+            if radius_j is None or (elem_i == "H" and elem_j == "H"):
+                continue
+            distance = float(np.linalg.norm(coords[i] - coords[j]))
+            # 0.30 A tolerance handles rounded PDB coordinates without making
+            # hydrogen bonds or close non-bonded contacts look covalent.
+            if 0.40 < distance <= radius_i + radius_j + 0.30:
+                candidates.append((distance, i, j))
+
+    for _, i, j in sorted(candidates):
+        if degree[i] >= max_degree.get(elements[i], 4):
+            continue
+        if degree[j] >= max_degree.get(elements[j], 4):
+            continue
+        existing.add((i, j))
+        degree[i] += 1
+        degree[j] += 1
+
+    return np.asarray(sorted(existing), dtype=np.int32).reshape((-1, 2))
+
+
+def _pdb_conect_block(
+    serials_np: np.ndarray,
+    bonds_df: pl.DataFrame,
+    atoms_df: Optional[pl.DataFrame] = None,
+    xyz: Optional[np.ndarray] = None,
+) -> str:
+    if atoms_df is not None and xyz is not None:
+        pairs = _complete_bond_pairs_from_geometry(atoms_df, bonds_df, xyz)
+    elif bonds_df.is_empty():
         return ""
-    pairs = np.c_[bonds_df["a"].to_numpy(), bonds_df["b"].to_numpy()]
+    else:
+        pairs = np.c_[bonds_df["a"].to_numpy(), bonds_df["b"].to_numpy()]
     # map atom_index -> serial
     s = serials_np
     n_atoms = s.shape[0]
-    out = io.StringIO()
-    # skip any pair with indices outside [0, n_atoms-1]
+    adjacency: dict[int, set[int]] = {int(serial): set() for serial in s}
+    # Stored bonds are atom indices.  Silently dropping an invalid pair creates a
+    # chemically incomplete PDB, so make the provenance error actionable.
     valid_mask = (pairs[:, 0] >= 0) & (pairs[:, 0] < n_atoms) & (pairs[:, 1] >= 0) & (pairs[:, 1] < n_atoms)
     if not np.all(valid_mask):
-        # emit a diagnostic to stderr but continue
-        import sys
-
         bad = np.nonzero(~valid_mask)[0]
-        sys.stderr.write(f"Warning: {_pdb_conect_block.__name__}: skipping {bad.size} out-of-range bond(s)\n")
-        pairs = pairs[valid_mask]
+        examples = pairs[bad[:5]].tolist()
+        raise ValueError(
+            f"Cannot emit PDB CONECT records: {bad.size} bond(s) reference atom "
+            f"indices outside 0..{n_atoms - 1}; examples={examples}"
+        )
 
     for i in range(pairs.shape[0]):
-        a = int(s[pairs[i, 0]])
-        b = int(s[pairs[i, 1]])
-        out.write(f"CONECT{a:5d}{b:5d}\n")
+        a = int(s[int(pairs[i, 0])])
+        b = int(s[int(pairs[i, 1])])
+        if a == b:
+            continue
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+
+    isolated = sorted(serial for serial, neighbours in adjacency.items() if not neighbours)
+    if isolated and len(adjacency) > 1:
+        raise ValueError(
+            "Cannot emit complete PDB CONECT records: atom serial(s) have no "
+            f"covalent neighbours after MOL2 and geometry repair: {isolated[:10]}"
+            + (" ..." if len(isolated) > 10 else "")
+        )
+
+    # Emit the complete adjacency for each atom. PDB permits four neighbours
+    # per CONECT line; repeat the source serial when more are present.
+    out = io.StringIO()
+    for source in sorted(adjacency):
+        targets = sorted(adjacency[source])
+        for start in range(0, len(targets), 4):
+            out.write(f"CONECT{source:5d}")
+            for target in targets[start:start + 4]:
+                out.write(f"{target:5d}")
+            out.write("\n")
     return out.getvalue()
 
 def pdb_string_for_frame(out_dir: str, frame_idx: int, title: Optional[str] = None) -> str:
@@ -434,7 +638,7 @@ def pdb_string_for_frame(out_dir: str, frame_idx: int, title: Optional[str] = No
             element=elem[i],
         ))
 
-    conect = _pdb_conect_block(serials, bonds)
+    conect = _pdb_conect_block(serials, bonds, atoms, xyz)
     if conect:
         out.write(conect)
 
@@ -470,12 +674,15 @@ def write_pdb_for_frame(
     atoms = load_atoms(out_dir)
     bonds = load_bonds(out_dir)
     xyz = load_frame_xyz(out_dir, frame_idx).copy()  # (n_atoms,3) mutable copy
+    res_names = atoms["res_name"].to_list()
 
     if flip:
         # Locate indices
         names = atoms["name"].to_list()
         res_ids = atoms["res_id"].to_list()
-        res_names = atoms["res_name"].to_list()
+        # The geometric operation creates the opposite anomer, so its reducing
+        # residue name must change even when coordinates cannot be flipped.
+        res_names = flip_anomeric_residue_names(res_names, res_ids)
 
         idx_C1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "C1" and r == 2), None)
         idx_H1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "H1" and r == 2), None)
@@ -506,28 +713,11 @@ def write_pdb_for_frame(
                 xyz[idx_H1] = new_H1
                 xyz[idx_HO1] = new_HO1
 
-                # Toggle residue name A<->B for residue id 2 if last char matches
-                # Find all atoms with res_id==2 and update their res_name consistently
-                try:
-                    res2_name = next(res_names[i] for i,r in enumerate(res_ids) if r == 2)
-                    if res2_name and res2_name[-1] in ("A","B"):
-                        flipped_res2 = res2_name[:-1] + ("B" if res2_name[-1] == "A" else "A")
-                        # Apply change to local list (used later when writing)
-                        for i,r in enumerate(res_ids):
-                            if r == 2:
-                                res_names[i] = flipped_res2
-                except StopIteration:
-                    pass
         # else: silently ignore if atoms missing (fallback to original coordinates)
 
     # Prepare for writing (reuse existing helper formatting routines)
     serials = atoms["serial"].to_numpy()
     names = atoms["name"].to_list()
-    # res_names maybe updated if flip performed
-    try:
-        res_names  # type: ignore
-    except NameError:  # flip False path
-        res_names = atoms["res_name"].to_list()
     chain_u8 = atoms["chain_id_u8"].to_numpy()
     resid = atoms["res_id"].to_numpy()
     elem = atoms["element"].to_list()
@@ -548,7 +738,7 @@ def write_pdb_for_frame(
                 x=float(x), y=float(y), z=float(z),
                 element=elem[i],
             ))
-        conect = _pdb_conect_block(serials, bonds)
+        conect = _pdb_conect_block(serials, bonds, atoms, xyz)
         if conect:
             fh.write(conect)
         fh.write("ENDMDL\n")
@@ -594,13 +784,16 @@ def get_mol_from_frame(
     atoms = load_atoms(out_dir)
     bonds = load_bonds(out_dir)
     xyz = load_frame_xyz(out_dir, frame_idx).copy()
+    res_names = atoms["res_name"].to_list()
 
     # Optional flip duplicates the coordinate transformation in write_pdb_for_frame
     if flip:
         try:
             names = atoms["name"].to_list()
             res_ids = atoms["res_id"].to_list()
-            res_names = atoms["res_name"].to_list()
+            # Keep metadata in sync with the generated opposite anomer even if
+            # the coordinate fallback below cannot find all OH atoms.
+            res_names = flip_anomeric_residue_names(res_names, res_ids)
             idx_C1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "C1" and r == 2), None)
             idx_H1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "H1" and r == 2), None)
             idx_O1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "O1" and r == 1), None)
@@ -615,16 +808,6 @@ def get_mol_from_frame(
                     new_H1 = C1 + (CO1_vec / np.linalg.norm(CO1_vec)) * len_C1H1
                     new_HO1 = new_O1 + HO1O1_vec
                     xyz[idx_O1] = new_O1; xyz[idx_H1] = new_H1; xyz[idx_HO1] = new_HO1
-                    # Toggle residue 2 name A<->B if last char matches
-                    try:
-                        res2_name = next(res_names[i] for i,r in enumerate(res_ids) if r == 2)
-                        if res2_name and res2_name[-1] in ("A","B"):
-                            flipped_res2 = res2_name[:-1] + ("B" if res2_name[-1]=="A" else "A")
-                            for i,r in enumerate(res_ids):
-                                if r == 2:
-                                    res_names[i] = flipped_res2
-                    except StopIteration:
-                        pass
         except Exception:
             pass  # silent fallback
 
@@ -633,7 +816,7 @@ def get_mol_from_frame(
     serials = atoms["serial"].to_numpy()
     elem_col = atoms["element"].to_list()
     names_col = atoms["name"].to_list()
-    resn_col = atoms["res_name"].to_list()
+    resn_col = res_names
     resid_col = atoms["res_id"].to_list()
     try:
         chain_ids_u8 = atoms["chain_id_u8"].to_numpy()
@@ -804,6 +987,60 @@ def _add_pdb_remarks(
         
         
 
+_PDB_ANOMER_RESIDUE_PAIRS = {
+    "NDG": ("NDG", "NAG"),  # GlcNAc alpha/beta
+    "NAG": ("NDG", "NAG"),
+    "A2G": ("A2G", "NGA"),  # GalNAc alpha/beta
+    "NGA": ("A2G", "NGA"),
+    "GLC": ("GLC", "BGC"),  # Glc alpha/beta
+    "BGC": ("GLC", "BGC"),
+    "GLA": ("GLA", "GAL"),  # Gal alpha/beta
+    "GAL": ("GLA", "GAL"),
+    "FUC": ("FUC", "FUL"),  # L-Fuc alpha/beta
+    "FUL": ("FUC", "FUL"),
+    "MAN": ("MAN", "BMA"),  # Man alpha/beta
+    "BMA": ("MAN", "BMA"),
+    "GCU": ("GCU", "BDP"),  # GlcA alpha/beta
+    "BDP": ("GCU", "BDP"),
+    "XYS": ("XYS", "XYP"),  # Xyl alpha/beta
+    "XYP": ("XYS", "XYP"),
+    "RAM": ("RAM", "RHM"),  # Rha alpha/beta
+    "RHM": ("RAM", "RHM"),
+    "RIB": ("RIB", "BDR"),  # Rib alpha/beta
+    "BDR": ("RIB", "BDR"),
+    "ARA": ("ARA", "ARB"),  # Ara alpha/beta
+    "ARB": ("ARA", "ARB"),
+}
+
+
+def normalize_anomeric_pdb_text(filedata: str, target_anomer: str) -> str:
+    """Normalize the reducing-residue name in fixed-width PDB atom records.
+
+    This is used only for legacy/fallback text paths where the atom table is
+    unavailable.  It understands both GLYCAM A/B codes and the corresponding
+    three-letter PDB aliases, and leaves all non-reducing residues untouched.
+    """
+    target = str(target_anomer).strip().lower()
+    if target not in {"alpha", "beta"}:
+        return filedata
+    target_index = 0 if target == "alpha" else 1
+    converted_lines = []
+    for line in filedata.splitlines(keepends=True):
+        if line.startswith(("ATOM  ", "HETATM")) and len(line) >= 26:
+            try:
+                is_reducing_residue = int(line[22:26].strip()) == 2
+            except (TypeError, ValueError):
+                is_reducing_residue = False
+            if is_reducing_residue:
+                current = line[17:20].strip()
+                pair = _PDB_ANOMER_RESIDUE_PAIRS.get(current)
+                desired = pair[target_index] if pair else normalize_anomeric_residue_name(current, target)
+                if desired and desired != current:
+                    line = f"{line[:17]}{desired:>3s}{line[20:]}"
+        converted_lines.append(line)
+    return "".join(converted_lines)
+
+
 def _convert_pdb_text_naming(filedata: str, naming_format: str) -> str:
     """Convert PDB residue naming in text for the specified target format.
 
@@ -813,34 +1050,48 @@ def _convert_pdb_text_naming(filedata: str, naming_format: str) -> str:
     if naming_format == 'GLYCAM':
         return filedata
     if naming_format == 'PDB':
-        # Convert GLYCAM to PDB naming
-        filedata = re.sub(r"\s\wYA", " NDG", filedata)  # GlcNAc alpha
-        filedata = re.sub(r"\s\wYB", " NAG", filedata)  # GlcNAc beta
-        filedata = re.sub(r"\s\wVA", " A2G", filedata)  # GalNAc alpha
-        filedata = re.sub(r"\s\wVB", " NGA", filedata)  # GalNAc beta
-        filedata = re.sub(r"\s\wGA", " GLC", filedata)  # Glc alpha
-        filedata = re.sub(r"\s\wGB", " BGC", filedata)  # Glc beta
-        filedata = re.sub(r"\s\wGL", " NGC", filedata)  # Neu5Gc alpha
-        filedata = re.sub(r"\s\wLA", " GLA", filedata)  # Gal alpha
-        filedata = re.sub(r"\s\wLB", " GAL", filedata)  # Gal beta
-        filedata = re.sub(r"\s\wfA", " FUC", filedata)  # L-Fuc alpha
-        filedata = re.sub(r"\s\wfB", " FUL", filedata)  # L-Fuc beta
-        filedata = re.sub(r"\s\wMB", " BMA", filedata)  # Man beta
-        filedata = re.sub(r"\s\wMA", " MAN", filedata)  # Man alpha
-        filedata = re.sub(r"\s\wSA", " SIA", filedata)  # Neu5Ac alpha
-        filedata = re.sub(r"\s\wSA", " SLB", filedata)  # Neu5Ac beta (note: original code maps SA twice)
-        filedata = re.sub(r"\s\wZA", " GCU", filedata)  # GlcA alpha
-        filedata = re.sub(r"\s\wZB", " BDP", filedata)  # GlcA beta
-        filedata = re.sub(r"\s\wXA", " XYS", filedata)  # Xyl alpha
-        filedata = re.sub(r"\s\wXB", " XYP", filedata)  # Xyl beta
-        filedata = re.sub(r"\s\wuA", " IDR", filedata)  # IdoA alpha
-        filedata = re.sub(r"\s\whA", " RAM", filedata)  # Rha alpha
-        filedata = re.sub(r"\s\whB", " RHM", filedata)  # Rha beta
-        filedata = re.sub(r"\s\wRA", " RIB", filedata)  # Rib alpha
-        filedata = re.sub(r"\s\wRB", " BDR", filedata)  # Rib beta
-        filedata = re.sub(r"\s\wAA", " ARA", filedata)  # Ara alpha
-        filedata = re.sub(r"\s\wAB", " ARB", filedata)  # Ara beta
-        return filedata
+        # GLYCAM names have a linkage-position prefix followed by a two-character
+        # residue code (for example ``0VB``).  Convert each atom record exactly
+        # once by editing its fixed-width resName field (PDB columns 18--20).
+        # Whole-text sequential substitutions used to remap their own output:
+        # ``0VB -> NGA -> GLC`` and ``0MB -> BMA -> MAN``.
+        pdb_residue_names = {
+            "YA": "NDG",  # GlcNAc alpha
+            "YB": "NAG",  # GlcNAc beta
+            "VA": "A2G",  # GalNAc alpha
+            "VB": "NGA",  # GalNAc beta
+            "GA": "GLC",  # Glc alpha
+            "GB": "BGC",  # Glc beta
+            "GL": "NGC",  # Neu5Gc alpha
+            "LA": "GLA",  # Gal alpha
+            "LB": "GAL",  # Gal beta
+            "fA": "FUC",  # L-Fuc alpha
+            "fB": "FUL",  # L-Fuc beta
+            "MB": "BMA",  # Man beta
+            "MA": "MAN",  # Man alpha
+            "SA": "SIA",  # Neu5Ac alpha; beta source code is not defined here
+            "ZA": "GCU",  # GlcA alpha
+            "ZB": "BDP",  # GlcA beta
+            "XA": "XYS",  # Xyl alpha
+            "XB": "XYP",  # Xyl beta
+            "uA": "IDR",  # IdoA alpha
+            "hA": "RAM",  # Rha alpha
+            "hB": "RHM",  # Rha beta
+            "RA": "RIB",  # Rib alpha
+            "RB": "BDR",  # Rib beta
+            "AA": "ARA",  # Ara alpha
+            "AB": "ARB",  # Ara beta
+        }
+
+        converted_lines = []
+        for line in filedata.splitlines(keepends=True):
+            if line.startswith(("ATOM  ", "HETATM")) and len(line) >= 20:
+                glycam_residue = line[17:20]
+                pdb_residue = pdb_residue_names.get(glycam_residue[-2:])
+                if pdb_residue is not None:
+                    line = f"{line[:17]}{pdb_residue:>3s}{line[20:]}"
+            converted_lines.append(line)
+        return "".join(converted_lines)
     if naming_format == 'CHARMM':
         # Convert GLYCAM to CHARMM naming
         filedata = re.sub(r"\s\wYA ", " AGLC", filedata)  # GlcNAc alpha
@@ -1003,8 +1254,9 @@ def emit_multimodel_pdbs(
         frame_indices: list[int],
         title_header: str | None,
         per_model_meta: list[tuple[str | None, float | None]] | None,
+        target_anomer: str,
     ) -> None:
-        """Write a GLYCAM multi-model PDB with CONECT, aligned to first 5 residues.
+        """Write a GLYCAM multi-model PDB with CONECT records per model.
 
         per_model_meta: list of (cluster_id, population_pct) parallel to frame_indices
         """
@@ -1015,10 +1267,22 @@ def emit_multimodel_pdbs(
 
         serials = atoms["serial"].to_numpy()
         names = atoms["name"].to_list()
-        resn = atoms["res_name"].to_list()
+        resn = normalize_anomeric_residue_names(
+            atoms["res_name"].to_list(),
+            atoms["res_id"].to_list(),
+            target_anomer,
+        )
         chain_u8 = atoms["chain_id_u8"].to_numpy()
         resid = atoms["res_id"].to_numpy()
         elem = atoms["element"].to_list()
+        # Covalent topology is invariant across conformers. Geometry repair is
+        # O(n_atoms^2), so infer the complete CONECT block once from the first
+        # aligned model instead of repeating it for every model.
+        conect = (
+            _pdb_conect_block(serials, bonds, atoms, aligned_xyzs[0])
+            if aligned_xyzs
+            else ""
+        )
 
         with storage.open(out_path, "w") as fh:
             if title_header:
@@ -1043,7 +1307,6 @@ def emit_multimodel_pdbs(
                         x=x, y=y, z=z,
                         element=elem[j],
                     ))
-                conect = _pdb_conect_block(serials, bonds)
                 if conect:
                     fh.write(conect)
                 fh.write("ENDMDL\n")
@@ -1127,18 +1390,27 @@ def emit_multimodel_pdbs(
                                         except Exception:
                                             aligned.append(arr)
                                     xyzs = aligned
-                                # Write GLYCAM then convert if needed
+                                serials = atoms_df["serial"].to_numpy()
+                                names = atoms_df["name"].to_list()
+                                resn = normalize_anomeric_residue_names(
+                                    atoms_df["res_name"].to_list(),
+                                    atoms_df["res_id"].to_list(),
+                                    anomer,
+                                )
+                                chain_u8 = atoms_df["chain_id_u8"].to_numpy()
+                                resid = atoms_df["res_id"].to_numpy()
+                                elem = atoms_df["element"].to_list()
+                                conect = (
+                                    _pdb_conect_block(serials, bonds_df, atoms_df, xyzs[0])
+                                    if xyzs
+                                    else ""
+                                )
+                                # Write GLYCAM then convert if needed.
                                 if fmt == "GLYCAM":
                                     with storage.open(out_path, "w") as fh:
                                         fh.write(
                                             f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}\n"
                                         )
-                                        serials = atoms_df["serial"].to_numpy()
-                                        names = atoms_df["name"].to_list()
-                                        resn = atoms_df["res_name"].to_list()
-                                        chain_u8 = atoms_df["chain_id_u8"].to_numpy()
-                                        resid = atoms_df["res_id"].to_numpy()
-                                        elem = atoms_df["element"].to_list()
                                         for i, xyz in enumerate(xyzs, start=1):
                                             fh.write(f"MODEL     {i:4d}\n")
                                             for j in range(len(serials)):
@@ -1152,7 +1424,6 @@ def emit_multimodel_pdbs(
                                                     x=x, y=y, z=z,
                                                     element=elem[j],
                                                 ))
-                                            conect = _pdb_conect_block(serials, bonds_df if bonds_df is not None else pl.DataFrame({"a": [], "b": []}))
                                             if conect:
                                                 fh.write(conect)
                                             fh.write("ENDMDL\n")
@@ -1168,12 +1439,6 @@ def emit_multimodel_pdbs(
                                             fh.write(
                                                 f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}\n"
                                             )
-                                            serials = atoms_df["serial"].to_numpy()
-                                            names = atoms_df["name"].to_list()
-                                            resn = atoms_df["res_name"].to_list()
-                                            chain_u8 = atoms_df["chain_id_u8"].to_numpy()
-                                            resid = atoms_df["res_id"].to_numpy()
-                                            elem = atoms_df["element"].to_list()
                                             for i, xyz in enumerate(xyzs, start=1):
                                                 fh.write(f"MODEL     {i:4d}\n")
                                                 for j in range(len(serials)):
@@ -1187,7 +1452,6 @@ def emit_multimodel_pdbs(
                                                         x=x, y=y, z=z,
                                                         element=elem[j],
                                                     ))
-                                                conect = _pdb_conect_block(serials, bonds_df if bonds_df is not None else pl.DataFrame({"a": [], "b": []}))
                                                 if conect:
                                                     fh.write(conect)
                                                 fh.write("ENDMDL\n")
@@ -1204,12 +1468,14 @@ def emit_multimodel_pdbs(
                                             pass
                             else:
                                 # No parseable models -> simple conversion
-                                converted = _convert_pdb_text_naming(raw, fmt)
+                                normalized_raw = normalize_anomeric_pdb_text(raw, anomer)
+                                converted = _convert_pdb_text_naming(normalized_raw, fmt)
                                 storage.write_text(out_path, converted)
                                 wrote = True
                         else:
                             # atoms/bonds not available -> simple conversion
-                            converted = _convert_pdb_text_naming(raw, fmt)
+                            normalized_raw = normalize_anomeric_pdb_text(raw, anomer)
+                            converted = _convert_pdb_text_naming(normalized_raw, fmt)
                             storage.write_text(out_path, converted)
                             wrote = True
                     except Exception:
@@ -1252,6 +1518,7 @@ def emit_multimodel_pdbs(
                                     frame_indices=frames,
                                     title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
                                     per_model_meta=per_meta,
+                                    target_anomer=anomer,
                                 )
                                 wrote = True
                             else:
@@ -1265,6 +1532,7 @@ def emit_multimodel_pdbs(
                                         frame_indices=frames,
                                         title_header=f"REMARK   GLYCAN MULTI-MODEL PDB  LEVEL {level_name.upper()}  ANOMER {anomer.upper()}",
                                         per_model_meta=per_meta,
+                                        target_anomer=anomer,
                                     )
                                     with open(tmp_path, "r", encoding="utf-8") as _fh:
                                         raw = _fh.read()
@@ -1308,7 +1576,8 @@ def emit_multimodel_pdbs(
                                 out_f.write(f"REMARK   CLUSTER_POPULATION_PCT {pop}\n")
                             with storage.open(fpath, "r") as in_f:
                                 raw = in_f.read()
-                            converted = _convert_pdb_text_naming(raw, fmt)
+                            normalized_raw = normalize_anomeric_pdb_text(raw, anomer)
+                            converted = _convert_pdb_text_naming(normalized_raw, fmt)
                             for line in converted.splitlines():
                                 if line.startswith(("ATOM", "HETATM", "ANISOU", "TER")):
                                     out_f.write(line + "\n")
@@ -1474,18 +1743,46 @@ def align_structures_by_residues(
                 ref_mol.AddConformer(ref_conf, assignId=True)
                 tgt_mol.AddConformer(tgt_conf, assignId=True)
                 
-                # Perform alignment
+                # Perform alignment (mutates tgt_mol in place)
                 atom_map = [(i, i) for i in range(len(ref_align_indices))]
                 rmsd = rdMolAlign.AlignMol(tgt_mol, ref_mol, atomMap=atom_map)
-                
-                # Extract transformation matrix
-                # Get aligned coordinates
-                aligned_conf = tgt_mol.GetConformer()
-                aligned_coords = target_coords.copy()
-                
-                # Apply the same transformation to all target coordinates
-                # This is a simplified approach - we'll use the Kabsch algorithm as fallback
-                
+
+                # Extract the rigid transform actually applied to the alignment
+                # subset by reading back the (now-moved) tgt conformer and
+                # comparing against the original subset of target_coords. This
+                # avoids the prior bug where the transform was discarded and
+                # unaligned target coordinates were returned.
+                post_tgt = np.asarray(
+                    [
+                        [
+                            tgt_mol.GetConformer().GetAtomPosition(i).x,
+                            tgt_mol.GetConformer().GetAtomPosition(i).y,
+                            tgt_mol.GetConformer().GetAtomPosition(i).z,
+                        ]
+                        for i in range(len(tgt_align_indices))
+                    ],
+                    dtype=float,
+                )
+                pre_tgt = np.asarray(target_coords[tgt_align_indices], dtype=float)
+                # Recover R, t from the moved subset via Kabsch; this is
+                # numerically equivalent to RDKit's transform on this subset.
+                pre_centroid = pre_tgt.mean(axis=0)
+                post_centroid = post_tgt.mean(axis=0)
+                H = (pre_tgt - pre_centroid).T @ (post_tgt - post_centroid)
+                U, S, Vt = np.linalg.svd(H)
+                R = Vt.T @ U.T
+                if np.linalg.det(R) < 0:
+                    Vt[-1, :] *= -1
+                    R = Vt.T @ U.T
+                t = post_centroid - R @ pre_centroid
+
+                # Apply the recovered transform to the full target_coords
+                aligned_coords = (R @ target_coords.T).T + t
+                transform_matrix = np.eye(4)
+                transform_matrix[:3, :3] = R
+                transform_matrix[:3, 3] = t
+                return aligned_coords, transform_matrix
+
             except ImportError:
                 use_rdkit = False
             except Exception as e:
@@ -1589,6 +1886,7 @@ def write_aligned_pdb_for_frame(
     """
     atoms = load_atoms(frame_data_dir)
     bonds = load_bonds(frame_data_dir)
+    res_names = atoms["res_name"].to_list()
     
     # Get aligned coordinates
     if frame_idx == reference_frame_idx:
@@ -1604,7 +1902,9 @@ def write_aligned_pdb_for_frame(
         try:
             names = atoms["name"].to_list()
             res_ids = atoms["res_id"].to_list()
-            res_names = atoms["res_name"].to_list()
+            # The output is the opposite anomer; keep its residue metadata
+            # consistent even if the coordinate flip falls back.
+            res_names = flip_anomeric_residue_names(res_names, res_ids)
 
             idx_C1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "C1" and r == 2), None)
             idx_H1 = next((i for i,(n,r) in enumerate(zip(names, res_ids)) if n == "H1" and r == 2), None)
@@ -1635,23 +1935,13 @@ def write_aligned_pdb_for_frame(
                     xyz[idx_H1] = new_H1
                     xyz[idx_HO1] = new_HO1
 
-                    # Toggle residue 2 name A<->B if last char matches
-                    try:
-                        res2_name = next(res_names[i] for i,r in enumerate(res_ids) if r == 2)
-                        if res2_name and res2_name[-1] in ("A","B"):
-                            flipped_res2 = res2_name[:-1] + ("B" if res2_name[-1]=="A" else "A")
-                            for i,r in enumerate(res_ids):
-                                if r == 2:
-                                    res_names[i] = flipped_res2
-                    except StopIteration:
-                        pass
         except Exception:
             pass  # silent fallback
 
     # Write PDB with the aligned coordinates
     serials = atoms["serial"].to_numpy()
     names = atoms["name"].to_list()
-    resn = atoms["res_name"].to_list()
+    resn = res_names
     chain_u8 = atoms["chain_id_u8"].to_numpy()
     resid = atoms["res_id"].to_numpy()
     elem = atoms["element"].to_list()
@@ -1674,7 +1964,7 @@ def write_aligned_pdb_for_frame(
                 element=elem[i],
             ))
 
-        conect = _pdb_conect_block(serials, bonds)
+        conect = _pdb_conect_block(serials, bonds, atoms, xyz)
         if conect:
             out.write(conect)
 
@@ -1682,13 +1972,16 @@ def write_aligned_pdb_for_frame(
 
 
 def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
-    """Parse bond information from MOL2 file and ensure graph connectivity.
+    """Parse MOL2 bonds and restore only unambiguous residue-local bonds.
     
     Args:
         file_path: Path to MOL2 file
         
     Returns:
-        List of tuples containing bonded atom pairs with missing connections added
+        List of bonded atom pairs. Missing C1--C2 bonds are restored for
+        pyranose residues identified by C1, C2, and O5. Disconnected components
+        are deliberately left disconnected here: trajectory-aware recovery in
+        ``lib.frame_quality`` is the only safe place to infer missing linkages.
     """
     try:
         storage = get_storage_manager()
@@ -1706,6 +1999,10 @@ def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
                 break
 
         atom_coords = {}
+        # MOL2 atom columns 7/8 identify the residue/substructure. Preserve
+        # them so we can validate glycan ring topology rather than relying
+        # solely on whole-graph connectedness.
+        atom_residues = {}
         if atom_start != -1:
             if atom_end == -1:
                 atom_end = len(lines)
@@ -1713,10 +2010,12 @@ def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
             for line in lines[atom_start:atom_end]:
                 try:
                     parts = line.strip().split()
-                    if len(parts) >= 4:
+                    if len(parts) >= 5:
                         atom_id = int(parts[0])
                         x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
                         atom_coords[atom_id] = (x, y, z)
+                        if len(parts) >= 8:
+                            atom_residues[atom_id] = (parts[1], parts[6], parts[7])
                 except (ValueError, IndexError):
                     continue
 
@@ -1745,49 +2044,29 @@ def parse_mol2_bonds(file_path: Path) -> List[Tuple[int, int]]:
             except ValueError:
                 logger.warning(f"Skipping invalid bond line: {line.strip()}")
                 continue
-        
-        # Check connectivity and add missing bonds if needed
-        G = nx.Graph()
-        G.add_edges_from(bonded_atoms)
-        
-        # Find all connected components
-        components = list(nx.connected_components(G))
-        
-        if len(components) > 1:
-            logger.warning(f"Graph not fully connected. Found {len(components)} components. Adding missing bonds.")
-            
-            # Connect components by adding bonds between closest atoms by coordinate distance
-            while len(components) > 1:
-                min_distance = float('inf')
-                best_connection = None
-                
-                for i in range(len(components)):
-                    for j in range(i + 1, len(components)):
-                        comp1_nodes = list(components[i])
-                        comp2_nodes = list(components[j])
-                        
-                        # Find closest atoms between components by 3D distance
-                        for node1 in comp1_nodes:
-                            for node2 in comp2_nodes:
-                                if node1 in atom_coords and node2 in atom_coords:
-                                    coord1 = atom_coords[node1]
-                                    coord2 = atom_coords[node2]
-                                    distance = np.sqrt(sum((c1 - c2)**2 for c1, c2 in zip(coord1, coord2)))
-                                    if distance < min_distance:
-                                        min_distance = distance
-                                        best_connection = (node1, node2)
-                
-                if best_connection:
-                    node1, node2 = best_connection
-                    bonded_atoms.append((node1, node2))
-                    logger.info(f"Added missing bond: {node1} - {node2} (distance: {min_distance:.3f})")
-                    
-                    # Update the graph with the new bond and recalculate components
-                    G.add_edge(node1, node2)
-                    components = list(nx.connected_components(G))
-                else:
-                    logger.warning("Could not find atoms with coordinates to connect components")
-                    break
+
+        # A missing C1--C2 bond does not split a pyranose residue: the remaining
+        # C1--O5--C5--C4--C3--C2 path still forms one connected component. That
+        # allowed malformed MOL2 topologies (for example 4YB residue 6 in
+        # G45661AN) to pass the older disconnected-component repair unchanged.
+        # Restore only the chemically unambiguous ring closure for residues that
+        # explicitly contain C1, C2, and O5.
+        residue_atoms = {}
+        for atom_id, (atom_name, residue_id, residue_name) in atom_residues.items():
+            residue_atoms.setdefault((residue_id, residue_name), {})[atom_name] = atom_id
+
+        known_bonds = {tuple(sorted((a, b))) for a, b in bonded_atoms}
+        for (residue_id, residue_name), names in residue_atoms.items():
+            if not {"C1", "C2", "O5"}.issubset(names):
+                continue
+            ring_closure = tuple(sorted((names["C1"], names["C2"])))
+            if ring_closure not in known_bonds:
+                bonded_atoms.append(ring_closure)
+                known_bonds.add(ring_closure)
+                logger.warning(
+                    "Added missing pyranose ring-closure bond %s-%s for residue %s %s",
+                    ring_closure[0], ring_closure[1], residue_name, residue_id,
+                )
 
         return bonded_atoms
     except Exception as e:

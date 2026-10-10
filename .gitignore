@@ -7,6 +7,14 @@ tests/
 !tests/
 tests/*
 !tests/test_glymeta_glytoucan_repair.py
+!tests/test_alignment_transform.py
+!tests/verify_alignment.py
+!tests/test_pdb_conversion_and_connectivity.py
+!tests/test_snfg_renderer.py
+!tests/test_torsion_classification.py
+!tests/test_name_utils_crabwurcs.py
+!tests/test_static_parallelism.py
+!tests/test_glystatic_output_safety.py
 env/
 dummy_database_process/
 dummy_database_static/
@@ -39,3 +47,6 @@ static/
 GLYCOSHAPE_RDF/
 *.log
 .java/
+.cargo/
+.rustup/
+.crabwurcs/

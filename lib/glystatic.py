@@ -2,7 +2,10 @@
 
 import json
 import shutil
+import subprocess
+import tempfile
 import pandas as pd
+from io import BytesIO
 from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import Descriptors
@@ -26,6 +29,92 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 
+def _render_snfg_svg(glycam_name: str, iupac: str, destination: Path) -> str:
+    """Render an SNFG SVG with the configured backend and return its name."""
+    destination = Path(destination)
+
+    if config.snfg_renderer == "glycodraw":
+        GlycoDraw(iupac, filepath=str(destination), show_linkage=True)
+        renderer = "GlycoDraw"
+    else:
+        command = [
+            config.crabwurcs_executable,
+            "render",
+            "--from",
+            "glycam",
+            "--output",
+            str(destination),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                input=glycam_name,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"crabWURCS executable not found: {config.crabwurcs_executable!r}. "
+                "Install crabwurcs-cli or set GLYCOSHAPE_CRABWURCS_BIN."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("crabWURCS SNFG rendering timed out after 60 seconds") from exc
+
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+            raise RuntimeError(f"crabWURCS SNFG rendering failed: {detail}")
+        renderer = "crabWURCS"
+
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError(f"{renderer} did not produce an SVG file")
+    if "<svg" not in destination.read_text(encoding="utf-8", errors="ignore"):
+        raise RuntimeError(f"{renderer} output is not an SVG document")
+
+    return renderer
+
+
+def _apply_glytoucan_fallbacks(
+    glytoucan: str | None,
+    glytoucan_alpha: str | None,
+    glytoucan_beta: str | None,
+    inventory_glytoucan: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Apply only the inventory fallback for the archetype accession.
+
+    Alpha and beta are distinct structures with distinct WURCS strings.  An
+    unresolved variant must remain unresolved rather than inheriting the
+    archetype accession.
+    """
+    if not glytoucan and inventory_glytoucan:
+        glytoucan = inventory_glytoucan
+    return glytoucan, glytoucan_alpha, glytoucan_beta
+
+
+def _copy_or_convert_analysis_table(storage, folder_path: str, output_subdir: str, csv_name: str, parquet_name: str) -> bool:
+    """Write a static CSV from a Parquet process export, falling back to legacy CSV copy."""
+    parquet_src = f"{folder_path}/embedding/exports/{parquet_name}"
+    csv_src = f"{folder_path}/output/{csv_name}"
+    csv_dst = f"{output_subdir}/{csv_name}"
+
+    if storage.exists(parquet_src):
+        try:
+            df = pd.read_parquet(BytesIO(storage.read_binary(parquet_src)))
+            storage.write_text(csv_dst, df.to_csv(index=False))
+            logger.info(f"Converted Parquet export to static CSV: {parquet_name} -> {csv_name}")
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to convert {parquet_src} to {csv_name}: {exc}")
+
+    if storage.exists(csv_src):
+        content = storage.read_binary(csv_src)
+        storage.write_binary(csv_dst, content)
+        return True
+
+    return False
+
+
 def get_glycan_metadata(glycam_name: str) -> dict:
     """Get glycan metadata, trying PocketBase first then falling back to CSV.
 
@@ -37,12 +126,25 @@ def get_glycan_metadata(glycam_name: str) -> dict:
     """
     if config.use_pocketbase:
         try:
-            from lib.pocketbase import get_pocketbase_client, extract_inventory_metadata
+            from lib.pocketbase import GLYCAN_COLLECTION, get_pocketbase_client, extract_inventory_metadata
             client = get_pocketbase_client()
             if client.is_available():
                 record = client.get_record_by_glycam_name(glycam_name)
                 if record is not None:
                     metadata = extract_inventory_metadata(record)
+                    glycan_record = client.get_record_by_glycam_name(
+                        glycam_name,
+                        collection=GLYCAN_COLLECTION,
+                    )
+                    if glycan_record is None and metadata.get("ID"):
+                        glycan_record = client.get_record_by_glycoshape_id(
+                            metadata["ID"],
+                            collection=GLYCAN_COLLECTION,
+                        )
+                    if not metadata.get("ID") and glycan_record:
+                        metadata["ID"] = glycan_record.get("glycoshape_id", "")
+                    if not metadata.get("glytoucan_id") and glycan_record:
+                        metadata["glytoucan_id"] = glycan_record.get("glytoucan_id", "")
                     logger.info(f"Found metadata for {glycam_name} from PocketBase: ID={metadata['ID']}")
                     return metadata
                 else:
@@ -58,6 +160,72 @@ def get_glycan_metadata(glycam_name: str) -> dict:
 def get_glycan_metadata_from_inventory(glycam_name: str) -> dict:
     """Backward-compatible wrapper for submission metadata lookup."""
     return get_glycan_metadata(glycam_name)
+
+
+def _safe_simulation_length_ns(value) -> float | None:
+    """Normalize an explicit nanosecond duration from source metadata."""
+    if value is None or value == "":
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _source_simulation_length_ns(glycam_name: str, storage) -> float | None:
+    """Read an uploaded source duration expressed in nanoseconds.
+
+    Manual upload ``info.json`` files use the camel-case ``simulationLength``
+    field.  The explicit snake-case spelling is also accepted for newer
+    source metadata.  Missing or malformed source metadata is intentionally
+    ignored so legacy CSV/PocketBase μs values continue to work.
+    """
+    if storage is None:
+        return None
+
+    source_info_path = Path(config.data_dir) / glycam_name / "info.json"
+    try:
+        if not storage.exists(source_info_path):
+            return None
+        with storage.open(source_info_path, "r") as handle:
+            source_info = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.debug("Could not read source simulation metadata for %s: %s", glycam_name, exc)
+        return None
+
+    if not isinstance(source_info, dict):
+        return None
+    for key in ("simulation_length_ns", "simulationLength"):
+        length_ns = _safe_simulation_length_ns(source_info.get(key))
+        if length_ns is not None:
+            return length_ns
+    return None
+
+
+def _simulation_length_us(metadata: dict, glycam_name: str, storage) -> float | None:
+    """Resolve the export duration in μs from explicit ns or legacy μs data."""
+    # Source metadata is authoritative.  This keeps the export independent of
+    # mutable submission-progress records in PocketBase.
+    length_ns = _source_simulation_length_ns(glycam_name, storage)
+    if length_ns is None:
+        length_ns = _safe_simulation_length_ns(metadata.get("simulation_length_ns"))
+    if length_ns is not None:
+        length_us = length_ns / 1000.0
+        logger.info(
+            "Using explicit simulation duration for %s: %.6g ns -> %.6g μs",
+            glycam_name,
+            length_ns,
+            length_us,
+        )
+        return length_us
+
+    # Existing inventory rows are already stored in μs.  Preserve that
+    # contract until their source metadata is migrated to an explicit ns
+    # field.
+    return metadata.get("length")
 
 
 def _get_metadata_from_csv(glycam_name: str) -> dict:
@@ -354,7 +522,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
     try:
         metadata = get_glycan_metadata(glycam_name)
         ID = metadata["ID"]
-        length = metadata["length"]
+        length = _simulation_length_us(metadata, glycam_name, storage)
         package = metadata["package"]
         forcefield = metadata["forcefield"]
         temperature = metadata["temperature"]
@@ -363,15 +531,32 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         comments = metadata["comments"]
         inventory_glytoucan = metadata["glytoucan_id"]
     except Exception as e:
-        logger.warning(f"Failed to get metadata from inventory: {e}")
-        logger.info("Using fallback ID generation")
-        ID = generate_glycan_id(glycam_name)
-        length = package = forcefield = temperature = pressure = salt = comments = inventory_glytoucan = None
-    
+        # A GlycoShape ID is assigned by the submissions inventory/PocketBase.
+        # Never manufacture one from a name: it looks legitimate (GSxxxxxx)
+        # but cannot be reconciled with PocketBase or the public database.
+        raise ValueError(
+            f"No registered GlycoShape submission metadata for '{glycam_name}'. "
+            "Create its PocketBase submission entry with an assigned GS00xxx ID, "
+            "then rerun the static stage."
+        ) from e
+
+    ID = str(ID or "").strip()
+    if not re.fullmatch(r"GS\d+", ID):
+        raise ValueError(
+            f"Invalid or missing GlycoShape ID {ID!r} for '{glycam_name}'. "
+            "Refusing to write static output because the destination must be a "
+            "registered static/GSxxxxx child directory."
+        )
+
     logger.info(f"Using ID: {ID}")
-    
+
     # Create output directory
-    final_output_dir = f"{output_dir}/{ID}"
+    final_output_path = output_dir / ID
+    if final_output_path.parent.resolve() != output_dir.resolve():
+        raise ValueError(
+            f"Unsafe static output destination for '{glycam_name}': {final_output_path}"
+        )
+    final_output_dir = str(final_output_path)
     # Remove existing directory if it exists (for both local and Oracle)
     if storage.exists(final_output_dir):
         if hasattr(storage, '_local_backend') and storage._local_backend.exists(final_output_dir):
@@ -389,29 +574,24 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         logger.warning(f"Could not canonicalize {glycam_name}; using original glycan string: {e}")
         iupac = glycam_name
     
-    # Generate SNFG diagram
+    # Generate SNFG diagram. Always render to a temporary local file so both
+    # local and Oracle storage use the same backend path.
+    temp_path = None
     try:
-        # For Oracle storage, generate to temp file first then upload
-        if hasattr(storage, '_is_oracle') and storage._is_oracle:
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False) as tmp_file:
-                temp_path = tmp_file.name
-            snfg = GlycoDraw(iupac, filepath=temp_path, show_linkage=True)
-            # Read the temp file and upload to storage
-            with open(temp_path, 'rb') as f:
-                svg_content = f.read()
-            storage.write_binary(f"{final_output_dir}/snfg.svg", svg_content)
-            # Clean up temp file
-            import os
-            os.unlink(temp_path)
-            logger.info(f"Generated SNFG diagram: {final_output_dir}/snfg.svg")
-        else:
-            # Local storage - write directly
-            snfg_svg_path = storage._local_backend._resolve_path(f"{final_output_dir}/snfg.svg")
-            snfg = GlycoDraw(iupac, filepath=str(snfg_svg_path), show_linkage=True)
-            logger.info(f"Generated SNFG diagram: {snfg_svg_path}")
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_file:
+            temp_path = Path(tmp_file.name)
+        renderer = _render_snfg_svg(glycam_name, iupac, temp_path)
+        storage.write_binary(f"{final_output_dir}/snfg.svg", temp_path.read_bytes())
+        logger.info(
+            "Generated SNFG diagram with %s: %s/snfg.svg",
+            renderer,
+            final_output_dir,
+        )
     except Exception as e:
         logger.warning(f"Could not generate SNFG diagram: {e}")
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
     
     # Process glycan chemical data
     try:
@@ -470,21 +650,46 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         except Exception as e:
             logger.warning(f"Could not retrieve WURCS/GlyTouCan for {iupac}: {e}")
             glytoucan, wurcs = None, None
-        try:
-            glytoucan_alpha, wurcs_alpha = name_utils.iupac2wurcs_glytoucan(iupac_alpha)
-        except Exception as e:
-            logger.warning(f"Could not retrieve alpha WURCS/GlyTouCan for {iupac_alpha}: {e}")
-            glytoucan_alpha, wurcs_alpha = None, None
-        try:
-            glytoucan_beta, wurcs_beta = name_utils.iupac2wurcs_glytoucan(iupac_beta)
-        except Exception as e:
-            logger.warning(f"Could not retrieve beta WURCS/GlyTouCan for {iupac_beta}: {e}")
-            glytoucan_beta, wurcs_beta = None, None
+        # Generate reducing-end variants from the complete GLYCAM strings.
+        # Unlike the legacy open-ended IUPAC spellings, these preserve the
+        # alpha/beta anomer and reducing-residue modifications in crabWURCS
+        # 0.2.2 (particularly for sulfated GAGs).
+        wurcs_alpha = name_utils.crabwurcs_convert(glycam_alpha, "glycam", "wurcs")
+        if wurcs_alpha:
+            glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha)
+        else:
+            try:
+                glytoucan_alpha, wurcs_alpha = name_utils.iupac2wurcs_glytoucan(iupac_alpha)
+            except Exception as e:
+                logger.warning(f"Could not retrieve alpha WURCS/GlyTouCan for {iupac_alpha}: {e}")
+                glytoucan_alpha, wurcs_alpha = None, None
 
-        # If wurcs is None, try to get it from Mol2WURCS using smiles
+        wurcs_beta = name_utils.crabwurcs_convert(glycam_beta, "glycam", "wurcs")
+        if wurcs_beta:
+            glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta)
+        else:
+            try:
+                glytoucan_beta, wurcs_beta = name_utils.iupac2wurcs_glytoucan(iupac_beta)
+            except Exception as e:
+                logger.warning(f"Could not retrieve beta WURCS/GlyTouCan for {iupac_beta}: {e}")
+                glytoucan_beta, wurcs_beta = None, None
+
+        # If GlyCosmos could not convert the name, use crabWURCS locally before
+        # falling back to the older SMILES/MolWURCS route.
+        if wurcs is None:
+            wurcs = name_utils.crabwurcs_convert(iupac, "iupac-condensed", "wurcs")
+            if wurcs:
+                logger.info("Recovered WURCS locally with crabWURCS")
+                variants = name_utils.get_wurcs_variants(wurcs)
+                if variants:
+                    wurcs, wurcs_alpha, wurcs_beta = variants
+                glytoucan = name_utils.wurcs2glytoucan(wurcs)
+                glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha) if wurcs_alpha else None
+                glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta) if wurcs_beta else None
+
         if wurcs is None and smiles:
             try:
-                logger.info("WURCS is None, trying to get it from Mol2WURCS")
+                logger.info("WURCS is None after crabWURCS, trying MolWURCS")
                 wurcs = name_utils.smiles2wurcs(smiles)
                 variants = name_utils.get_wurcs_variants(wurcs)
                 if variants:
@@ -499,12 +704,12 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
                 wurcs = wurcs_alpha = wurcs_beta = None
                 glytoucan = glytoucan_alpha = glytoucan_beta = None
 
-        if not glytoucan and inventory_glytoucan:
-            glytoucan = inventory_glytoucan
-        if not glytoucan_alpha and glytoucan:
-            glytoucan_alpha = glytoucan
-        if not glytoucan_beta and glytoucan:
-            glytoucan_beta = glytoucan
+        glytoucan, glytoucan_alpha, glytoucan_beta = _apply_glytoucan_fallbacks(
+            glytoucan,
+            glytoucan_alpha,
+            glytoucan_beta,
+            inventory_glytoucan,
+        )
 
         # Get motifs
         try: 
@@ -681,23 +886,43 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
         output_subdir = f"{final_output_dir}/output"
         storage.mkdir(output_subdir)
         
-        analysis_files = ["pca.csv", "torsion_glycosidic.csv", "torsion_all.csv", "torparts.npz", "info.json"]
-        analysis_files.extend([f"torsion_{level_key}_reps.csv" for level_key in cluster_levels.keys()])
+        table_exports = {
+            "pca.csv": "pca.parquet",
+            "torsion_glycosidic.csv": "torsion_glycosidic.parquet",
+            "torsion_all.csv": "torsion_all.parquet",
+        }
+        for level_key in cluster_levels.keys():
+            table_exports[f"torsion_{level_key}_reps.csv"] = f"torsion_{level_key}_reps.parquet"
 
-        for file_name in analysis_files:
+        for csv_name, parquet_name in table_exports.items():
+            _copy_or_convert_analysis_table(storage, folder_path, output_subdir, csv_name, parquet_name)
+
+        for file_name in ("torparts.npz", "info.json"):
             src_file = f"{folder_path}/output/{file_name}"
             if storage.exists(src_file):
                 # Use storage abstraction to copy files
                 content = storage.read_binary(src_file)
                 storage.write_binary(f"{output_subdir}/{file_name}", content)
         
+        # Copy frozen PCA landscape data (ROH-excluded, anomer-independent)
+        landscape_src_dir = f"{folder_path}/embedding/landscape"
+        if storage.exists(landscape_src_dir):
+            landscape_dst_dir = f"{final_output_dir}/landscape"
+            storage.mkdir(landscape_dst_dir)
+            for landscape_file in ("pca_model.joblib", "landscape_metadata.json", "preprocessing.npz"):
+                src_file = f"{landscape_src_dir}/{landscape_file}"
+                if storage.exists(src_file):
+                    content = storage.read_binary(src_file)
+                    storage.write_binary(f"{landscape_dst_dir}/{landscape_file}", content)
+                    logger.info(f"Copied landscape file: {landscape_file}")
+
         logger.info(f"Successfully processed {glycam_name} -> {final_output_dir}")
         return {
             "glycoshape_id": ID,
             "final_output_dir": str(final_output_dir),
             "local_output_dir": str(final_output_dir),
         }
-        
+
     except Exception as e:
         logger.error(f"Failed to process glycan data for {glycam_name}: {e}")
         raise

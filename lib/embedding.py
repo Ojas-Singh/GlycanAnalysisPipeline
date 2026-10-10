@@ -899,42 +899,62 @@ def create_cluster_info_fast(
         else:
             start_time = time.time() if enable_profiling_local else None
             try:
-                # Tuned GridSearchCV: Smaller grid/folds for speed, especially small clusters
-                if size < 10:
-                    cv_folds = 2  # Minimal CV for tiny clusters
-                    bandwidth_grid = np.linspace(0.1, 1.0, 5)  # Tiny grid: fast, still accurate
-                elif size < 20:
-                    cv_folds = 3
-                    bandwidth_grid = np.linspace(0.1, 1.0, 10)
+                # KDE bandwidth selection scales poorly with very large clusters
+                # (and GridSearchCV repeats that cost for every candidate). Fit
+                # on a deterministic, evenly distributed sample, then choose the
+                # closest representative from the complete cluster below.
+                max_kde_samples = 5000
+                if size > max_kde_samples:
+                    sample_positions = np.linspace(0, size - 1, max_kde_samples, dtype=int)
+                    kde_fit_data = cluster_data_scaled[sample_positions]
+                    logger.info(
+                        "KDE representative for cluster %s: sampling %s/%s frames",
+                        new_cluster_id,
+                        len(kde_fit_data),
+                        size,
+                    )
+                    # Grid-search cross-validation is quadratic in the number
+                    # of sampled frames. Avoid it for oversized trajectories.
+                    bandwidth = 0.5
+                    grid_time = 0.0
                 else:
-                    cv_folds = min(5, size // 5)  # Adaptive: fewer folds for medium
-                    bandwidth_grid = np.linspace(0.1, 1.0, 20)  # Reduced from 30
+                    # Tuned GridSearchCV for normal-sized clusters.
+                    kde_fit_data = cluster_data_scaled
+                    if size < 10:
+                        cv_folds = 2
+                        bandwidth_grid = np.linspace(0.1, 1.0, 5)
+                    elif size < 20:
+                        cv_folds = 3
+                        bandwidth_grid = np.linspace(0.1, 1.0, 10)
+                    else:
+                        cv_folds = min(5, size // 5)
+                        bandwidth_grid = np.linspace(0.1, 1.0, 20)
 
-                grid_start = time.time() if enable_profiling_local else None
-                grid = GridSearchCV(
-                    KernelDensity(kernel='gaussian'),
-                    {'bandwidth': bandwidth_grid},
-                    cv=cv_folds,
-                    n_jobs=1  # Sequential CV per cluster to avoid nested parallelism overhead on low cores
-                )
-                grid.fit(cluster_data_scaled)
-                bandwidth = float(grid.best_params_['bandwidth'])
-                grid_time = time.time() - grid_start if enable_profiling_local else 0
+                    grid_start = time.time() if enable_profiling_local else None
+                    grid = GridSearchCV(
+                        KernelDensity(kernel='gaussian'),
+                        {'bandwidth': bandwidth_grid},
+                        cv=cv_folds,
+                        n_jobs=1,
+                    )
+                    grid.fit(kde_fit_data)
+                    bandwidth = float(grid.best_params_['bandwidth'])
+                    grid_time = time.time() - grid_start if enable_profiling_local else 0
 
                 # Fit KDE (fast)
                 kde_start = time.time() if enable_profiling_local else None
-                kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(cluster_data_scaled)
+                kde_model = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(kde_fit_data)
                 kde_time = time.time() - kde_start if enable_profiling_local else 0
 
                 # Optimized minimize: Better start, fewer iters, pre-compute bounds globally if possible
-                d = cluster_data_scaled.shape[1]
-                bounds = [(float(np.min(cluster_data_scaled[:, dim])), float(np.max(cluster_data_scaled[:, dim])))
+                d = kde_fit_data.shape[1]
+                bounds = [(float(np.min(kde_fit_data[:, dim])), float(np.max(kde_fit_data[:, dim])))
                           for dim in range(d)]  # Per-cluster bounds (fast)
 
                 opt_start = time.time() if enable_profiling_local else None
                 result = minimize(
                     lambda x: -kde_model.score_samples([x])[0],
-                    np.mean(cluster_data_scaled, axis=0),  # Centroid start: converges faster
+                    np.mean(kde_fit_data, axis=0),  # Centroid start: converges faster
                     bounds=bounds,
                     method='L-BFGS-B',
                     options={'maxiter': 50, 'ftol': 1e-6}  # Reduced iters/tol for speed
