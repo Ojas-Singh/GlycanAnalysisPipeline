@@ -74,6 +74,8 @@ XTC_PRECISION = 10000
 XTC_EXACT_LIMIT_ANGSTROM = 5120.0
 
 OBJECT_KEY_ROOT = "raw"
+#: ``source.glycam_name_from`` of an entry whose name was given by the names file of the converter.
+NAMES_FILE_ORIGIN = "names-file"
 MAX_OBJECT_KEY_BYTES = 1024
 MAX_FOLDER_NAME_BYTES = 255
 SHORT_FOLDER_PREFIX_BYTES = 200
@@ -204,13 +206,18 @@ def _sequence_from_json(path: Path) -> str:
     return name
 
 
-def resolve_glycam_name(source_dir: PathLike) -> Tuple[str, str, List[str]]:
+def resolve_glycam_name(source_dir: PathLike, override: Optional[str] = None) -> Tuple[str, str, List[str]]:
     """GLYCAM name of a source folder: ``(name, origin, warnings)``.
 
     ``name.json`` is authoritative when present (as in the processing step).
     A folder named by a GlyTouCan accession takes the name from ``info.json``.
     Every other folder is named by its GLYCAM name.  ``origin`` is
     ``"name.json"``, ``"info.json"`` or ``"folder"``.
+
+    ``override`` is a name given from outside (the ``--names`` file of the
+    converter).  It takes precedence over all three, ``origin`` is then
+    ``"names-file"``, and a different name in ``name.json`` or ``info.json``
+    is reported as a warning.
     """
     source_dir = Path(source_dir)
     folder = source_dir.name
@@ -226,7 +233,19 @@ def resolve_glycam_name(source_dir: PathLike) -> Tuple[str, str, List[str]]:
         except (OSError, ValueError) as exc:
             info_error = f"{INFO_FILE} gives no GLYCAM name ({exc})"
 
-    if name_path.is_file():
+    if override is not None:
+        name, origin = override, NAMES_FILE_ORIGIN
+        if name_path.is_file():
+            try:
+                json_name = _sequence_from_json(name_path)
+            except (OSError, ValueError) as exc:
+                warnings.append(f"{NAME_FILE} gives no GLYCAM name ({exc})")
+            else:
+                if json_name != name:
+                    warnings.append(
+                        f"{NAME_FILE} indexOrderedSequence differs from the GLYCAM name taken from {origin}: {json_name}"
+                    )
+    elif name_path.is_file():
         try:
             name = _sequence_from_json(name_path)
         except (OSError, ValueError) as exc:
@@ -1379,6 +1398,7 @@ def verify_entry(
     source_dir: Optional[PathLike] = None,
     deep: bool = True,
     check_frames: int = DEFAULT_CHECK_FRAMES,
+    name_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Verify an archive entry; returns ``{"ok": bool, "errors": [...], ...}``.
 
@@ -1388,6 +1408,12 @@ def verify_entry(
     coordinates hash to the recorded digest.  With ``source_dir``: the source
     ``simulation.pdb`` has the recorded size and SHA-256 and every one of its
     coordinates equals the archive.
+
+    ``name_override`` is the name the names file gives this source folder, as
+    in :func:`convert_entry`.  The name of an entry that was converted with
+    such a name cannot be confirmed from the source folder alone: without
+    ``name_override`` it is not compared and the report says so
+    (``glycam_name_checked`` is false).
     """
     entry_dir = Path(entry_dir)
     report: Dict[str, Any] = {"ok": False, "errors": [], "entry": str(entry_dir)}
@@ -1430,9 +1456,12 @@ def verify_entry(
     if source_dir is not None:
         try:
             inputs = source_inputs(source_dir)
-            source_name = resolve_glycam_name(source_dir)[0]
-            if source_name != manifest["glycam_name"]:
-                errors.append(f"the source folder has GLYCAM name {source_name}, the manifest says {manifest['glycam_name']}")
+            named_by_file = (manifest.get("source") or {}).get("glycam_name_from") == NAMES_FILE_ORIGIN
+            report["glycam_name_checked"] = name_override is not None or not named_by_file
+            if report["glycam_name_checked"]:
+                source_name = resolve_glycam_name(source_dir, name_override)[0]
+                if source_name != manifest["glycam_name"]:
+                    errors.append(f"the source folder has GLYCAM name {source_name}, the manifest says {manifest['glycam_name']}")
             detail = _compare_stream(inputs["pdb"], entry_dir)
             source: PdbTrajectory = detail["source"]
             recorded = manifest["source"]
@@ -1525,6 +1554,7 @@ def convert_entry(
     check_frames: int = DEFAULT_CHECK_FRAMES,
     block_bytes: int = DEFAULT_BLOCK_BYTES,
     batch_bytes: int = DEFAULT_BATCH_BYTES,
+    name_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Convert one source folder into an archive entry under ``archive_dir``.
 
@@ -1534,6 +1564,10 @@ def convert_entry(
     whose manifest verifies and describes this source is left alone
     (``status`` is ``"skipped"``) unless ``force`` is set.
 
+    ``name_override`` names the entry instead of ``name.json``, ``info.json``
+    or the folder (:func:`resolve_glycam_name`); the manifest then records
+    ``"names-file"`` as the source of the name.
+
     Returns ``{"status", "manifest", "entry", "timing"}``; raises an
     :class:`ArchiveError` with the reason when the source cannot be archived.
     """
@@ -1542,7 +1576,7 @@ def convert_entry(
     source_dir = Path(source_dir)
     archive_dir = Path(archive_dir)
     inputs = source_inputs(source_dir)
-    glycam_name, origin, warnings = resolve_glycam_name(source_dir)
+    glycam_name, origin, warnings = resolve_glycam_name(source_dir, name_override)
     folder = entry_folder_name(glycam_name)
     final = archive_dir / folder
 

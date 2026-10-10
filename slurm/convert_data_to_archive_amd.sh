@@ -46,6 +46,7 @@ else
 fi
 FORCE="${FORCE:-0}"                      # 1: convert again even when an entry verifies
 GLYCAN_FILE="${GLYCAN_FILE:-}"           # optional file with source folder names, one per line
+NAMES_FILE="${NAMES_FILE:-}"             # optional JSON object, source folder name -> GLYCAM name (--names)
 
 if ! [[ "${WORKERS}" =~ ^[1-9][0-9]*$ ]] || (( WORKERS > CPUS )); then
     echo "WORKERS must be a positive integer no larger than allocated CPUs (${CPUS})." >&2
@@ -82,6 +83,9 @@ elif [[ "${FORCE}" == "1" ]]; then
 fi
 if [[ -n "${GLYCAN_FILE}" ]]; then
     args+=(--glycan-file "${GLYCAN_FILE}")
+fi
+if [[ -n "${NAMES_FILE}" ]]; then
+    args+=(--names "${NAMES_FILE}")
 fi
 
 echo "----------------------------------------------------------------"

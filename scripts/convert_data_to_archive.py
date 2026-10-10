@@ -18,6 +18,13 @@ Written at the end, in the archive directory:
 Run one conversion per archive directory at a time.  ``--verify-only``
 re-checks existing entries instead (against the source when ``--data-dir`` is
 given) and writes ``verification_report.json``.
+
+``--names FILE`` names source folders from outside: a JSON object of source
+folder name to GLYCAM name.  It takes precedence over ``name.json``,
+``info.json`` and the folder name, and the manifest records ``names-file`` as
+the source of the name.  An entry that the same source folder was given under
+another name before stays where it is and is reported;
+``--remove-superseded`` deletes it once the new entry is in place.
 """
 from __future__ import annotations
 
@@ -59,7 +66,9 @@ def _peak_rss_mb() -> float:
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
 
 
-def _convert_one(source_dir: str, archive_dir: str, options: Dict[str, Any]) -> Dict[str, Any]:
+def _convert_one(
+    source_dir: str, archive_dir: str, options: Dict[str, Any], name_override: Optional[str] = None
+) -> Dict[str, Any]:
     """Worker: convert one source folder and describe the outcome."""
     row: Dict[str, Any] = {"source_folder": Path(source_dir).name, "status": "failed"}
     try:
@@ -69,6 +78,7 @@ def _convert_one(source_dir: str, archive_dir: str, options: Dict[str, Any]) -> 
             force=options["force"],
             check_frames=options["check_frames"],
             block_bytes=options["block_bytes"],
+            name_override=name_override,
         )
         manifest = result["manifest"]
         archive_size = sum(item["size"] for item in manifest["files"].values())
@@ -76,6 +86,7 @@ def _convert_one(source_dir: str, archive_dir: str, options: Dict[str, Any]) -> 
         row.update(
             status=result["status"],
             glycam_name=manifest["glycam_name"],
+            glycam_name_from=manifest["source"]["glycam_name_from"],
             folder=manifest["folder"],
             atoms=manifest["atoms"],
             frames=manifest["frames"],
@@ -107,11 +118,14 @@ def _convert_one(source_dir: str, archive_dir: str, options: Dict[str, Any]) -> 
     return row
 
 
-def _verify_one(entry_dir: str, source_dir: Optional[str], check_frames: int) -> Dict[str, Any]:
+def _verify_one(
+    entry_dir: str, source_dir: Optional[str], check_frames: int, name_override: Optional[str] = None
+) -> Dict[str, Any]:
     """Worker: verify one existing entry, against its source when given."""
     started = time.perf_counter()
     try:
-        report = archive.verify_entry(entry_dir, source_dir, deep=True, check_frames=check_frames)
+        report = archive.verify_entry(
+            entry_dir, source_dir, deep=True, check_frames=check_frames, name_override=name_override)
     except Exception as exc:
         report = {"ok": False, "errors": [f"{type(exc).__name__}: {exc}"], "entry": entry_dir}
     report["folder"] = Path(entry_dir).name
@@ -128,9 +142,51 @@ def _read_names(path: Path) -> List[str]:
     ]
 
 
-def _plan(data_dir: Path, requested: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _load_names(path: Optional[Path]) -> Dict[str, str]:
+    """The ``--names`` file: a JSON object of source folder name to GLYCAM name."""
+    if path is None:
+        return {}
+    try:
+        names = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"--names {path}: {exc}")
+    if not isinstance(names, dict) or not all(
+        isinstance(folder, str) and folder and isinstance(name, str) and name for folder, name in names.items()
+    ):
+        raise SystemExit(f"--names {path}: expected a JSON object of source folder name to GLYCAM name")
+    return names
+
+
+def _superseded(archive_dir: Path, rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Entries left under another name by source folders that the names file named in this run."""
+    renamed = {
+        row["source_folder"]: row["glycam_name"]
+        for row in rows
+        if row["status"] in ("converted", "skipped") and row.get("glycam_name_from") == archive.NAMES_FILE_ORIGIN
+    }
+    found: List[Dict[str, str]] = []
+    if not renamed:
+        return found
+    for entry_dir in archive.iter_entry_dirs(archive_dir):
+        try:
+            manifest = archive.load_manifest(entry_dir)
+            source_folder, glycam_name = manifest["source"]["folder"], manifest["glycam_name"]
+        except (archive.ArchiveError, KeyError, TypeError):
+            continue
+        if source_folder in renamed and glycam_name != renamed[source_folder]:
+            found.append({"source_folder": source_folder, "folder": entry_dir.name, "glycam_name": glycam_name})
+    return found
+
+
+def _plan(
+    data_dir: Path, requested: List[str], names: Optional[Dict[str, str]] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Source folders to convert (largest first) and those that cannot be planned."""
+    names = names or {}
     folders = sorted(p for p in data_dir.iterdir() if p.is_dir() and not p.name.startswith("."))
+    unknown = sorted(set(names) - {p.name for p in folders})
+    if unknown:
+        raise SystemExit(f"--names lists folders that are not under {data_dir}: {', '.join(unknown)}")
     if requested:
         present = {p.name for p in folders}
         missing = sorted(set(requested) - present)
@@ -144,10 +200,11 @@ def _plan(data_dir: Path, requested: List[str]) -> Tuple[List[Dict[str, Any]], L
     for folder in folders:
         try:
             inputs = archive.source_inputs(folder)
-            glycam_name, _, _ = archive.resolve_glycam_name(folder)
+            glycam_name, _, _ = archive.resolve_glycam_name(folder, names.get(folder.name))
             task = {
                 "source_dir": str(folder),
                 "source_folder": folder.name,
+                "name_override": names.get(folder.name),
                 "glycam_name": glycam_name,
                 "folder": archive.entry_folder_name(glycam_name),
                 "size": inputs["pdb"].stat().st_size,
@@ -225,7 +282,7 @@ def _convert(args: argparse.Namespace) -> int:
     requested = list(args.glycan)
     if args.glycan_file:
         requested.extend(_read_names(args.glycan_file))
-    tasks, rows = _plan(data_dir, requested)
+    tasks, rows = _plan(data_dir, requested, _load_names(args.names))
     total = len(tasks) + len(rows)
     for done, row in enumerate(rows, start=1):
         _progress(done, total, row)
@@ -236,7 +293,7 @@ def _convert(args: argparse.Namespace) -> int:
         "block_bytes": args.block_mb << 20,
     }
     started = time.perf_counter()
-    argument_lists = [(task["source_dir"], str(archive_dir), options) for task in tasks]
+    argument_lists = [(task["source_dir"], str(archive_dir), options, task["name_override"]) for task in tasks]
     for arguments, row in _run(_convert_one, argument_lists, args.workers):
         if isinstance(row, Exception):
             row = {
@@ -250,6 +307,16 @@ def _convert(args: argparse.Namespace) -> int:
     elapsed = time.perf_counter() - started
 
     shutil.rmtree(archive_dir / archive.STAGING_DIR, ignore_errors=True)
+    superseded = _superseded(archive_dir, rows)
+    for old in superseded:
+        old["removed"] = bool(args.remove_superseded)
+        if args.remove_superseded:
+            shutil.rmtree(archive_dir / old["folder"])
+        print(
+            f"SUPERSEDED {old['source_folder']}: entry {old['folder']} holds the same source under another name; "
+            + ("removed" if args.remove_superseded else "rerun with --remove-superseded to delete it"),
+            file=sys.stderr,
+        )
     index, problems = archive.write_index(archive_dir)
 
     converted = sorted((r for r in rows if r["status"] == "converted"), key=lambda r: r["source_folder"])
@@ -262,6 +329,8 @@ def _convert(args: argparse.Namespace) -> int:
         "converter_version": archive.CONVERTER_VERSION,
         "data_dir": str(data_dir),
         "archive_dir": str(archive_dir),
+        "names_file": str(args.names.resolve()) if args.names else None,
+        "superseded": superseded,
         "workers": args.workers,
         "wall_seconds": round(elapsed, 3),
         "counts": {"converted": len(converted), "skipped": len(skipped), "failed": len(failed)},
@@ -301,6 +370,7 @@ def _verify(args: argparse.Namespace) -> int:
     requested = set(args.glycan)
     if args.glycan_file:
         requested.update(_read_names(args.glycan_file))
+    names = _load_names(args.names)
 
     argument_lists = []
     for entry_dir in archive.iter_entry_dirs(archive_dir):
@@ -313,7 +383,7 @@ def _verify(args: argparse.Namespace) -> int:
             continue
         if data_dir is not None and source_folder:
             source_dir = str(data_dir / source_folder)
-        argument_lists.append((str(entry_dir), source_dir, args.check_frames))
+        argument_lists.append((str(entry_dir), source_dir, args.check_frames, names.get(source_folder)))
 
     started = time.perf_counter()
     reports = []
@@ -351,6 +421,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=1, help="Glycans converted at the same time (default 1).")
     parser.add_argument("--glycan", action="append", default=[], help="Restrict to this source folder; repeatable.")
     parser.add_argument("--glycan-file", type=Path, help="One source folder name per line.")
+    parser.add_argument(
+        "--names",
+        type=Path,
+        help="JSON object of source folder name to GLYCAM name; takes precedence over name.json, "
+        "info.json and the folder name.",
+    )
+    parser.add_argument(
+        "--remove-superseded",
+        action="store_true",
+        help="Delete an entry that a source folder named by --names left under another GLYCAM name.",
+    )
     parser.add_argument("--force", action="store_true", help="Convert again even when the entry verifies.")
     parser.add_argument(
         "--check-frames",
