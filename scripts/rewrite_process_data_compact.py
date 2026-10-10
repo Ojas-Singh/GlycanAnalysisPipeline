@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional
 # This maintenance script is intentionally local-only. Set this before importing
 # pipeline modules, because lib.config loads .env on import using setdefault().
 os.environ["GLYCOSHAPE_ORACLE_PAR_URL"] = ""
+os.environ["GLYCOSHAPE_STORAGE"] = "local"   # the same for S3 storage
 os.environ.setdefault("GLYCOSHAPE_MAX_WORKERS", "1")
 
 import numpy as np

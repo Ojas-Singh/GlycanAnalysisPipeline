@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 # a project .env file from routing absolute local paths through Oracle storage,
 # which is unavailable from AMD nodes.
 os.environ["GLYCOSHAPE_ORACLE_PAR_URL"] = ""
+os.environ["GLYCOSHAPE_STORAGE"] = "local"   # the same for S3 storage
 
 from lib import archive, config
 from lib.frame_quality import filter_broken_frames, quality_manifest_is_current

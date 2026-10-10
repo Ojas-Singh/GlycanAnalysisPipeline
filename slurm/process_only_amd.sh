@@ -111,6 +111,7 @@ fi
 
 export REPO_ROOT DATA_DIR PROCESS_DIR LOG_DIR VENV_PYTHON WORKERS FORCE_UPDATE
 export GLYCOSHAPE_ORACLE_PAR_URL=""
+export GLYCOSHAPE_STORAGE=local
 
 # Run the chunk in parallel. Each line of CHUNK_FILE is one glycan name.
 xargs -a "${CHUNK_FILE}" -P "${NJOBS}" -I{} \

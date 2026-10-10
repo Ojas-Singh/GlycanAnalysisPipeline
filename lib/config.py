@@ -145,8 +145,29 @@ oracle_par_url = os.environ.get("GLYCOSHAPE_ORACLE_PAR_URL")
 oracle_process_prefix = os.environ.get("GLYCOSHAPE_ORACLE_PROCESS_PREFIX", "process").strip() or "process"
 oracle_output_prefix = os.environ.get("GLYCOSHAPE_ORACLE_OUTPUT_PREFIX", "static").strip() or "static"
 
+
+def selected_storage() -> str:
+    """Storage backend named by the environment: ``"s3"``, ``"oracle"`` or ``"local"``.
+
+    ``GLYCOSHAPE_STORAGE`` chooses it.  Unset (or ``auto``) keeps the previous
+    rule: Oracle when ``GLYCOSHAPE_ORACLE_PAR_URL`` is set, local otherwise.
+    The S3 settings (``GLYCOSHAPE_S3_*``) are read by ``lib.storage``.
+    """
+    raw = os.environ.get("GLYCOSHAPE_STORAGE", "").strip().lower()
+    has_par_url = bool(os.environ.get("GLYCOSHAPE_ORACLE_PAR_URL", "").strip())
+    if raw in ("", "auto"):
+        return "oracle" if has_par_url else "local"
+    if raw in ("s3", "local") or (raw == "oracle" and has_par_url):
+        return raw
+    if raw == "oracle":
+        raise ValueError("GLYCOSHAPE_STORAGE=oracle needs GLYCOSHAPE_ORACLE_PAR_URL")
+    raise ValueError(f"Invalid GLYCOSHAPE_STORAGE={raw!r}; expected s3, oracle or local")
+
+
+storage_backend = selected_storage()
+
 # Determine storage mode
-use_oracle_storage = oracle_par_url is not None and oracle_par_url.strip() != ""
+use_oracle_storage = storage_backend == "oracle"
 
 if use_oracle_storage:
     def _resolve_oracle_local_output_dir() -> str:
@@ -232,7 +253,7 @@ def get_storage_info() -> dict:
         Dictionary with storage mode and configuration info
     """
     return {
-        "storage_mode": "oracle" if use_oracle_storage else "local",
+        "storage_mode": "oracle" if use_oracle_storage else ("s3" if storage_backend == "s3" else "local"),
         "oracle_par_url": oracle_par_url if use_oracle_storage else None,
         "oracle_process_prefix": oracle_process_prefix if use_oracle_storage else None,
         "oracle_output_prefix": oracle_output_prefix if use_oracle_storage else None,
