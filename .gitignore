@@ -17,6 +17,7 @@ tests/*
 !tests/test_glystatic_output_safety.py
 !tests/test_archive.py
 !tests/test_archive_store.py
+!tests/test_process_equalities.py
 env/
 dummy_database_process/
 dummy_database_static/

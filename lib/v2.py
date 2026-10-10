@@ -55,6 +55,7 @@ from lib.embedding import (
     StandardScaler,
     gmm_optimize_silhouette,
     gmm_optimize_glycosidic_deviation,
+    silhouette_scores_shared,
     kcenter_coverage_clustering,
     create_cluster_info,
     create_cluster_info_fast,
@@ -509,6 +510,67 @@ def _build_atom_table_for_landscape(frame_data_dir: str, chosen_atoms: np.ndarra
     return atom_table
 
 
+def _run_in_threads(function, arguments: List, n_threads: int) -> None:
+    if n_threads > 1 and len(arguments) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            list(pool.map(function, arguments))
+    else:
+        for argument in arguments:
+            function(argument)
+
+
+def _column_blocks(n_rows: int, n_columns: int, block_bytes: int = 64 * 2**20) -> List[Tuple[int, int]]:
+    """Column ranges of at least two columns holding about block_bytes of float64 each.
+
+    Two columns at least: NumPy sums a single strided column pairwise, but
+    the columns of a wider block row after row, as it does for the whole
+    matrix. That order is what keeps the block results equal to X.mean(axis=0)
+    and X.std(axis=0) bit for bit.
+    """
+    width = max(2, block_bytes // (8 * max(1, n_rows)))
+    starts = list(range(0, n_columns, width))
+    blocks = [(start, min(start + width, n_columns)) for start in starts]
+    if len(blocks) > 1 and blocks[-1][1] - blocks[-1][0] < 2:
+        last = blocks.pop()
+        blocks[-1] = (blocks[-1][0], last[1])
+    return blocks
+
+
+def _column_mean(X: np.ndarray, n_threads: int = 1) -> np.ndarray:
+    """X.mean(axis=0), computed block of columns by block of columns, in threads."""
+    out = np.empty(X.shape[1], dtype=np.float64)
+
+    def block_mean(block: Tuple[int, int]) -> None:
+        out[block[0]:block[1]] = X[:, block[0]:block[1]].mean(axis=0)
+
+    _run_in_threads(block_mean, _column_blocks(*X.shape), n_threads)
+    return out
+
+
+def _column_std(X: np.ndarray, n_threads: int = 1) -> np.ndarray:
+    """X.std(axis=0, ddof=1) without the temporary of the size of X that np.std makes."""
+    out = np.empty(X.shape[1], dtype=np.float64)
+
+    def block_std(block: Tuple[int, int]) -> None:
+        out[block[0]:block[1]] = X[:, block[0]:block[1]].std(axis=0, ddof=1)
+
+    _run_in_threads(block_std, _column_blocks(*X.shape), n_threads)
+    return out
+
+
+def _scale_rows(X: np.ndarray, operation, row: np.ndarray, n_threads: int = 1) -> None:
+    """X = operation(X, row) in place (X -= row, X /= row), blocks of rows in threads."""
+    n_rows = X.shape[0]
+    step = max(1, -(-n_rows // max(1, 4 * n_threads)))
+
+    def apply(start: int) -> None:
+        operation(X[start:start + step], row, out=X[start:start + step])
+
+    _run_in_threads(apply, list(range(0, n_rows, step)), n_threads)
+
+
 def _fit_pca_and_write_landscape(
     frame_data_dir: str,
     embedding_dir: str,
@@ -519,37 +581,62 @@ def _fit_pca_and_write_landscape(
     method: str = "noH_noROH_fast",
     sample_size: int = 300,
     seed: int = 0,
+    overwrite_landscape: bool = False,
 ) -> tuple[pl.DataFrame, List[float], List[float]]:
-    """Fit PCA once and persist both frame scores and reusable projection artifacts."""
-    X = np.asarray(landscape, dtype=float)
-    if X.ndim != 2:
+    """Fit PCA once and persist both frame scores and reusable projection artifacts.
+
+    The float64 matrix of the fit is the largest object of the pipeline
+    (frames x pairs x 8 bytes: 18.8 GB for 159,940 frames and 14,706 pairs).
+    It exists once: with ``overwrite_landscape`` a float64 landscape is
+    standardised in place, the standard deviations are taken block of columns
+    by block of columns (NumPy's std otherwise allocates a second matrix), and
+    scikit-learn centres the matrix itself instead of a copy of it. The
+    arithmetic of every value is unchanged.
+    """
+    if np.ndim(landscape) != 2:
         raise ValueError("landscape must be 2D (n_frames, n_features)")
 
-    n_frames, n_pairs = X.shape
+    n_frames, n_pairs = np.shape(landscape)
     if n_frames == 0:
         return pl.DataFrame({"frame": []}), [], []
     if n_pairs == 0:
         raise ValueError("No atom pairs available for PCA landscape")
 
-    X_proc = X.copy()
+    if (
+        overwrite_landscape
+        and isinstance(landscape, np.ndarray)
+        and landscape.dtype == np.float64
+        and landscape.flags.c_contiguous
+        and landscape.flags.writeable
+    ):
+        X_proc = landscape
+    else:
+        X_proc = np.array(landscape, dtype=float, order="C")
+    del landscape
+    n_threads = max(1, int(config.max_workers))
     pair_stds = None
     if per_pair_scale:
-        pair_stds = X_proc.std(axis=0, ddof=1)
+        pair_stds = _column_std(X_proc, n_threads)
         pair_stds = np.nan_to_num(pair_stds, nan=1.0, posinf=1.0, neginf=1.0)
         pair_stds[pair_stds == 0] = 1.0
-        X_proc = X_proc / pair_stds[np.newaxis, :]
+        _scale_rows(X_proc, np.divide, pair_stds, n_threads)
 
-    feature_means = X_proc.mean(axis=0)
-    X_proc -= feature_means
-    feature_stds = X_proc.std(axis=0, ddof=1)
+    feature_means = _column_mean(X_proc, n_threads)
+    _scale_rows(X_proc, np.subtract, feature_means, n_threads)
+    feature_stds = _column_std(X_proc, n_threads)
     feature_stds = np.nan_to_num(feature_stds, nan=1.0, posinf=1.0, neginf=1.0)
     feature_stds[feature_stds == 0] = 1.0
-    X_proc /= feature_stds
+    _scale_rows(X_proc, np.divide, feature_stds, n_threads)
 
     n_components = min(10, n_frames, n_pairs)
     from sklearn.decomposition import PCA as _SkPCA
     pca = _SkPCA(n_components=n_components, svd_solver="auto")
+    # copy=False only makes the fit centre X_proc itself rather than a copy;
+    # X_proc is not used afterwards. The stored model keeps the default.
+    pca.copy = False
     scores = pca.fit_transform(X_proc)
+    pca.copy = True
+    del X_proc
     evr_arr = np.nan_to_num(pca.explained_variance_ratio_, nan=0.0, posinf=0.0, neginf=0.0)
     evr = [float(x) for x in evr_arr]
     cumulative = [float(sum(evr[: i + 1])) for i in range(len(evr))]
@@ -618,12 +705,17 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
         return pca_path
 
     logger.info("Computing ROH-excluded conformation landscape (may be memory intensive)")
+    # The landscape is asked for as float64 (float32 distances, widened) and
+    # handed over to the fit, which standardises it in place: one matrix
+    # instead of the float32 one, its float64 copy and the working copy.
     landscape, chosen_atoms = get_conformation_landscape(
         frame_data_dir,
         method="noH_noROH_fast",
         sample_size=300,
         seed=0,
         return_atom_indices=True,
+        dtype=np.float64,
+        n_threads=max(1, int(config.max_workers)),
     )
     logger.info("Running PCA on conformation landscape and saving frozen projection artifacts")
     pca_df, evr_list, cumulative = _fit_pca_and_write_landscape(
@@ -635,7 +727,9 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
         method="noH_noROH_fast",
         sample_size=300,
         seed=0,
+        overwrite_landscape=True,
     )
+    del landscape
     _write_parquet(pca_df, pca_path)
     logger.info(f"Wrote PCA parquet: {pca_path}")
 
@@ -702,7 +796,6 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
 
     logger.info("Estimating conformational entropy (kNN)")
     H = float(knn_conformational_entropy(pca_df, k=5, n_components=3))
-    _ = knn_conformational_entropy(pca_df, k=5, n_components=3, return_details=True, boltzmann=True, temperature=300)  # side calculations
     logger.info(f"Entropy (nats): {H}")
 
     cluster_out_json = os.path.join(embedding_dir, "clustering_results.json")
@@ -742,21 +835,51 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
         from sklearn.mixture import GaussianMixture
         from sklearn.metrics import silhouette_score as _silhouette_score
         
+        labels_by_n: Dict[int, Optional[np.ndarray]] = {}
         for n in range(2, 9):
             try:
                 gmm = GaussianMixture(n_components=n, random_state=42)
-                labels_n = gmm.fit_predict(pca_data)
+                labels_by_n[n] = gmm.fit_predict(pca_data)
+            except Exception:
+                labels_by_n[n] = None
+
+        # The silhouette of every n needs all pairwise distances of the same
+        # points: compute them once for the seven labelings, on all workers.
+        fitted = [n for n in range(2, 9) if labels_by_n[n] is not None]
+        shared_scores: Optional[Dict[int, Optional[float]]] = None
+        try:
+            shared_scores = dict(zip(
+                fitted,
+                silhouette_scores_shared(pca_data, [labels_by_n[n] for n in fitted]),
+            ))
+        except Exception as exc:
+            logger.warning(f"Shared silhouette computation failed ({exc}); computing one labeling at a time")
+
+        for n in range(2, 9):
+            try:
+                labels_n = labels_by_n[n]
+                if labels_n is None:
+                    raise ValueError(f"GMM with {n} components was not fitted")
                 if len(np.unique(labels_n)) > 1:
-                    score = float(_silhouette_score(pca_data, labels_n))
+                    if shared_scores is not None:
+                        score = shared_scores[n]
+                        if score is None:
+                            raise ValueError("silhouette is not defined for this labeling")
+                    else:
+                        score = float(_silhouette_score(pca_data, labels_n))
                     silhouette_scores[str(n)] = score
                 else:
                     silhouette_scores[str(n)] = None
             except Exception:
                 silhouette_scores[str(n)] = None
         
-        # Fit main clustering with 5 clusters
-        gmm_main = GaussianMixture(n_components=n_main, random_state=42)
-        labels_main = gmm_main.fit_predict(pca_data)
+        # Main clustering with 5 clusters: the fit of n=5 above (same data,
+        # same random_state); fitted here only if that one failed.
+        if labels_by_n.get(n_main) is not None:
+            labels_main = labels_by_n[n_main]
+        else:
+            gmm_main = GaussianMixture(n_components=n_main, random_state=42)
+            labels_main = gmm_main.fit_predict(pca_data)
 
     except Exception as exc:
         logger.warning(f"sklearn unavailable or failed ({exc}); defaulting main clustering via single cluster")
@@ -1279,6 +1402,16 @@ def step_create_info_json(embedding_dir: str, entropy: float, force: bool = Fals
         json.dump(info, f, indent=2)
     logger.info(f"Wrote consolidated data to {info_path}")
 
+def _load_frames(coords, frame_indices: List[int]) -> Dict[int, np.ndarray]:
+    """Frames of the coordinate store by index, each chunk decompressed once."""
+    n_frames = int(coords.shape[0])
+    wanted = sorted({int(index) for index in frame_indices if 0 <= int(index) < n_frames})
+    if not wanted:
+        return {}
+    block = np.asarray(coords.oindex[wanted, :, :])
+    return {index: block[position] for position, index in enumerate(wanted)}
+
+
 def _aligned_frame_xyz_cached(
     coords,
     atoms_df: pl.DataFrame,
@@ -1457,6 +1590,18 @@ def step_save_representative_structures(
         current_anomer,
     )
     opposite_anomer = "beta" if current_anomer == "alpha" else "alpha"
+    # Read the reference frame and every representative frame in one pass:
+    # with one Zarr chunk per trajectory, each single-frame read decompresses
+    # all frames.
+    coords = _load_frames(
+        coords,
+        [0] + [
+            int(rep_idx)
+            for level in cr.levels()
+            for rep_idx in cr.representatives(level)["representative_idx"].to_list()
+            if rep_idx is not None
+        ],
+    )
     reference_xyz = np.asarray(coords[0], dtype=float).copy()
     conect_block = glypdbio._pdb_conect_block(serials, bonds, atoms, reference_xyz)
     aligned_cache: Dict[int, np.ndarray] = {0: reference_xyz.copy()}
@@ -1581,6 +1726,20 @@ def step_save_representative_structures(
     logger.info(f"Saved {total_structures} representative models across alpha/beta multi-model files in {out_dir}")
 
 
+def _plot_level(torsion_table_path: str, dist_plot_path: str, representative_frames: List[int], level: int) -> Optional[str]:
+    """Draw the distribution plot of one level; returns None, or the error as text."""
+    try:
+        plot_torsion_distribution(
+            torsion_csv_path=torsion_table_path,
+            output_path=dist_plot_path,
+            cluster_representatives=representative_frames,
+            level=level
+        )
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
 def step_plot_torsion_distributions(
     embedding_dir: str,
     out_dir: str,
@@ -1624,6 +1783,7 @@ def step_plot_torsion_distributions(
     # Process each clustering level
     plots_created = 0
     plots_skipped = 0
+    pending: List[Tuple[int, str, List[int]]] = []
     
     for level in cr.levels():
         level_dir = os.path.join(out_dir, f"level_{level}")
@@ -1666,18 +1826,29 @@ def step_plot_torsion_distributions(
             plots_created += 1
             continue
 
-        # Create distribution plot
-        try:
-            plot_torsion_distribution(
-                torsion_csv_path=torsion_table_path,
-                output_path=dist_plot_path,
-                cluster_representatives=representative_frames,
-                level=level
-            )
+        pending.append((level, dist_plot_path, representative_frames))
+
+    # Create distribution plots. The figures of the levels do not depend on
+    # each other (same distributions, other representative lines), so with
+    # more than one worker each level is drawn in its own process.
+    if len(pending) > 1 and int(config.max_workers) > 1:
+        from joblib import Parallel, delayed
+
+        errors = Parallel(n_jobs=min(len(pending), int(config.max_workers)))(
+            delayed(_plot_level)(torsion_table_path, dist_plot_path, representative_frames, level)
+            for level, dist_plot_path, representative_frames in pending
+        )
+    else:
+        errors = [
+            _plot_level(torsion_table_path, dist_plot_path, representative_frames, level)
+            for level, dist_plot_path, representative_frames in pending
+        ]
+    for (level, dist_plot_path, _), error in zip(pending, errors):
+        if error is None:
             logger.info(f"Saved torsion distribution plot: {dist_plot_path}")
             plots_created += 1
-        except Exception as exc:
-            logger.warning(f"Failed to create torsion distribution plot for level {level}: {exc}")
+        else:
+            logger.warning(f"Failed to create torsion distribution plot for level {level}: {error}")
     
     logger.info(f"Distribution plots: {plots_created} created, {plots_skipped} skipped")
 
@@ -1875,11 +2046,18 @@ def step_export_analysis_data(
             if not glycosidic_indices:
                 logger.warning("No glycosidic torsions identified for torsion_glycosidic.parquet")
 
+            # Only the rows of representative frames are looked up below.
+            representative_frames = sorted({
+                int(rep["representative_idx"])
+                for rep_rows in reps_rows_by_level.values()
+                for rep in rep_rows
+                if rep.get("representative_idx") is not None
+            })
             frame_rows = {
                 int(row["frame"]): row
                 for row in all_df.select(
                     ["frame", "source_frame", *export_names]
-                ).iter_rows(named=True)
+                ).filter(pl.col("frame").is_in(representative_frames)).iter_rows(named=True)
             }
             for level in levels_to_export:
                 reps_out_path = os.path.join(exports_dir, f"torsion_level_{level}_reps.parquet")
@@ -1977,6 +2155,10 @@ def _read_parquet_header(path: str) -> List[str]:
     if not _path_exists(path):
         return []
     try:
+        if os.path.exists(path):
+            # Column names from the footer; the table itself is not needed.
+            import pyarrow.parquet as pq  # type: ignore
+            return [str(value) for value in pq.read_schema(path).names]
         return [str(value) for value in _read_parquet_robust(path).columns]
     except Exception:
         return []

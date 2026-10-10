@@ -320,6 +320,8 @@ def get_conformation_landscape(
     seed: int = 0,
     chunk_size: int = 1000,
     return_atom_indices: bool = False,
+    dtype=np.float32,
+    n_threads: int = 1,
 ):
     """Fast conformational landscape matrix.
 
@@ -349,6 +351,10 @@ def get_conformation_landscape(
                     Reduces peak memory usage for large trajectories by processing frames in batches.
         return_atom_indices: If True, return (landscape, chosen_atom_indices) tuple instead
                     of just the landscape array.
+        dtype: dtype of the returned matrix. The distances are always computed in float32;
+                    np.float64 stores those float32 values widened, which is what a later
+                    conversion of the float32 matrix gives, without holding both matrices.
+        n_threads: number of threads that compute frame chunks (the result does not depend on it).
 
     Notes:
         - If <2 eligible atoms, returns an array of shape (n_frames, 0).
@@ -437,20 +443,30 @@ def get_conformation_landscape(
     # Precompute pair indices once (lower triangle i>j)
     i_idx, j_idx = np.tril_indices(m, k=-1)
     
-    # Chunked distance computation to reduce memory usage
-    chunk_size = min(chunk_size, n_frames)
-    dist_chunks = []
-    for start in range(0, n_frames, chunk_size):
+    # Chunked distance computation to reduce memory usage. Every frame is
+    # computed on its own, so the chunk length and the number of threads do
+    # not change the values; the chunks are written straight into the result
+    # (no list of chunks next to the stacked matrix). A chunk is kept to
+    # about 64 MiB of temporaries per thread.
+    chunk_size = max(1, min(chunk_size, n_frames, (64 * 2**20) // (n_pairs * 48) or 1))
+    landscape = np.empty((n_frames, n_pairs), dtype=dtype)
+
+    def fill_chunk(start: int) -> None:
         end = min(start + chunk_size, n_frames)
         chunk_coords = coords_sub[start:end]  # Shape: (chunk_frames, m, 3)
         chunk_diffs = chunk_coords[:, i_idx, :] - chunk_coords[:, j_idx, :]  # Shape: (chunk_frames, n_pairs, 3)
         chunk_dist = np.sqrt(np.sum(chunk_diffs * chunk_diffs, axis=-1)).astype(np.float32)  # Shape: (chunk_frames, n_pairs)
-        dist_chunks.append(chunk_dist)
-    
-    # Concatenate all chunks
-    dist_mat = np.vstack(dist_chunks)
-    # Guarantee C-contiguous output
-    landscape = np.ascontiguousarray(dist_mat)
+        landscape[start:end] = chunk_dist
+
+    starts = range(0, n_frames, chunk_size)
+    if int(n_threads) > 1 and len(starts) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=int(n_threads)) as pool:
+            list(pool.map(fill_chunk, starts))
+    else:
+        for start in starts:
+            fill_chunk(start)
     if return_atom_indices:
         return landscape, chosen
     return landscape

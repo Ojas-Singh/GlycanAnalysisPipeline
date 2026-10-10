@@ -83,6 +83,12 @@ represent a glycan.
 
 With `GLYCOSHAPE_ORACLE_PAR_URL` set, use the staged workflow below: download the bucket `data/` prefix to local storage on a login node, process local data on AMD Slurm nodes, then build and upload only `static/` from a login node. `process/` is deliberately local-only and must not be uploaded to Oracle.
 
+`GLYCOSHAPE_STORE_FRAME_CHUNK` is the number of frames per Zarr chunk of
+`process/<glycan>/data/coords.zarr`; `0` (the default) is one chunk for the
+whole trajectory. `GLYCOSHAPE_STORE_FRAMES_BUFFER` is only how many parsed
+frames are handed over at a time: whatever its value, every chunk is
+compressed and written once.
+
 `GLYCOSHAPE_MAX_WORKERS` controls numerical fan-out inside one glycan.
 `GLYCOSHAPE_STATIC_WORKERS` separately controls how many glycans static-only
 mode rebuilds concurrently and defaults to 8. Set it to `1` for serial
