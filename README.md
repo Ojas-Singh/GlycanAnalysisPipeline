@@ -173,6 +173,41 @@ The login-node scripts are deliberately scoped as follows:
 
 Source directory names under `data/` are opaque storage keys and need not be GLYCAM names. When present, `data/<storage-key>/name.json` supplies the authoritative `indexOrderedSequence` used by processing. Use `scripts/upload_data_to_oracle.py --glycan <storage-key> --file name.json` to publish a corrected mapping without re-uploading a simulation PDB.
 
+## Raw trajectory archive
+
+The raw data can be kept in a compact archive instead of multi-model PDB text. One entry is one glycan:
+
+```
+<archive>/
+  index.json                 one record per entry (names, folders, counts, sizes, SHA-256)
+  conversion_report.json     the last converter run; entries that failed are under "failed" with the reason
+  <folder>/
+    trajectory.xtc           all frames in source order; XTC precision 10000 (0.0001 nm = 0.001 Å)
+    topology.pdb             header, first frame and records after the last frame (CONECT, ...), verbatim lines
+    structure.mol2           unchanged
+    info.json, name.json     unchanged, when the source has them
+    manifest.json            GLYCAM name, atoms, frames, box, size and SHA-256 of every file and of the
+                             source simulation.pdb, what the verification measured, converter version/date
+```
+
+- **Coordinates are exact.** They go from the PDB columns to the XTC as integers of 0.001 Å, so the archive holds the digits of the source; `-0.000` is stored as `0.000` and counted in the manifest. Step and time of a frame are its index from 0 (the source has no times). The box of each frame is the `CRYST1` in force at that frame, so a file made of several runs written one after the other keeps the box of each run, and the manifest lists the frame at which each starts (as it does for `END` and other records found between frames). The 1 × 1 × 1 Å placeholder cell that PDB writers emit when there is no box is recorded in the manifest and `topology.pdb` but not written as a box.
+- **Names.** An entry is identified by its full GLYCAM name: `glycam_name` in the manifest and the index, and `raw/<GLYCAM name>/` as object-storage key prefix (`lib.archive.object_key_prefix`). The name comes from `name.json` when the source folder has one, from `info.json` when the folder is named by a GlyTouCan ID, and is the folder name otherwise. `<folder>` is the GLYCAM name when that is a usable directory name (at most 255 bytes, no `/`); otherwise it is the first 200 bytes of the name, `~`, and the first 16 hex digits of the SHA-256 of the name (`lib.archive.entry_folder_name`). Always read the name from `manifest.json`, not from the folder.
+- **Verification.** Before an entry gets its final name the XTC is read back and every coordinate is compared with the source text; `manifest.json` records the number compared, the number that differ (always 0 for a published entry) and the largest difference in Å between the stored float and the decimal number of the text. A sample of frames (`--check-frames`, default 100) is also re-read from the source with plain `float()` as an independent check. A source that cannot be represented is not converted and is listed in the report: a frame with another atom count or other atom records, a truncated file, a coordinate that the XTC does not return exactly (possible only from 5120 Å on).
+
+```bash
+# Convert (resumable: entries whose manifest verifies are skipped; the source is only read)
+.venv/bin/python scripts/convert_data_to_archive.py --data-dir data --archive-dir archive --workers 8
+
+# One 64-core AMD node; DATA_DIR and ARCHIVE_DIR are at the top of the script.
+# VERIFY=1 runs the verification below instead, with every frame re-read from the source.
+mkdir -p logs/slurm && sbatch slurm/convert_data_to_archive_amd.sh
+
+# Verify an archive: files against manifests, and with --data-dir every coordinate against the source
+.venv/bin/python scripts/convert_data_to_archive.py --verify-only --archive-dir archive --data-dir data --workers 8
+```
+
+The pipeline reads either layout: point `--data-dir` at the archive and the store step streams frames from `trajectory.xtc` (`lib.glystore.store_from_archive`) with the same result as from `simulation.pdb`; folders with `simulation.pdb` keep working. Archive entries are read from the local filesystem only. In Python, `lib.archive.ArchiveEntry(path).iter_frames(chunk=1024)` yields `(frames, atoms, 3)` float32 arrays in Å, and `lib.archive.verify_entry(path, source_dir)` checks one entry. The XTC is written with MDTraj (`mdtraj==1.10.3` in `requirements.txt`); an existing `.venv` needs `uv pip install -r requirements.txt` once.
+
 ## Login Node Run
 
 Run from the checkout on the login node:
