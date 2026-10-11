@@ -51,12 +51,26 @@ def add_literal(graph, subject, predicate, obj, datatype=None):
                 graph.add((subject, predicate, Literal(str(obj), datatype=XSD.string)))
 
 
+# --- Helper Function to Create a Blank Node ---
+def blank_node(graph):
+    """A blank node labelled by its creation order in ``graph``.
+
+    The Turtle serializer writes these nodes inline, without their label, and
+    orders them by it.  A random label therefore gave the same graph with its
+    lines in another order on every run; a label that follows the order of
+    the input makes the file a function of the JSON.
+    """
+    count = getattr(graph, "_glycoshape_blank_nodes", 0) + 1
+    graph._glycoshape_blank_nodes = count
+    return BNode(f"gs{count:09d}")
+
+
 # --- Helper Function to Add Quantity with Unit ---
 def add_quantity_with_unit(graph, subject, predicate, value, unit_uri, quantity_type=None):
     """Adds a quantity value with associated unit using QUDT pattern."""
     if value is not None and value != "":
         # Create a blank node for the quantity
-        quantity_node = BNode()
+        quantity_node = blank_node(graph)
         graph.add((subject, predicate, quantity_node))
         graph.add((quantity_node, RDF.type, QUDT.Quantity))
         if quantity_type:
@@ -219,7 +233,7 @@ def process_glycan_variant(glycan_variant_uri, data, g):
     components = data.get("components")
     if components and isinstance(components, dict):
         for mono_name, count in components.items():
-            comp_node = BNode()
+            comp_node = blank_node(g)
             g.add((glycan_variant_uri, GLYCORDF.has_component, comp_node))
             g.add((comp_node, RDF.type, GLYCORDF.Component))
 
@@ -235,7 +249,7 @@ def process_glycan_variant(glycan_variant_uri, data, g):
     composition = data.get("composition")
     if composition and isinstance(composition, dict):
         for residue_type, count in composition.items():
-            comp_node = BNode()
+            comp_node = blank_node(g)
             g.add((glycan_variant_uri, GS.hasResidueTypeComposition, comp_node))
             g.add((comp_node, RDF.type, GS.ResidueTypeComposition))
             
@@ -283,7 +297,7 @@ def process_glycan_variant(glycan_variant_uri, data, g):
     clusters = data.get("clusters")
     if clusters and isinstance(clusters, dict):
         for cluster_label, percentage in clusters.items():
-            cluster_result_node = BNode()
+            cluster_result_node = blank_node(g)
             g.add((glycan_variant_uri, GS.hasClusterResult, cluster_result_node))
             g.add((cluster_result_node, RDF.type, GS.ClusterResult))
 
@@ -297,7 +311,7 @@ def process_glycan_variant(glycan_variant_uri, data, g):
     coverage_clusters = data.get("coverage_clusters")
     if coverage_clusters and isinstance(coverage_clusters, dict):
         for cluster_label, percentage in coverage_clusters.items():
-            coverage_result_node = BNode()
+            coverage_result_node = blank_node(g)
             g.add((glycan_variant_uri, GS.hasCoverageClusterResult, coverage_result_node))
             g.add((coverage_result_node, RDF.type, GS.CoverageClusterResult))
 
