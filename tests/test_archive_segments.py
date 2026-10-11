@@ -296,6 +296,34 @@ def test_structures_of_the_replicas_have_to_agree(tmp_path):
         segs.convert_segments([segs.SegmentSource("a", first.pdb)], tmp_path / "none", NAME)
 
 
+def test_mol2_as_the_post_processing_of_a_run_writes_it_is_read(tmp_path):
+    """ParmEd: a CRYSIN and a SUBSTRUCTURE section, right-aligned columns, charges."""
+    path = tmp_path / "glycan.dry.mol2"
+    path.write_text(
+        "@<TRIPOS>MOLECULE\nAGLC\n4 3 2 0 1\nBIOPOLYMER\nUSER_CHARGES\n"
+        "@<TRIPOS>CRYSIN\n   41.6050    41.6050    41.6050    90.0000    90.0000    90.0000 1 1\n"
+        "@<TRIPOS>ATOM\n"
+        "       1 C1          17.8000    29.7600    24.4000 CC3162        1 AGLC       0.340000\n"
+        "       2 H1          17.1600    30.6600    24.2700 HCA1          1 AGLC       0.090000\n"
+        "       3 O1          18.5400    29.9100    25.5900 OC311         1 AGLC      -0.650000\n"
+        "       4 C1          19.7600    28.9300    23.3700 CC3162        2 BGLC       0.340000\n"
+        "@<TRIPOS>BOND\n     1     1     2 1\n     2     3     1 1\n     3     3     4 1\n"
+        "@<TRIPOS>SUBSTRUCTURE\n     1 AGLC            1 RESIDUE           0 ****  ROOT      0\n"
+        "     2 BGLC            4 RESIDUE           0 ****  ****      0\n"
+    )
+    read = segs.read_mol2(path)
+    assert read["atoms"] == [("C1", "CC3162", "1", "AGLC"), ("H1", "HCA1", "1", "AGLC"), ("O1", "OC311", "1", "AGLC"),
+                             ("C1", "CC3162", "2", "BGLC")]
+    assert read["bonds"] == {(0, 1), (0, 2), (2, 3)}
+    same = dict(read, bonds=set(read["bonds"]))
+    assert segs.compare_mol2(read, same, "a", "b", same_run=True) == []
+    path.write_text("@<TRIPOS>MOLECULE\nempty\n")
+    with pytest.raises(archive.SourceError, match="has no @<TRIPOS>ATOM records"):
+        segs.read_mol2(path)
+    with pytest.raises(archive.SourceError, match="cannot read"):
+        segs.read_mol2(tmp_path / "missing.mol2")
+
+
 # ---------------------------------------------------------------------------
 # Rerun, damaged sources, parallel conversion
 # ---------------------------------------------------------------------------
