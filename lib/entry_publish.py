@@ -37,9 +37,14 @@ file the *stored* manifest lists is stored with the listed content.
    copy and step 6 the stored manifest describes files that have been
    replaced: a reader that is behind fails its verification, keeps its
    database and tries again at its next synchronisation; a reader that is
-   up to date does nothing.  The window is the time of these copies.
-6. *Manifest.*  The new ``sync_manifest.json`` is copied into place, as one
-   object.  Readers see the new database.
+   up to date does nothing.  The window is the time of these copies, so
+   they run ``workers`` at a time, in two groups (:func:`roll_forward`):
+   the changed files of the glycan folder, which only a reader without the
+   published folder of this glycan fetches, and then the root files, which
+   every reader that is behind fetches.
+6. *Manifest.*  When every copy of step 5 has succeeded, and not before,
+   the new ``sync_manifest.json`` is copied into place, as one object.
+   Readers see the new database.
 7. *Afterwards.*  Files of the glycan that the new manifest no longer lists
    are deleted (all of them for a withdrawal), the record of the entry and
    the list of withdrawn IDs are written, the staged objects are removed
@@ -110,6 +115,7 @@ Log = Callable[[str], None]
 Checkpoint = Callable[[str], None]
 _PROCESS_LOCKS: Dict[Tuple[int, str], threading.Lock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
+_COUNT_GUARD = threading.Lock()
 
 
 class PublishEntryError(Exception):
@@ -172,6 +178,13 @@ class Target:
     ``state_prefix`` (lock, pending publication, records, withdrawn IDs) in
     the database bucket, ``history_prefix`` (what a replaced raw entry was)
     in the archive bucket.
+
+    Each of the three is followed by the prefix it belongs to, so that two
+    databases or two archives in one bucket (a trial next to the real one)
+    share no key: ``<staging>/<static prefix>/`` and
+    ``<state>/<static prefix>/`` for the static side,
+    ``<history>/<raw prefix>/`` for the raw side.  The prefixes of two
+    environments must not lie inside each other.
     """
 
     static: Any
@@ -217,6 +230,16 @@ class Target:
     def staged(self, sha256: str) -> str:
         return f"{self.staging_prefix}/{self.static_prefix}/{sha256}"
 
+    def history(self, glycam_name: str) -> str:
+        """Key prefix of what the raw entry of a glycan was before it was replaced, by the SHA-256 of its manifest.
+
+        ``raw-history/raw/<GLYCAM name>/`` with the defaults: under the raw
+        prefix like the state of the static side under the static prefix,
+        without an exception for the default one, so that a listing of
+        ``raw-history/<raw prefix>/`` is the history of that archive only.
+        """
+        return f"{self.history_prefix}/{self.raw_prefix}/{glycam_name}/"
+
     @property
     def lock_key(self) -> str:
         return f"{self.state_prefix}/{self.static_prefix}/lock.json"
@@ -240,9 +263,10 @@ class Store:
         self.backend, self.stats, self.dry_run = backend, stats, dry_run
 
     def _count(self, operation: str, **amounts: int) -> None:
-        self.stats["requests"][operation] = self.stats["requests"].get(operation, 0) + 1
-        for name, amount in amounts.items():
-            self.stats[name] = self.stats.get(name, 0) + amount
+        with _COUNT_GUARD:                                      # requests are made from several threads
+            self.stats["requests"][operation] = self.stats["requests"].get(operation, 0) + 1
+            for name, amount in amounts.items():
+                self.stats[name] = self.stats.get(name, 0) + amount
 
     def _writing(self, key: str) -> None:
         if self.dry_run:
@@ -500,26 +524,74 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
     Everything it needs is in the storage: the staged objects and the
     pending document.  An object that is already at its key with the size
     and SHA-256 it should have is left alone.
+
+    The window in which the stored manifest describes replaced files is the
+    time of the copies, so they run ``target.workers`` at a time, and what
+    has to be asked of the storage is asked before the first of them.  The
+    order that is kept:
+
+    * *Before the first copy*: which files are not at their keys yet, and
+      that each of them is staged (so is the manifest).  A run that could
+      not finish the switch from the storage does not begin or widen it.
+    * *The changed files of the glycan folder*, in any order.  A reader
+      fetches them only when it does not have the published folder of this
+      glycan; one that is behind for another reason is not affected yet.
+    * *The root files*, in any order, when every copy of the folder has
+      returned.  Every reader that is behind fetches every root file, so
+      once the first of these copies is done all of them fail: this group
+      comes last and is the short one, however long the folder takes.
+    * *The manifest*, alone, when every copy above has succeeded and none is
+      in flight: the stored manifest never lists a file that is not at its
+      key.  The files it lists and no stored manifest listed were uploaded
+      before ``pending.json`` was written; the files it no longer lists are
+      deleted after it.
+
+    A copy that fails stops the switch: the copies in flight are waited for,
+    those not started are not made, the manifest is not written and
+    ``pending.json`` stays.  Whatever subset of the files was switched then,
+    it is the state of step 5, which the next call completes by looking at
+    every key again.
     """
-    def place(item: Dict[str, Any]) -> bool:
+    def waits(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The item when it still has to be copied onto its key (its staged copy has to be there), or None."""
         if store.holds(item["key"], item["size"], item["sha256"]):
-            return False
+            return None
         staged = target.staged(item["sha256"])
         if not store.holds(staged, item["size"], item["sha256"]):
             raise PublishEntryError(
                 f"the staged copy of {item['key']} is missing or damaged ({staged}): the pending "
                 f"{pending['action']} of {pending['glycoshape_id']} cannot be completed from the storage")
-        store.copy(staged, item["key"], item["size"], item["sha256"])
-        return True
+        return item
 
-    switched = 0
-    window_started = time.perf_counter()
+    def place(item: Dict[str, Any]) -> str:
+        store.copy(target.staged(item["sha256"]), item["key"], item["size"], item["sha256"])
+        return item["key"]
+
+    def place_together(items: List[Dict[str, Any]]) -> int:
+        """Copy the items onto their keys, ``workers`` at a time; when this returns or raises none is in flight."""
+        with contextlib.closing(parallel_map(place, items, target.workers)) as placed:
+            for key in placed:
+                checkpoint(f"switched:{key}")
+        return len(items)
+
+    def of_the_root(item: Dict[str, Any]) -> bool:
+        """A file at the root of the database (every other switched file is ``<glycan>/...``)."""
+        return "/" not in item["key"][len(target.static_prefix) + 1:]
+
     try:
-        for item in pending["switch"]:
-            switched += place(item)
-            checkpoint(f"switched:{item['key']}")
-        manifest_written = place(pending["manifest"])
+        with contextlib.closing(parallel_map(waits, pending["switch"] + [pending["manifest"]], target.workers)) as looked:
+            waiting = {item["key"] for item in looked if item is not None}
+        of_folder = [item for item in pending["switch"] if item["key"] in waiting and not of_the_root(item)]
+        of_root = [item for item in pending["switch"] if item["key"] in waiting and of_the_root(item)]
+        manifest_written = pending["manifest"]["key"] in waiting
+        window_started = time.perf_counter()
+        switched = place_together(of_folder)
+        root_started = time.perf_counter()
+        switched += place_together(of_root)
+        if manifest_written:
+            place(pending["manifest"])
         window = round(time.perf_counter() - window_started, 3)
+        root_window = round(time.perf_counter() - root_started, 3)
         checkpoint("manifest")
     except PublishEntryError:
         raise
@@ -528,8 +600,10 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
             f"stopped while the changed files were switched ({type(exc).__name__}: {exc}); the published manifest "
             "may describe files that have been replaced, so a reader that is behind fails and retries: "
             "run the command again (or publish_entry.py recover) to finish") from exc
-    log(f"switched {switched} file(s) and {'wrote' if manifest_written else 'found'} "
-        f"{pending['manifest']['key']} (global_hash {pending['target_global_hash'][:16]}...) in {window} s")
+    log(f"switched {switched} file(s) ({len(of_folder)} of the glycan folder, then {len(of_root)} root file(s); "
+        f"{target.workers} at a time) and {'wrote' if manifest_written else 'found'} "
+        f"{pending['manifest']['key']} (global_hash {pending['target_global_hash'][:16]}...) in {window} s, "
+        f"{root_window} s of them for the root files and the manifest")
 
     # 7. Afterwards.  The published prefix is the new database from here on.
     try:
@@ -566,7 +640,7 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
             f"the new database is published, and clearing up stopped ({type(exc).__name__}: {exc}): "
             "run the command again (or publish_entry.py recover) to finish") from exc
     return {"switched": switched, "manifest_written": manifest_written, "deleted": len(doomed),
-            "switch_seconds": window}
+            "switch_seconds": window, "switch_root_seconds": root_window}
 
 
 def recover(target: Target, log: Log = print, checkpoint: Checkpoint = _noop, owner: Optional[str] = None,
@@ -733,7 +807,7 @@ def plan_raw(target: Target, store: Store, bundle: entry_complete.Bundle, policy
     stored_manifest = store.read_optional(key_prefix + archive.MANIFEST_FILE) if key_prefix + archive.MANIFEST_FILE in listing else None
     stored_sha256 = None if stored_manifest is None else hashlib.sha256(stored_manifest).hexdigest()
     extends = bundle.extends
-    history_prefix = f"{target.history_prefix}/{name}/"
+    history_prefix = target.history(name)
     if not listing:
         relation = "new"
     elif all(stored_ok.values()):
@@ -1063,7 +1137,22 @@ def check_bundle_policy(bundle: entry_complete.Bundle, policy: Policy) -> Tuple[
 def _complete(bundle: entry_complete.Bundle, submission: entry_complete.Submission, work: Path, journal: Journal,
               offline: Optional[bool], lookup_timeout: Optional[float], lookup_budget: Optional[float],
               refresh: bool, log: Log) -> Dict[str, Any]:
-    """The completed folder of the entry in the work folder: the one of an earlier run, or a new one."""
+    """The completed folder of the entry in the work folder: the one of an earlier run, or a new one.
+
+    The folder of an earlier run is kept when it was made from the same
+    bundle, submission and levels, is still what it was, and had no
+    ``problems``.  Problems are what an entry is refused for (a file that
+    is missing, no SNFG image, neither WURCS nor accession), and they say
+    as much about the machine the folder was completed on as about the
+    entry: a renderer that was not installed, a tool that could not be run.
+    Such a folder is completed again at every run, so a machine that was
+    repaired is noticed by the next run and not only by a new work folder.
+    Without ``allow_incomplete`` nothing was published from it, so nothing
+    is lost; with it the folder comes out the same on the same machine with
+    the same answers, and ``expect_hash`` stops anything else than what was
+    approved.  Lookups that were not answered are not problems: a folder
+    with such gaps is kept, as what was approved, until ``refresh``.
+    """
     fingerprint = hashlib.sha256(
         f"{bundle.sha256}\0{submission.sha256()}\0{list(bundle.levels)}".encode()).hexdigest()
     folder = work / "static" / submission.glycoshape_id
@@ -1075,8 +1164,11 @@ def _complete(bundle: entry_complete.Bundle, submission: entry_complete.Submissi
         except ValueError:
             report = None
         if report is not None and static_delta.folder_entry(folder)["hash"] == kept.get("hash"):
-            log(f"using the folder completed at {kept['at']} ({folder})")
-            return report
+            if not report.get("problems"):
+                log(f"using the folder completed at {kept['at']} ({folder})")
+                return report
+            log(f"the folder completed at {kept['at']} was not complete ({'; '.join(report['problems'])}): "
+                "completing it again")
     report = entry_complete.complete_entry(
         bundle.path, submission, work / "static", offline=offline, lookup_timeout=lookup_timeout,
         lookup_budget=lookup_budget, bundle=bundle)
@@ -1084,7 +1176,7 @@ def _complete(bundle: entry_complete.Bundle, submission: entry_complete.Submissi
     _write_json(report_path, report)
     journal.step("complete", fingerprint=fingerprint, hash=report["hash"], files=report["file_count"],
                  bytes=report["total_size"], offline=report["lookups"]["offline"],
-                 unanswered=report["lookups"]["unanswered"])
+                 unanswered=report["lookups"]["unanswered"], problems=report["problems"])
     log(f"completed {folder.name}: {report['file_count']} files, {report['total_size'] / 1e6:.1f} MB; "
         f"{len(report['gaps'])} empty identity field(s), {len(report['lookups']['unanswered'])} lookup(s) unanswered")
     return report
@@ -1163,7 +1255,9 @@ def publish_entry(
     the same work folder continues an interrupted run and publishes the same
     bytes.  ``expect_hash`` is the folder hash an administrator approved (of
     the report of a dry run): a folder that comes out differently is not
-    published.  ``refresh`` completes the folder again (new lookups).
+    published.  ``refresh`` completes the folder again (new lookups); a
+    folder that was completed with problems is completed again at every run
+    (:func:`_complete`).
 
     Checked before anything is written: the bundle (its hashes, levels,
     pipeline; ``policy``), the entry (complete), the ID (new for
@@ -1323,6 +1417,7 @@ def publish_entry(
                     {"glycam_name": name, "record": record, "withdrawn": {} if tombstone is not None else None},
                     owner, lock, lock_ttl, log, checkpoint)
                 journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
+                report["switch"] = done
                 _remember(cache_dir, derived_dir, derived)
                 report["status"] = "published"
     report["seconds"] = round(time.perf_counter() - started, 3)
@@ -1492,6 +1587,7 @@ def withdraw_entry(
                                "global_hash_before": database.global_hash}},
                 owner, lock, lock_ttl, log, checkpoint)
             journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
+            report["switch"] = done
             _remember(cache_dir, derived_dir, derived)
             report["status"] = "withdrawn"
             journal.data["status"] = "withdrawn"

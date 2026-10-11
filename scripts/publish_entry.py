@@ -72,7 +72,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         command.add_argument("--raw-bucket", help="Archive bucket (default: GLYCOSHAPE_S3_RAW_BUCKET).")
         command.add_argument("--static-prefix", help="Published prefix (default: GLYCOSHAPE_S3_STATIC_PREFIX, static).")
         command.add_argument("--raw-prefix", help="Raw prefix (default: GLYCOSHAPE_S3_RAW_PREFIX, raw).")
-        command.add_argument("--workers", type=int, default=8, help="Parallel requests (default 8).")
+        command.add_argument("--workers", type=int, default=8,
+                             help="Parallel requests (default 8); also how many copies of the switch are made at the "
+                                  "same time, which is what its duration depends on.")
         command.add_argument("--report", type=Path, help="Write the report of the run to this JSON file.")
         if name in ("publish", "replace", "withdraw", "recover"):
             command.add_argument("--lock-ttl", type=float, default=3600.0,
@@ -112,7 +114,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             command.add_argument("--overwrite-raw", action="store_true",
                                  help="Replace a stored raw entry by one that does not extend it.")
             command.add_argument("--keep-previous-raw", choices=("auto", "manifest", "all"), default="auto",
-                                 help="What of a replaced raw entry is copied to raw-history/ first (default auto: "
+                                 help="What of a replaced raw entry is copied to raw-history/<raw prefix>/ first (default auto: "
                                       "its manifest when the new entry extends it, every file otherwise).")
         if name == "withdraw":
             command.add_argument("--id", required=True, help="GlycoShape ID to withdraw.")
@@ -151,6 +153,20 @@ def _megabytes(count: int) -> str:
     return f"{count / 1e6:.1f} MB"
 
 
+#: The simulation fields of an entry as they are printed: key of the report, unit, what it is.
+_SIMULATION_LINE = (
+    ("length", "us", "length"), ("package", "", "MD package"), ("forcefield", "", "force field"),
+    ("temperature", "K", "temperature"), ("pressure", "bar", "pressure"), ("salt", "mM", "salt concentration"),
+)
+
+
+def _simulation_line(simulation: dict) -> str:
+    """The simulation of an entry in one line; a value the submission does not have is said to be not given."""
+    return ", ".join(
+        f"{what} not given" if simulation.get(key) in (None, "") else f"{simulation[key]} {unit}".rstrip()
+        for key, unit, what in _SIMULATION_LINE)
+
+
 def _print_entry(report: dict) -> None:
     entry = report.get("entry")
     if not entry:
@@ -160,9 +176,7 @@ def _print_entry(report: dict) -> None:
     _say(f"  folder: {entry['file_count']} files, {_megabytes(entry['total_size'])}, hash {entry['hash']}")
     _say(f"  IUPAC {identity.get('iupac')}; GlyTouCan {identity.get('glytoucan')}; "
          f"WURCS {'yes' if identity.get('wurcs') else 'no'}")
-    simulation = entry["simulation"]
-    _say(f"  simulation: {simulation.get('length')} us, {simulation.get('package')}, {simulation.get('forcefield')}, "
-         f"{simulation.get('temperature')} K, {simulation.get('pressure')} bar, {simulation.get('salt')} mM")
+    _say(f"  simulation: {_simulation_line(entry['simulation'])}")
     meta = entry.get("search_meta") or {}
     _say(f"  keywords {meta.get('keywords')}; common names {meta.get('common_names')}")
     lookups = entry["lookups"]

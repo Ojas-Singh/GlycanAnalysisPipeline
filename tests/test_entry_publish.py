@@ -5,12 +5,16 @@ entry is the bundle of the synthetic glycan.  ``Reader`` is the website.  No tes
 """
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import os
+import random
 import shutil
 import threading
+import time
 from pathlib import Path
 
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -19,7 +23,7 @@ import pytest
 
 from lib import archive, archive_transfer, entry_complete, entry_publish, static_publish
 from lib.entry_publish import LockHeld, Policy, PublishEntryError, Refused, Store, Target, new_stats
-from lib.storage import S3StorageBackend
+from lib.storage import S3StorageBackend, parallel_map
 
 import fake_services
 import publish_world
@@ -30,6 +34,7 @@ from static_tree import full_bake, manifest_without_times, root_files
 from synthetic_glycan import GLYCAM_NAME
 
 pytestmark = pytest.mark.usefixtures("no_internet")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 GS = "GS01067"
 SECOND_NAME = "DManpa1-2DManpb1-OH"
 STATE = "publish-state/static"
@@ -233,23 +238,92 @@ def test_the_root_files_of_the_last_publication_are_kept_for_the_next(world, bun
 # Interruptions
 # ---------------------------------------------------------------------------
 class Killed:
-    """The process dies at its n-th writing request: that request and every later request fail."""
+    """The process dies at its n-th writing request: that request and every later request fail.
+
+    The publisher makes the requests of a group (uploads, the copies of the switch, deletions) on the
+    threads of ``parallel_map``, and the order in which they reach the storage is up to the scheduler of
+    the machine: with a client that answers at once it is nearly always the order of submission, and it
+    is not the same at every run.  ``in_turns`` (in place of ``entry_publish.parallel_map`` for the run
+    that is killed) keeps the threads and decides the order: every thread of the pool waits before its
+    call and before each of its writing requests until every thread that has work is waiting, and then
+    one of them, drawn by a random generator seeded with ``at``, goes on alone up to its next writing
+    request or the end of its call.  So which requests have reached the storage when the process dies is
+    the same at every run of the test, and it is drawn from all the orders that ``workers`` threads can
+    produce: only requests that are in flight together change places (a call that is still queued never
+    overtakes), and a request that was submitted later is often stored before an earlier one.
+    """
 
     def __init__(self, client, at):
-        self.at, self.seen, self.dead = at, 0, False
+        self.at, self.seen, self.dead, self.stuck = at, 0, False, None
+        self.order = random.Random(at)
+        self.turn = threading.Condition()
+        self.waiting = {}                                       # (call, operation, key) -> whether it may go on
+        self.outstanding = self.workers = 0                     # calls of the group that have not returned; its threads
+        self.thread = threading.local()
         client.before = self
 
     def __call__(self, operation, bucket, key):
         if operation in WRITES:
-            self.seen += 1
-            if self.seen > self.at:
-                self.dead = True
+            call = getattr(self.thread, "call", None)
+            if call is not None:
+                self._wait_for_the_turn((call, operation, key))
+            with self.turn:
+                self.seen += 1
+                if self.seen > self.at:
+                    self.dead = True
+                    self.turn.notify_all()
         if self.dead:
             raise Interrupted(f"killed at writing request {self.at + 1}: {operation} {key}")
 
+    def _wait_for_the_turn(self, label):
+        with self.turn:
+            self.waiting[label] = False
+            self.turn.notify_all()
+            while not self.dead and not self.waiting[label]:
+                if len(self.waiting) == min(self.workers, self.outstanding) and not any(self.waiting.values()):
+                    self.waiting[self.order.choice(sorted(self.waiting))] = True       # every thread with work waits
+                    self.turn.notify_all()
+                elif not self.turn.wait(timeout=30):                  # a mistake of this harness: say so, let all go
+                    self.stuck = (f"no thread can take its turn: {sorted(self.waiting)} wait, {self.outstanding} "
+                                  f"call(s) on {self.workers} thread(s) have not returned")
+                    self.dead = True
+                    self.turn.notify_all()
+            del self.waiting[label]
+
+    def in_turns(self, function, items, workers):
+        """``parallel_map`` whose threads take turns at the storage, in the order of the seed."""
+        items = list(items)
+        with self.turn:
+            self.outstanding, self.workers = len(items), max(1, int(workers))
+
+        def call(numbered):
+            self.thread.call = numbered[0]
+            try:
+                self._wait_for_the_turn((numbered[0], "", ""))
+                return function(numbered[1])
+            finally:
+                self.thread.call = None
+                with self.turn:
+                    self.outstanding -= 1
+                    self.turn.notify_all()
+
+        return parallel_map(call, list(enumerate(items)), workers)
+
+
+def switched_so_far(world):
+    """Of the files of the pending switch, in its order: (key, at the root of the database, already the new file)."""
+    pending = json.loads(world.backend.read_binary(f"{STATE}/pending.json"))
+    return [(item["key"], "/" not in item["key"][len("static/"):],
+             (world.backend.head(item["key"]) or {}).get("sha256") == item["sha256"]) for item in pending["switch"]]
+
 
 def check_interruptions(objects, static_dir, tmp_path, monkeypatch, run, work_template, expected_glycans, old_glycans):
-    """Kill the run at every writing request; what readers see then; the same command finishes it."""
+    """Kill the run at every writing request; what readers see then; the same command finishes it.
+
+    Three websites follow the bucket: one that is up to date, one that has nothing (``behind``) and one
+    that has every glycan folder of the old database and not its root files (``lagging``: it missed a
+    publication that did not touch the glycan of this one).
+    """
     monkeypatch.setattr(entry_publish, "_process_alive", lambda pid: False)    # the killed run is gone
     prepared = {"objects": objects, "static": static_dir}
     reference = World(prepared, tmp_path / "reference")
@@ -263,20 +337,34 @@ def check_interruptions(objects, static_dir, tmp_path, monkeypatch, run, work_te
              "state": set(reference.keys("publish-state/"))}
     new_hash = final["manifest"]["global_hash"]
     assert points > 20 and new_hash != old_hash
-    seen = {"old": 0, "window": 0, "new": 0, "window_failed": 0}
-    for at in range(points):
-        world = World(prepared, tmp_path / f"at-{at}")
+    seen = {"old": 0, "window": 0, "new": 0, "window_failed": 0, "folder_only": 0, "out_of_order": 0}
+
+    def killed_world(at, name):
+        """A copy of the bucket in which the run was killed at its writing request number ``at`` (from 0)."""
+        world = World(prepared, tmp_path / name)
         shutil.copytree(work_template, world.tmp / "work")
         assert world.reader.global_hash == old_hash and world.reader.glycans() == old_glycans
-        Killed(world.client, at)
-        try:
-            run(world)
-        except (PublishEntryError, Interrupted):
-            pass
-        else:
-            assert at == points - 1, at                                         # only the release of the lock was lost
-            assert f"{STATE}/lock.json" in world.keys(STATE)
+        killed = Killed(world.client, at)
+        with monkeypatch.context() as patching:
+            patching.setattr(entry_publish, "parallel_map", killed.in_turns)
+            try:
+                run(world)
+            except (PublishEntryError, Interrupted):
+                pass
+            else:
+                assert at == points - 1, at                                     # only the release of the lock was lost
+                assert f"{STATE}/lock.json" in world.keys(STATE)
+        assert killed.stuck is None, killed.stuck
+        assert killed.dead and killed.seen > at and not killed.waiting, at
         world.client.before = None
+        return world
+
+    for at in range(points):
+        world = killed_world(at, f"at-{at}")
+        shutil.copytree(world.reader.folder, world.tmp / "website-lagging")
+        lagging = Reader(world.backend, world.tmp / "website-lagging")
+        known = json.loads((lagging.folder / "sync_manifest.json").read_text())
+        (lagging.folder / "sync_manifest.json").write_text(json.dumps({**known, "global_hash": "0" * 64}))
 
         # what the website sees at this point
         stored_hash = stored_manifest(world.backend)["global_hash"]
@@ -293,10 +381,24 @@ def check_interruptions(objects, static_dir, tmp_path, monkeypatch, run, work_te
             assert world.reader.global_hash == behind.global_hash == old_hash and behind.glycans() == old_glycans
         else:
             seen["window"] += 1                                                 # switching: old manifest, some files replaced
+            switched = switched_so_far(world)
+            of_folder = [new for _, root, new in switched if not root]
+            of_root = [new for _, root, new in switched if root]
+            assert all(of_folder) or not any(of_root), (at, switched)           # no root file before the last of the folder
+            seen["out_of_order"] += any(late and not early for group in (of_folder, of_root)
+                                        for index, late in enumerate(group) for early in group[:index])
+            again = killed_world(at, f"at-{at}-again")                          # the harness decides the order: the same again
+            assert switched_so_far(again) == switched, at
+            shutil.rmtree(again.tmp)
             assert world.reader.try_sync() is None and world.reader.global_hash == old_hash    # up to date: nothing to do
             failure = behind.try_sync()                                         # behind: gives up and keeps what it has
             seen["window_failed"] += failure is not None
+            assert (failure is not None) == any(of_folder + of_root), (at, failure)
             assert failure is None or "download verification failed" in failure, failure
+            failure = lagging.try_sync()                                        # it has the folder: only the root files matter
+            assert (failure is not None) == any(of_root), (at, failure)
+            assert failure is None or "download verification failed" in failure, failure
+            seen["folder_only"] += any(of_folder) and failure is None
 
         # the same command again finishes the publication
         report = run(world)
@@ -305,8 +407,9 @@ def check_interruptions(objects, static_dir, tmp_path, monkeypatch, run, work_te
         assert set(world.keys("raw/")) == final["raw"], at
         assert manifest_without_times(world.backend.read_binary("static/sync_manifest.json")) == final["manifest"], at
         assert set(world.keys("publish-state/")) == final["state"] and world.keys("publish-staging/") == [], at
-        assert world.reader.try_sync() is None and behind.try_sync() is None
-        assert world.reader.global_hash == behind.global_hash == new_hash and behind.glycans() == expected_glycans
+        assert world.reader.try_sync() is None and behind.try_sync() is None and lagging.try_sync() is None
+        assert world.reader.global_hash == behind.global_hash == lagging.global_hash == new_hash
+        assert behind.glycans() == lagging.glycans() == expected_glycans
         assert static_publish.check_published(world.backend, "static", quick=True, log=quiet)["ok"]
         shutil.rmtree(world.tmp)
     assert seen["old"] >= 5 and seen["window"] >= 3 and seen["new"] >= 3 and seen["window_failed"] >= 1, seen
@@ -373,6 +476,9 @@ def test_a_replacement_killed_at_any_request_leaves_the_old_or_the_new_database(
         lambda world: world.publish(extended_bundle, record(), action="replace", policy=Policy(allow_incomplete=True)),
         template, expected_glycans=sorted(PUBLISHED + (GS,)), old_glycans=sorted(PUBLISHED + (GS,)))
     assert seen["window"] > 15                                                 # the published files of the folder are switched
+    # while only files of the folder are switched, a website that has the folder is not affected; and the
+    # copies of a group do not reach the storage in the order of their names
+    assert seen["folder_only"] > 10 and seen["out_of_order"] > 5, seen
 
 
 def test_an_interrupted_switch_is_reported_and_completed_by_recover(world, bundle_dir, tmp_path):
@@ -423,6 +529,151 @@ def test_a_publication_that_was_interrupted_is_completed_before_the_next_one(wor
 
 
 # ---------------------------------------------------------------------------
+# The switch: copies at the same time, in two groups, the manifest alone
+# ---------------------------------------------------------------------------
+class WatchedCopies(FakeS3Client):
+    """A storage in which a copy takes time: when each one began and ended is noted; one onto ``fails`` fails, once."""
+
+    delay, fails = 0.0, None
+
+    def __init__(self, *buckets):
+        super().__init__(*buckets)
+        self.events = []
+
+    def copy_object(self, Bucket, Key, CopySource, **more):
+        with self._lock:
+            self.events.append(("began", Key))
+        time.sleep(self.delay)
+        if Key == self.fails:
+            self.fails = None
+            raise FakeClientError("InternalError", 500, "CopyObject")
+        done = super().copy_object(Bucket, Key, CopySource, **more)
+        with self._lock:
+            self.events.append(("ended", Key))
+        return done
+
+    def switched(self, what):
+        """Keys below static/ of which a copy began or ended, in that order."""
+        return [key for event, key in self.events if event == what and key.startswith("static/")]
+
+
+@pytest.fixture
+def slow_world(prepared, tmp_path, monkeypatch, bundle_dir):
+    """A bucket in which the entry is published and every copy takes time."""
+    fake_services.install(monkeypatch)
+    world = World(prepared, tmp_path, WatchedCopies)
+    assert world.publish(bundle_dir)["status"] == "published"
+    world.reader.sync()
+    world.client.events.clear()
+    return world
+
+
+def replace_by_the_extended_entry(world, extended_bundle, **options):
+    """Every file of the published folder changes: a switch of about twenty files of the folder and the root files."""
+    options.setdefault("work_dir", world.tmp / "work-extended")
+    return world.publish(extended_bundle, record(simulation={"simulation_length_ns": 3100.0}), action="replace", **options)
+
+
+def test_the_switch_copies_the_folder_then_the_root_files_and_then_the_manifest_alone(slow_world, extended_bundle):
+    world, delay, workers, manifest = slow_world, 0.05, 8, "static/sync_manifest.json"
+    world.client.delay, world.target.workers = delay, workers
+    messages = []
+    report = replace_by_the_extended_entry(world, extended_bundle, log=messages.append)
+    assert report["status"] == "published"
+    began, ended = world.client.switched("began"), world.client.switched("ended")
+    folder = {key for key in began if key.startswith(f"static/{GS}/")}
+    root = set(began) - folder - {manifest}
+    assert sorted(folder | root) == sorted(report["static"]["stage_and_switch"]) and sorted(began) == sorted(ended)
+    assert len(folder) > 15 and root >= {"static/GLYCOSHAPE.json", "static/GlycoShape.zip", "static/GLYCOSHAPE_RDF.ttl"}
+
+    # the order that is kept: no root file before the last file of the folder is there, the manifest after everything
+    events = [event for event in world.client.events if event[1].startswith("static/")]
+    at = {event: index for index, event in enumerate(events)}
+    assert max(at["ended", key] for key in folder) < min(at["began", key] for key in root)
+    assert events[-2:] == [("began", manifest), ("ended", manifest)]
+    # and inside a group the copies are under way together, up to as many as there are workers
+    under_way = most = 0
+    for event, _ in events:
+        under_way += 1 if event == "began" else -1
+        most = max(most, under_way)
+    assert workers // 2 < most <= workers
+
+    # so the window is the time of a few copies and not of all of them, which is what the journal records
+    copies = len(folder) + len(root)
+    journal = json.loads((world.tmp / "work-extended" / "journal.json").read_text())["steps"]["static"]
+    assert journal["switched"] == copies and journal["manifest_written"]
+    assert report["switch"] == {key: journal[key] for key in (
+        "switched", "manifest_written", "deleted", "switch_seconds", "switch_root_seconds")}
+    rounds = -(-len(folder) // workers) + -(-len(root) // workers) + 1
+    assert rounds * delay - 0.01 < journal["switch_seconds"] < (copies + 1) * delay / 2
+    assert 2 * delay - 0.01 < journal["switch_root_seconds"] < journal["switch_seconds"] - delay / 2
+    print(f"{copies} copies and the manifest, {delay} s each, {workers} at a time: switched in {journal['switch_seconds']} s "
+          f"({journal['switch_root_seconds']} s from the first root file on); one after another {(copies + 1) * delay:.2f} s")
+    assert any(f"switched {copies} file(s) ({len(folder)} of the glycan folder, then {len(root)} root file(s); "
+               f"{workers} at a time) and wrote {manifest}" in message for message in messages)
+    assert report["transfers"]["requests"]["copy"] == copies + 1 + len(report["raw"]["history"])
+    assert world.reader.try_sync() is None and static_publish.check_published(world.backend, "static", log=quiet)["ok"]
+
+
+@pytest.mark.parametrize("failing", [f"static/{GS}/data.json", "static/GlycoShape.zip"])
+def test_a_copy_that_fails_stops_the_switch_and_leaves_it_to_be_completed(slow_world, extended_bundle, tmp_path, failing):
+    world, manifest = slow_world, "static/sync_manifest.json"
+    world.client.delay, world.client.fails = 0.05, failing
+    old_hash = world.reader.global_hash
+    with pytest.raises(PublishEntryError, match="stopped while the changed files were switched .*InternalError.* run the command again"):
+        replace_by_the_extended_entry(world, extended_bundle)
+
+    # the copies that were under way were waited for, the others were not made, and neither was the one of the manifest
+    began, ended = world.client.switched("began"), world.client.switched("ended")
+    assert sorted(began) == sorted(ended + [failing]) and manifest not in began
+    switched = switched_so_far(world)
+    assert sorted(key for key, _, new in switched if new) == sorted(ended)
+    of_folder = [new for _, root, new in switched if not root]
+    of_root = [new for _, root, new in switched if root]
+    if failing == "static/GlycoShape.zip":
+        assert all(of_folder)                                               # the root files began when the folder was there
+    else:
+        assert not any(of_root) and len(began) < len(of_folder)             # and what was still waiting never began
+    # what is stored is the state of an interrupted switch: the old manifest, the intent, and no lock
+    assert stored_manifest(world.backend)["global_hash"] == old_hash
+    assert f"{STATE}/pending.json" in world.keys(STATE) and f"{STATE}/lock.json" not in world.keys(STATE)
+    report = entry_publish.status(world.target, GS, check=True)
+    assert not report["ok"] and report["pending"]["action"] == "replace" and report["pending"]["glycoshape_id"] == GS
+    assert world.reader.try_sync() is None and world.reader.global_hash == old_hash
+    assert "download verification failed" in world.reader.fresh(tmp_path / "behind").try_sync()
+
+    # recover, or the same command, makes the copies that are missing and then the one of the manifest
+    world.client.events.clear()
+    if failing == "static/GlycoShape.zip":
+        assert replace_by_the_extended_entry(world, extended_bundle)["status"] == "already-published"
+    else:
+        done = entry_publish.recover(world.target, log=quiet)
+        assert done["switched"] == len(switched) - len(ended) and done["manifest_written"]
+    assert sorted(world.client.switched("ended")) == sorted({key for key, _, new in switched if not new} | {manifest})
+    assert world.client.switched("ended")[-1] == manifest
+    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [f"{STATE}/entries/{GS}.json"]
+    assert world.reader.try_sync() is None and world.reader.fresh(tmp_path / "behind").try_sync() is None
+    assert world.reader.global_hash != old_hash and static_publish.check_published(world.backend, "static", log=quiet)["ok"]
+
+
+def test_a_switch_that_cannot_be_finished_from_the_storage_is_not_begun(world, bundle_dir, tmp_path):
+    def stop_before_the_switch(name):
+        if name == "pending":
+            raise Interrupted("stopped when the intent was written")
+
+    with pytest.raises(Interrupted):
+        world.publish(bundle_dir, checkpoint=stop_before_the_switch)
+    pending = json.loads(world.backend.read_binary(f"{STATE}/pending.json"))
+    world.backend.unlink(f"publish-staging/static/{pending['manifest']['sha256']}")     # lost: the last copy cannot be made
+    world.client.calls.clear()
+    with pytest.raises(PublishEntryError, match="the staged copy of static/sync_manifest.json is missing or damaged"):
+        entry_publish.recover(world.target, log=quiet)
+    # no file was switched for a manifest that cannot follow: the published prefix is the old database
+    assert world.published_writes() == [] and not any(new for _, _, new in switched_so_far(world))
+    assert world.reader.fresh(tmp_path / "behind").try_sync() is None
+
+
+# ---------------------------------------------------------------------------
 # Replace
 # ---------------------------------------------------------------------------
 def test_a_replacement_with_other_metadata_switches_only_what_changed(world, bundle_dir, tmp_path):
@@ -458,7 +709,7 @@ def test_a_replacement_by_an_extended_entry_overwrites_the_raw_entry_and_keeps_i
                            work_dir=tmp_path / "work-extended")
     assert report["status"] == "published" and report["raw"]["relation"] == "extension"
     assert report["raw"]["previous_manifest_sha256"] == first_sha256
-    assert report["raw"]["history"] == [f"raw-history/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
+    assert report["raw"]["history"] == [f"raw-history/raw/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
     assert set(report["raw"]["upload"]) == {"info.json", "trajectory.xtc", "manifest.json"}      # topology and MOL2 are the same
     # the previous trajectory is gone (the new one holds its frames); the manifest that described it is kept
     assert world.keys("raw-history/") == report["raw"]["history"]
@@ -496,7 +747,9 @@ def test_a_raw_entry_is_only_overwritten_when_asked_and_then_kept_in_the_history
     report = world.publish(unrelated, action="replace", work_dir=tmp_path / "work-unrelated-3", policy=Policy(overwrite_raw=True))
     assert report["status"] == "published" and report["raw"]["relation"] == "overwrite"
     previous = hashlib.sha256((bundle_dir / "archive" / "manifest.json").read_bytes()).hexdigest()
-    kept = {key[len(f"raw-history/{GLYCAM_NAME}/{previous}/"):]: content for key, content in stored_tree(world.backend, "raw-history/").items()}
+    history = f"raw-history/raw/{GLYCAM_NAME}/{previous}/"
+    assert all(key.startswith(history) for key in world.keys("raw-history/"))
+    kept = {key[len(history):]: content for key, content in stored_tree(world.backend, "raw-history/").items()}
     assert kept == {key[len(f"raw/{GLYCAM_NAME}/"):]: content for key, content in stored_before.items()
                     if key.startswith(f"raw/{GLYCAM_NAME}/")}                    # every file of the replaced entry
 
@@ -632,6 +885,78 @@ def test_an_entry_without_identity_or_image_is_published_only_when_allowed(world
     kept = json.loads(world.backend.read_binary(f"{STATE}/entries/{GS}.json"))
     assert kept["lookups"]["offline"] and "wurcs2glytoucan" not in kept["lookups"]["unanswered"]   # nothing to look up
     assert "archetype.glytoucan" in kept["gaps"]                            # what a later refresh has to fill
+
+
+def test_a_folder_that_was_completed_with_problems_is_completed_again_at_the_next_run(world, bundle_dir, monkeypatch):
+    """The SNFG renderer was missing; when it is there, the same command with the same work folder publishes."""
+    fake_services.install(monkeypatch, snfg=False)
+    first = world.publish(bundle_dir, dry_run=True)
+    assert first["refused"] == ["the entry is not complete: snfg.svg is missing (the SNFG renderer did not run)"]
+    assert first["entry"]["file_count"] == 24 and not (world.tmp / "work" / "static" / GS / "snfg.svg").exists()
+    journal = json.loads((world.tmp / "work" / "journal.json").read_text())
+    assert journal["status"] == "refused" and journal["steps"]["complete"]["problems"] == first["entry"]["problems"]
+    # as long as the machine is what it was the folder comes out the same, also for who allows it as it is
+    messages = []
+    allowed = world.publish(bundle_dir, dry_run=True, policy=Policy(allow_incomplete=True), log=messages.append)
+    assert allowed["ok"] and allowed["entry"]["hash"] == first["entry"]["hash"]
+    assert any("was not complete (snfg.svg is missing (the SNFG renderer did not run)): completing it again" in message
+               for message in messages)
+
+    calls = fake_services.install(monkeypatch)                              # the renderer is installed
+    messages.clear()
+    second = world.publish(bundle_dir, dry_run=True, log=messages.append)
+    assert second["ok"] and second["refused"] == [] and second["entry"]["problems"] == []
+    assert second["entry"]["file_count"] == 25 and second["entry"]["hash"] != first["entry"]["hash"]
+    assert (world.tmp / "work" / "static" / GS / "snfg.svg").is_file() and calls
+    assert any("completing it again" in message for message in messages)
+    # a folder without problems is the one that is kept, approved and published
+    calls.clear()
+    messages.clear()
+    done = world.publish(bundle_dir, expect_hash=second["entry"]["hash"], log=messages.append)
+    assert done["status"] == "published" and done["entry"]["hash"] == second["entry"]["hash"] and calls == []
+    assert any("using the folder completed at" in message for message in messages)
+    assert world.reader.try_sync() is None and (world.reader.folder / GS / "snfg.svg").is_file()
+
+
+def test_a_folder_with_lookups_that_were_not_answered_is_kept_until_a_refresh(world, bundle_dir, monkeypatch):
+    """Not a problem of the folder: what was approved is what is published, and --refresh-metadata asks again."""
+    fake_services.install(monkeypatch, online=False)                        # no service answers; the local tools work
+    first = world.publish(bundle_dir, dry_run=True)
+    assert first["ok"] and first["entry"]["problems"] == []
+    assert first["entry"]["lookups"]["unanswered"] and "archetype.glytoucan" in first["entry"]["gaps"]
+
+    calls = fake_services.install(monkeypatch)                              # the services answer again
+    messages = []
+    second = world.publish(bundle_dir, dry_run=True, log=messages.append)
+    assert calls == [] and any("using the folder completed at" in message for message in messages)
+    assert second["entry"]["hash"] == first["entry"]["hash"]
+    assert second["entry"]["lookups"]["unanswered"] == first["entry"]["lookups"]["unanswered"]
+    third = world.publish(bundle_dir, dry_run=True, refresh=True)
+    assert calls and third["entry"]["lookups"]["unanswered"] == [] and third["entry"]["gaps"] == []
+    assert third["entry"]["hash"] != first["entry"]["hash"]
+
+
+def test_the_tool_says_that_the_length_is_not_given_and_only_warns(world, bundle_dir, capsys):
+    """A bundle without a simulated length, published with --id: the dry run does not print ``None us``."""
+    spec = importlib.util.spec_from_file_location("publish_entry_tool", REPO_ROOT / "scripts" / "publish_entry.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    given = {"length": 2.5, "package": "GROMACS", "forcefield": "GLYCAM_06j", "temperature": 300.0, "pressure": 1.0, "salt": 150.0}
+    assert tool._simulation_line(given) == "2.5 us, GROMACS, GLYCAM_06j, 300.0 K, 1.0 bar, 150.0 mM"       # as before
+    assert tool._simulation_line({**given, "length": None, "salt": 0.0}) == (
+        "length not given, GROMACS, GLYCAM_06j, 300.0 K, 1.0 bar, 0.0 mM")
+
+    submission = entry_complete.submission_from_bundle(entry_complete.load_bundle(bundle_dir), GS)
+    assert "simulation_length_ns" not in submission["simulation"]
+    report = world.publish(bundle_dir, submission, dry_run=True)
+    assert report["ok"] and report["entry"]["simulation"]["length"] is None
+    capsys.readouterr()
+    tool._print_entry(report)
+    status = tool._finish(argparse.Namespace(report=None), report)
+    printed = capsys.readouterr().out.splitlines()
+    line = next(text for text in printed if text.startswith("  simulation: "))
+    assert line.startswith("  simulation: length not given, ") and "None" not in line
+    assert "WARNING simulation.simulation_length_ns is not given" in printed and status == tool.EXIT_DONE
 
 
 def test_what_is_stored_has_to_be_what_its_manifest_describes(world, bundle_dir):
@@ -839,3 +1164,80 @@ def test_the_prefixes_of_a_target_do_not_overlap(fake_s3):
                   {"static_prefix": ""}, {"staging_prefix": "/"}):
         with pytest.raises(PublishEntryError):
             Target(backend, backend, **wrong)
+
+
+def places(target):
+    """Every key prefix a publication to this target writes below."""
+    return [f"{target.static_prefix}/", f"{target.raw_prefix}/", f"{target.state_prefix}/{target.static_prefix}/",
+            f"{target.staging_prefix}/{target.static_prefix}/", f"{target.history_prefix}/{target.raw_prefix}/"]
+
+
+def test_what_a_target_keeps_outside_the_published_prefixes_is_under_its_own_prefixes(fake_s3):
+    backend, _ = fake_s3
+    real = Target(backend, backend)
+    trial = Target(backend, backend, static_prefix="trial-publish/static", raw_prefix="trial-publish/raw")
+    assert (real.lock_key, real.pending_key, real.withdrawn_key, real.record_key("GS01067"), real.staged("abc")) == (
+        "publish-state/static/lock.json", "publish-state/static/pending.json", "publish-state/static/withdrawn.json",
+        "publish-state/static/entries/GS01067.json", "publish-staging/static/abc")
+    assert real.history(GLYCAM_NAME) == f"raw-history/raw/{GLYCAM_NAME}/"
+    assert (trial.lock_key, trial.pending_key, trial.withdrawn_key, trial.record_key("GS01067"), trial.staged("abc")) == (
+        "publish-state/trial-publish/static/lock.json", "publish-state/trial-publish/static/pending.json",
+        "publish-state/trial-publish/static/withdrawn.json", "publish-state/trial-publish/static/entries/GS01067.json",
+        "publish-staging/trial-publish/static/abc")
+    assert trial.history(GLYCAM_NAME) == f"raw-history/trial-publish/raw/{GLYCAM_NAME}/"
+    for target in (real, trial):
+        for key in (target.lock_key, target.pending_key, target.withdrawn_key, target.record_key("GS01067"),
+                    target.staged("abc"), target.history(GLYCAM_NAME) + "0" * 64 + "/manifest.json"):
+            assert sum(key.startswith(place) for place in places(target)) == 1, key
+    # no place of one environment lies inside a place of the other
+    assert not [(mine, other) for mine in places(real) for other in places(trial)
+                if mine.startswith(other) or other.startswith(mine)]
+
+
+def test_a_trial_under_other_prefixes_of_the_same_bucket_shares_no_key_with_the_real_one(
+        world, bundle_dir, extended_bundle, tmp_path):
+    for key in world.keys("static/") + world.keys("raw/"):                  # the same database and archive, as a trial
+        world.backend.copy(key, f"trial/{key}")
+    trial = Target(static=world.backend, raw=world.backend, static_prefix="trial/static", raw_prefix="trial/raw", workers=4)
+    website = Reader(world.backend, tmp_path / "trial-website", prefix="trial/static")
+    # a publisher of the real database holds its lock meanwhile: it is not the lock of the trial
+    entry_publish.acquire_lock(world.target, world.store(), "elsewhere:77:abcd1234", "replace", "GS00002", ttl=600, log=quiet)
+    lock_of(world, host="elsewhere")
+    real_before = {key: content for key, content in stored_tree(world.backend, "").items() if not key.startswith("trial/")}
+    world.client.calls.clear()
+
+    def in_the_trial(action, bundle, submission, name):
+        return entry_publish.publish_entry(action, bundle, submission, trial, work_dir=tmp_path / name, log=quiet)
+
+    assert in_the_trial("publish", bundle_dir, record(), "work-trial")["status"] == "published"
+    replaced = in_the_trial("replace", extended_bundle, record(simulation={"simulation_length_ns": 3100.0}), "work-trial-2")
+    first_sha256 = hashlib.sha256((bundle_dir / "archive" / "manifest.json").read_bytes()).hexdigest()
+    assert replaced["status"] == "published" and replaced["raw"]["key_prefix"] == f"trial/raw/{GLYCAM_NAME}/"
+    assert replaced["raw"]["history"] == [f"raw-history/trial/raw/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
+    assert website.try_sync() is None and website.glycans() == sorted(PUBLISHED + (GS,))
+    assert entry_publish.withdraw_entry("GS00002", trial, tmp_path / "work-trial-3", log=quiet)["status"] == "withdrawn"
+
+    # everything the trial wrote is in its own places, and what the real one keeps is byte for byte what it was
+    written = sorted({call[2] for call in world.writes()})
+    assert written and all(sum(key.startswith(place) for place in places(trial)) == 1 for key in written), written
+    assert not [key for key in written if any(key.startswith(place) for place in places(world.target))]
+    assert {key: content for key, content in stored_tree(world.backend, "").items() if not key.startswith("trial/")
+            and not any(key.startswith(place) for place in places(trial))} == real_before
+    assert world.keys("raw-history/") == replaced["raw"]["history"]
+    assert world.keys("publish-state/") == [
+        f"{STATE}/lock.json", "publish-state/trial/static/entries/GS00002.json",
+        f"publish-state/trial/static/entries/{GS}.json", "publish-state/trial/static/withdrawn.json"]
+    assert world.keys("publish-staging/") == []
+
+    # and the real one is published afterwards as if there had been no trial
+    world.backend.unlink(f"{STATE}/lock.json")
+    assert world.publish(bundle_dir)["status"] == "published"
+    again = world.publish(extended_bundle, record(simulation={"simulation_length_ns": 3100.0}), action="replace",
+                          work_dir=tmp_path / "work-real-2")
+    assert again["raw"]["relation"] == "extension"
+    assert again["raw"]["history"] == [f"raw-history/raw/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
+    assert world.keys("raw-history/") == sorted(again["raw"]["history"] + replaced["raw"]["history"])
+    assert entry_publish.status(world.target, "GS00002")["entry"]["state"] == "published"
+    assert entry_publish.status(trial, "GS00002")["entry"]["state"] == "withdrawn"
+    assert world.reader.try_sync() is None and world.reader.glycans() == sorted(PUBLISHED + (GS,))
+    assert website.try_sync() is None and website.glycans() == sorted(set(PUBLISHED + (GS,)) - {"GS00002"})
