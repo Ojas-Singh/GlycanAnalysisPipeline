@@ -18,6 +18,7 @@ import fnmatch
 import hashlib
 import mimetypes
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
@@ -1638,6 +1639,9 @@ def get_storage_manager() -> StorageManager:
     return _storage_manager
 
 
+_local_storage_lock = threading.RLock()
+
+
 @contextlib.contextmanager
 def local_storage() -> Iterator[None]:
     """Local files for the pipeline functions that go through the storage manager.
@@ -1647,15 +1651,17 @@ def local_storage() -> Iterator[None]:
     a ``.env`` file selects; the manager that was there is put back
     afterwards.  For code that works on local folders only (completing and
     publishing one entry) in a process whose environment names a remote
-    storage.  The manager is one per process: not for concurrent use.
+    storage.  The manager is one per process, so one thread at a time is
+    inside such a block; another one waits.
     """
     global _storage_manager
-    previous = _storage_manager
-    _storage_manager = StorageManager(LocalStorageBackend())
-    try:
-        yield
-    finally:
-        _storage_manager = previous
+    with _local_storage_lock:
+        previous = _storage_manager
+        _storage_manager = StorageManager(LocalStorageBackend())
+        try:
+            yield
+        finally:
+            _storage_manager = previous
 
 
 def reset_storage_manager() -> None:

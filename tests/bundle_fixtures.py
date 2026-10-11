@@ -91,6 +91,26 @@ def make_bundle(dest: Path, run_dir: Path, archive_entry: Path, **fields: Any) -
     return dest
 
 
+def renamed_bundle(dest: Path, bundle_dir: Path, glycam_name: str) -> Path:
+    """A copy of a bundle whose three documents name another glycan (same files otherwise).
+
+    For tests that need a second entry and not a second analysis.
+    """
+    dest = Path(dest)
+    shutil.copytree(bundle_dir, dest)
+    (dest / "bundle.json").unlink()
+    manifest = json.loads((dest / "archive" / "manifest.json").read_text())
+    manifest.update(glycam_name=glycam_name, folder=glycam_name, object_key_prefix=f"raw/{glycam_name}/")
+    manifest["source"]["folder"] = glycam_name
+    (dest / "archive" / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    result = json.loads((dest / "result.json").read_text())
+    result.update(glycam_name=glycam_name, folder=glycam_name)
+    result["input"]["glycam_name"] = glycam_name
+    (dest / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    write_bundle_json(dest)
+    return dest
+
+
 def submission_record(glycoshape_id: str, glycam_name: str, **fields: Any) -> Dict[str, Any]:
     """A complete submission record; ``fields`` replace the top-level ones."""
     record = {

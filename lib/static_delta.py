@@ -269,7 +269,14 @@ def change_manifest(
     else:
         if not isinstance(entry, dict) or not entry.get("files"):
             raise DeltaError(f"the folder of {glycan_id} holds no files")
-        glycans[glycan_id] = entry
+        # A file of a replaced glycan that did not change keeps its stored entry (its time included).
+        stored_files = (glycans.get(glycan_id) or {}).get("files") or {}
+        files = {
+            name: stored_files[name] if name in stored_files and all(
+                stored_files[name].get(key) == info.get(key) for key in ("path", "sha256", "size")) else info
+            for name, info in entry["files"].items()
+        }
+        glycans[glycan_id] = glybake.manifest_glycan_entry(glycan_id, files)
     roots = copy.deepcopy(stored_manifest["root_files"])
     for name, path in root_files.items():
         size, digest = _sha256(Path(path))
