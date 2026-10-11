@@ -146,8 +146,9 @@ class Policy:
     its SNFG image.  ``overwrite_raw``: replace a stored raw entry by one
     that does not extend it.  ``keep_previous_raw``: what of a replaced raw
     entry is copied to the history prefix first: ``auto`` (its manifest when
-    the new entry extends it, every file otherwise), ``manifest``, ``all``
-    or ``none``.
+    the new entry extends it, every file otherwise), ``manifest`` or
+    ``all``.  The manifest is always kept: it is the record of what was
+    replaced, and what an interrupted replacement is resumed by.
     """
 
     levels: Optional[Tuple[int, ...]] = None
@@ -755,13 +756,13 @@ def plan_raw(target: Target, store: Store, bundle: entry_complete.Bundle, policy
         refused.append(
             "a raw entry with other files is stored for this glycan and the bundle does not extend it: "
             "replacing it needs --overwrite-raw")
-    if policy.keep_previous_raw not in ("auto", "manifest", "all", "none"):
-        refused.append(f"keep_previous_raw is {policy.keep_previous_raw!r}: auto, manifest, all or none")
+    if policy.keep_previous_raw not in ("auto", "manifest", "all"):
+        refused.append(f"keep_previous_raw is {policy.keep_previous_raw!r}: auto, manifest or all")
     keep = policy.keep_previous_raw
     if keep == "auto":
         keep = "all" if relation == "overwrite" else "manifest"
     history: List[Tuple[str, str]] = []
-    if stored_manifest is not None and relation in ("extension", "same-data", "overwrite") and keep != "none":
+    if stored_manifest is not None and relation in ("extension", "same-data", "overwrite"):
         kept = sorted(listing) if keep == "all" else [key_prefix + archive.MANIFEST_FILE]
         history = [(key, f"{history_prefix}{stored_sha256}/{key[len(key_prefix):]}") for key in kept]
 
