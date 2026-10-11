@@ -881,6 +881,55 @@ def test_an_entry_without_identity_or_image_is_published_only_when_allowed(world
     assert "archetype.glytoucan" in kept["gaps"]                            # what a later refresh has to fill
 
 
+def test_a_folder_that_was_completed_with_problems_is_completed_again_at_the_next_run(world, bundle_dir, monkeypatch):
+    """The SNFG renderer was missing; when it is there, the same command with the same work folder publishes."""
+    fake_services.install(monkeypatch, snfg=False)
+    first = world.publish(bundle_dir, dry_run=True)
+    assert first["refused"] == ["the entry is not complete: snfg.svg is missing (the SNFG renderer did not run)"]
+    assert first["entry"]["file_count"] == 24 and not (world.tmp / "work" / "static" / GS / "snfg.svg").exists()
+    journal = json.loads((world.tmp / "work" / "journal.json").read_text())
+    assert journal["status"] == "refused" and journal["steps"]["complete"]["problems"] == first["entry"]["problems"]
+    # as long as the machine is what it was the folder comes out the same, also for who allows it as it is
+    messages = []
+    allowed = world.publish(bundle_dir, dry_run=True, policy=Policy(allow_incomplete=True), log=messages.append)
+    assert allowed["ok"] and allowed["entry"]["hash"] == first["entry"]["hash"]
+    assert any("was not complete (snfg.svg is missing (the SNFG renderer did not run)): completing it again" in message
+               for message in messages)
+
+    calls = fake_services.install(monkeypatch)                              # the renderer is installed
+    messages.clear()
+    second = world.publish(bundle_dir, dry_run=True, log=messages.append)
+    assert second["ok"] and second["refused"] == [] and second["entry"]["problems"] == []
+    assert second["entry"]["file_count"] == 25 and second["entry"]["hash"] != first["entry"]["hash"]
+    assert (world.tmp / "work" / "static" / GS / "snfg.svg").is_file() and calls
+    assert any("completing it again" in message for message in messages)
+    # a folder without problems is the one that is kept, approved and published
+    calls.clear()
+    messages.clear()
+    done = world.publish(bundle_dir, expect_hash=second["entry"]["hash"], log=messages.append)
+    assert done["status"] == "published" and done["entry"]["hash"] == second["entry"]["hash"] and calls == []
+    assert any("using the folder completed at" in message for message in messages)
+    assert world.reader.try_sync() is None and (world.reader.folder / GS / "snfg.svg").is_file()
+
+
+def test_a_folder_with_lookups_that_were_not_answered_is_kept_until_a_refresh(world, bundle_dir, monkeypatch):
+    """Not a problem of the folder: what was approved is what is published, and --refresh-metadata asks again."""
+    fake_services.install(monkeypatch, online=False)                        # no service answers; the local tools work
+    first = world.publish(bundle_dir, dry_run=True)
+    assert first["ok"] and first["entry"]["problems"] == []
+    assert first["entry"]["lookups"]["unanswered"] and "archetype.glytoucan" in first["entry"]["gaps"]
+
+    calls = fake_services.install(monkeypatch)                              # the services answer again
+    messages = []
+    second = world.publish(bundle_dir, dry_run=True, log=messages.append)
+    assert calls == [] and any("using the folder completed at" in message for message in messages)
+    assert second["entry"]["hash"] == first["entry"]["hash"]
+    assert second["entry"]["lookups"]["unanswered"] == first["entry"]["lookups"]["unanswered"]
+    third = world.publish(bundle_dir, dry_run=True, refresh=True)
+    assert calls and third["entry"]["lookups"]["unanswered"] == [] and third["entry"]["gaps"] == []
+    assert third["entry"]["hash"] != first["entry"]["hash"]
+
+
 def test_what_is_stored_has_to_be_what_its_manifest_describes(world, bundle_dir):
     inventory = world.backend.read_binary("static/GLYCOSHAPE.json")
     world.backend.write_binary("static/GLYCOSHAPE.json", inventory + b"\n")        # replaced by something else

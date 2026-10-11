@@ -1137,7 +1137,22 @@ def check_bundle_policy(bundle: entry_complete.Bundle, policy: Policy) -> Tuple[
 def _complete(bundle: entry_complete.Bundle, submission: entry_complete.Submission, work: Path, journal: Journal,
               offline: Optional[bool], lookup_timeout: Optional[float], lookup_budget: Optional[float],
               refresh: bool, log: Log) -> Dict[str, Any]:
-    """The completed folder of the entry in the work folder: the one of an earlier run, or a new one."""
+    """The completed folder of the entry in the work folder: the one of an earlier run, or a new one.
+
+    The folder of an earlier run is kept when it was made from the same
+    bundle, submission and levels, is still what it was, and had no
+    ``problems``.  Problems are what an entry is refused for (a file that
+    is missing, no SNFG image, neither WURCS nor accession), and they say
+    as much about the machine the folder was completed on as about the
+    entry: a renderer that was not installed, a tool that could not be run.
+    Such a folder is completed again at every run, so a machine that was
+    repaired is noticed by the next run and not only by a new work folder.
+    Without ``allow_incomplete`` nothing was published from it, so nothing
+    is lost; with it the folder comes out the same on the same machine with
+    the same answers, and ``expect_hash`` stops anything else than what was
+    approved.  Lookups that were not answered are not problems: a folder
+    with such gaps is kept, as what was approved, until ``refresh``.
+    """
     fingerprint = hashlib.sha256(
         f"{bundle.sha256}\0{submission.sha256()}\0{list(bundle.levels)}".encode()).hexdigest()
     folder = work / "static" / submission.glycoshape_id
@@ -1149,8 +1164,11 @@ def _complete(bundle: entry_complete.Bundle, submission: entry_complete.Submissi
         except ValueError:
             report = None
         if report is not None and static_delta.folder_entry(folder)["hash"] == kept.get("hash"):
-            log(f"using the folder completed at {kept['at']} ({folder})")
-            return report
+            if not report.get("problems"):
+                log(f"using the folder completed at {kept['at']} ({folder})")
+                return report
+            log(f"the folder completed at {kept['at']} was not complete ({'; '.join(report['problems'])}): "
+                "completing it again")
     report = entry_complete.complete_entry(
         bundle.path, submission, work / "static", offline=offline, lookup_timeout=lookup_timeout,
         lookup_budget=lookup_budget, bundle=bundle)
@@ -1158,7 +1176,7 @@ def _complete(bundle: entry_complete.Bundle, submission: entry_complete.Submissi
     _write_json(report_path, report)
     journal.step("complete", fingerprint=fingerprint, hash=report["hash"], files=report["file_count"],
                  bytes=report["total_size"], offline=report["lookups"]["offline"],
-                 unanswered=report["lookups"]["unanswered"])
+                 unanswered=report["lookups"]["unanswered"], problems=report["problems"])
     log(f"completed {folder.name}: {report['file_count']} files, {report['total_size'] / 1e6:.1f} MB; "
         f"{len(report['gaps'])} empty identity field(s), {len(report['lookups']['unanswered'])} lookup(s) unanswered")
     return report
@@ -1237,7 +1255,9 @@ def publish_entry(
     the same work folder continues an interrupted run and publishes the same
     bytes.  ``expect_hash`` is the folder hash an administrator approved (of
     the report of a dry run): a folder that comes out differently is not
-    published.  ``refresh`` completes the folder again (new lookups).
+    published.  ``refresh`` completes the folder again (new lookups); a
+    folder that was completed with problems is completed again at every run
+    (:func:`_complete`).
 
     Checked before anything is written: the bundle (its hashes, levels,
     pipeline; ``policy``), the entry (complete), the ID (new for
