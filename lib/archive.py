@@ -35,6 +35,14 @@ asked for.  The entry then holds every complete frame, in source order, and
 its manifest says under ``source_irregularities`` what was wrong with the
 source and which of its bytes are not in the archive; see
 :class:`PdbTrajectory`.
+
+An entry can also hold several trajectories one after the other: the replicas
+of a run, or an existing entry and the trajectories it was extended with.  Its
+manifest then lists them under ``segments`` (and ``extends``), next to
+everything a manifest has always had, and the readers here read it like any
+other entry.  ``lib/archive_segments.py`` writes such entries; a manifest
+without ``segments`` is that of one ``simulation.pdb`` and is written here,
+as before.
 """
 from __future__ import annotations
 
@@ -60,6 +68,8 @@ ARCHIVE_SCHEMA = "glycoshape-raw-trajectory"
 INDEX_SCHEMA = "glycoshape-raw-trajectory-index"
 SCHEMA_VERSION = 1
 CONVERTER_VERSION = "1.0.0"
+#: Version of the ``segments`` / ``extends`` records of a manifest (``segments_version``).
+SEGMENTS_VERSION = 1
 
 TRAJECTORY_FILE = "trajectory.xtc"
 TOPOLOGY_FILE = "topology.pdb"
@@ -1353,17 +1363,23 @@ def _xtc_file_class():
 
 
 class _XtcWriter:
-    """Appends integer coordinates (0.001 A) to an XTC at precision 0.0001 nm."""
+    """Appends integer coordinates (0.001 A) to an XTC at precision 0.0001 nm.
 
-    def __init__(self, path: PathLike) -> None:
+    ``first_index`` is the step and time of the first frame written: 0 for a
+    trajectory of its own, the number of frames before it for a part that is
+    appended to others (``lib/archive_segments.py``).
+    """
+
+    def __init__(self, path: PathLike, first_index: int = 0) -> None:
         self._file = _xtc_file_class()(str(path), "w")
+        self.first_index = int(first_index)
         self.frames = 0
 
     def write(self, coordinates: np.ndarray, cell: Optional[Cell]) -> None:
         count = len(coordinates)
         xyz = np.empty(coordinates.shape, dtype=np.float32)
         np.divide(coordinates, float(XTC_PRECISION), out=xyz, casting="same_kind")
-        index = np.arange(self.frames, self.frames + count)
+        index = np.arange(self.first_index + self.frames, self.first_index + self.frames + count)
         box = np.ascontiguousarray(np.broadcast_to(cell_to_vectors_nm(cell), (count, 3, 3)))
         self._file._write(
             xyz,
@@ -1618,11 +1634,13 @@ def _read_back(
     atoms: int,
     on_frames: Optional[Callable[[int, np.ndarray], None]] = None,
     chunk: int = DEFAULT_CHUNK_FRAMES,
+    first_index: int = 0,
 ) -> Dict[str, Any]:
     """Decode ``trajectory.xtc`` completely and summarise what it holds.
 
     ``on_frames(first_frame, values)`` receives every decoded chunk as int32
-    in units of 0.001 A.
+    in units of 0.001 A.  ``first_index`` is the step and time the first
+    frame has to carry: 0 for an entry, the frames before it for a part.
     """
     digest = hashlib.sha256()
     frames = 0
@@ -1639,7 +1657,7 @@ def _read_back(
         # exact is nm as stored; values / 1000 is the decimal number of the text
         max_difference = max(max_difference, float(np.abs(exact * 10.0 - values / 1000.0).max()))
         max_abs = max(max_abs, int(np.abs(values).max()))
-        expected = np.arange(frames, frames + len(xyz))
+        expected = np.arange(first_index + frames, first_index + frames + len(xyz))
         index_ok = index_ok and np.array_equal(steps, expected) and np.array_equal(times, expected.astype(np.float32))
         if on_frames is not None:
             on_frames(frames, values)
@@ -1959,12 +1977,17 @@ def _compare_stream(pdb_path: Path, entry_dir: Path, repair: bool = False) -> Di
     }
 
 
-def _verify_trajectory(pdb_path: Path, entry_dir: Path, source: PdbTrajectory, check_frames: int) -> Dict[str, Any]:
-    """Read the written XTC back and compare it with what ``source`` parsed."""
+def _verify_trajectory(
+    pdb_path: Path, entry_dir: Path, source: PdbTrajectory, check_frames: int, first_index: int = 0
+) -> Dict[str, Any]:
+    """Read the written XTC back and compare it with what ``source`` parsed.
+
+    ``first_index`` is the step and time of its first frame (see :func:`_read_back`).
+    """
     irregularities = source.irregularities
     check = _ReferenceCheck(pdb_path, source, _sample_indices(source.n_frames, check_frames, irregularities))
     try:
-        back = _read_back(entry_dir, source.n_atoms, on_frames=check)
+        back = _read_back(entry_dir, source.n_atoms, on_frames=check, first_index=first_index)
     finally:
         check.close()
     precision = back["precision"]
@@ -2019,12 +2042,77 @@ def _verify_trajectory(pdb_path: Path, entry_dir: Path, source: PdbTrajectory, c
     return verification
 
 
+def segments_of(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """``segments`` of a manifest; empty for an entry made from one ``simulation.pdb``.
+
+    An entry made from several trajectories (the replicas of a run, or an
+    entry that was extended) lists them in order: each segment is the frames
+    ``first_frame`` to ``first_frame + frames`` of the trajectory.  See
+    ``lib/archive_segments.py``, which writes such entries.
+    """
+    segments = manifest.get("segments")
+    return segments if isinstance(segments, list) else []
+
+
+class _SegmentDigests:
+    """SHA-256 of the coordinates of every segment, from the decoded chunks of the trajectory.
+
+    A callback of :func:`_read_back`; ``lengths`` are the frames of the
+    segments in order.  The digest of a segment is that of its coordinates as
+    int32 little-endian in units of 0.001 A, as for the whole trajectory.
+    """
+
+    def __init__(self, lengths: Sequence[int]) -> None:
+        self._bounds = np.concatenate(([0], np.cumsum(np.asarray(lengths, dtype=np.int64))))
+        self._digests = [hashlib.sha256() for _ in lengths]
+        self.frames = 0
+
+    def __call__(self, first: int, values: np.ndarray) -> None:
+        last = first + len(values)
+        self.frames = max(self.frames, last)
+        segment = int(np.searchsorted(self._bounds, first, side="right")) - 1
+        while first < last and segment < len(self._digests):
+            stop = min(last, int(self._bounds[segment + 1]))
+            if stop > first:
+                self._digests[segment].update(np.ascontiguousarray(values[: stop - first]))
+                values = values[stop - first:]
+                first = stop
+            segment += 1
+
+    def hexdigests(self) -> List[str]:
+        return [digest.hexdigest() for digest in self._digests]
+
+
+def check_segment_records(manifest: Dict[str, Any]) -> List[str]:
+    """Problems in the ``segments`` of a manifest: they have to cover its frames once, in order."""
+    problems: List[str] = []
+    position = 0
+    for index, segment in enumerate(segments_of(manifest)):
+        try:
+            first, frames = int(segment["first_frame"]), int(segment["frames"])
+            if not isinstance(segment["coordinates_sha256"], str):
+                raise TypeError("coordinates_sha256 is not a string")
+        except (KeyError, TypeError, ValueError) as exc:
+            problems.append(f"segment {index} is incomplete: {type(exc).__name__}: {exc}")
+            return problems
+        if first != position or frames < 1:
+            problems.append(
+                f"segment {index} holds frames {first} to {first + frames}, expected to start at frame {position}"
+            )
+            return problems
+        position += frames
+    if segments_of(manifest) and position != int(manifest["frames"]):
+        problems.append(f"the segments hold {position} frames, the manifest says {manifest['frames']}")
+    return problems
+
+
 def verify_entry(
     entry_dir: PathLike,
     source_dir: Optional[PathLike] = None,
     deep: bool = True,
     check_frames: int = DEFAULT_CHECK_FRAMES,
     name_override: Optional[str] = None,
+    check_folder: bool = True,
 ) -> Dict[str, Any]:
     """Verify an archive entry; returns ``{"ok": bool, "errors": [...], ...}``.
 
@@ -2048,6 +2136,14 @@ def verify_entry(
     such a name cannot be confirmed from the source folder alone: without
     ``name_override`` it is not compared and the report says so
     (``glycam_name_checked`` is false).
+
+    ``check_folder=False`` accepts an entry in a folder that is not named by
+    its manifest, such as ``archive/`` of an extracted entry bundle.
+
+    An entry with ``segments`` (several trajectories, ``lib/archive_segments.py``)
+    is checked the same way; ``deep`` also compares the coordinates of every
+    segment with the digest of its record (``segments_checked``).  It cannot
+    be compared with one source folder: ``source_dir`` is then an error.
     """
     entry_dir = Path(entry_dir)
     report: Dict[str, Any] = {"ok": False, "errors": [], "entry": str(entry_dir)}
@@ -2063,7 +2159,7 @@ def verify_entry(
         if manifest["folder"] != entry_folder_name(manifest["glycam_name"]):
             errors.append("manifest folder is not the folder name of its GLYCAM name")
         folder = os.path.basename(os.path.abspath(entry_dir))
-        if manifest["folder"] != folder:
+        if check_folder and manifest["folder"] != folder:
             errors.append(f"entry folder is {folder}, the manifest says {manifest['folder']}")
         files = manifest["files"]
         for required in (TRAJECTORY_FILE, TOPOLOGY_FILE, MOL2_FILE):
@@ -2086,6 +2182,16 @@ def verify_entry(
                     f"source_irregularities says {irregularities['frames_kept']} frames were kept, "
                     f"the manifest says {frames} frames"
                 )
+        segments = segments_of(manifest)
+        errors.extend(check_segment_records(manifest))
+        if segments:
+            report["segments"] = len(segments)
+            if repair_summary(manifest) is not None:
+                report["repaired"] = True
+            if source_dir is not None:
+                errors.append(
+                    f"the entry was made from {len(segments)} segments; it cannot be compared with one source folder"
+                )
     except (KeyError, TypeError, ValueError, NamingError) as exc:
         errors.append(f"incomplete manifest: {type(exc).__name__}: {exc}")
         return report
@@ -2095,6 +2201,7 @@ def verify_entry(
     # With a source: every coordinate of the text against the archive first;
     # this also gives the byte offsets of the frames for the reference check.
     check: Optional[_ReferenceCheck] = None
+    segment_digests = _SegmentDigests([int(segment["frames"]) for segment in segments]) if segments else None
     if source_dir is not None:
         try:
             inputs = source_inputs(source_dir)
@@ -2131,12 +2238,21 @@ def verify_entry(
 
     if deep or check is not None:
         try:
-            back = _read_back(entry_dir, atoms, on_frames=check)
+            # A segmented entry has no source folder to compare with, so there is no reference check then.
+            back = _read_back(entry_dir, atoms, on_frames=check if check is not None else segment_digests)
             if deep:
                 if back["frames"] != frames:
                     errors.append(f"{TRAJECTORY_FILE} holds {back['frames']} frames, the manifest says {frames}")
                 if back["coordinates_sha256"] != manifest["trajectory"]["coordinates_sha256"]:
                     errors.append("coordinates of the trajectory do not match the digest of the manifest")
+                if segment_digests is not None:
+                    for index, (segment, found) in enumerate(zip(segments, segment_digests.hexdigests())):
+                        if found != segment["coordinates_sha256"]:
+                            errors.append(
+                                f"coordinates of segment {index} ({segment.get('name')}) do not match the digest "
+                                "of its record"
+                            )
+                    report["segments_checked"] = len(segments)
                 if not back["index_ok"]:
                     errors.append("step and time of the trajectory are not the frame index")
                 if back["precision"] not in (None, float(XTC_PRECISION)):
@@ -2252,9 +2368,16 @@ def convert_entry(
         if manifest is not None:
             return {"status": "skipped", "manifest": manifest, "entry": str(final), "timing": {}}
         try:
-            other = load_manifest(final)["source"]["folder"] if final.exists() else source_dir.name
+            existing = load_manifest(final) if final.exists() else None
+            other = existing["source"]["folder"] if existing is not None else source_dir.name
         except (VerificationError, KeyError, TypeError):
-            other = source_dir.name   # unreadable entry: replaced below
+            existing, other = None, source_dir.name   # unreadable entry: replaced below
+        if existing is not None and segments_of(existing):
+            raise ArchiveError(
+                f"the entry of this GLYCAM name holds {len(segments_of(existing))} segments "
+                "(lib/archive_segments.py); the conversion of one source folder does not replace it "
+                "(force does)"
+            )
         if other != source_dir.name:
             raise NamingError(
                 f"the entry of this GLYCAM name was converted from source folder {other}; "
@@ -2394,10 +2517,32 @@ def iter_entry_dirs(archive_dir: PathLike) -> Iterator[Path]:
 
 
 def repair_summary(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The short form of ``source_irregularities`` for an index or a report; None for a regular entry."""
+    """The short form of ``source_irregularities`` for an index or a report; None for a regular entry.
+
+    An entry with ``segments`` keeps the record of a damaged source in the
+    segment that came from it; the short form then adds up the segments that
+    have one (``frames_in_source`` counts the frames of those sources only)
+    and names them under ``segments``.
+    """
     irregularities = manifest.get("source_irregularities")
     if irregularities is None:
-        return None
+        repaired = [
+            (index, segment["source_irregularities"]) for index, segment in enumerate(segments_of(manifest))
+            if isinstance(segment, dict) and segment.get("source_irregularities") is not None
+        ]
+        if not repaired:
+            return None
+        counts: Counter = Counter()
+        for _, record in repaired:
+            counts.update(record["counts"])
+        return {
+            "frames_in_source": sum(record["frames_in_source"] for _, record in repaired),
+            "frames_dropped": sum(record["frames_dropped"] for _, record in repaired),
+            "bytes_ignored": sum(record["bytes_ignored"] for _, record in repaired),
+            "truncated": any(record["truncated"] for _, record in repaired),
+            "counts": dict(sorted(counts.items())),
+            "segments": [index for index, _ in repaired],
+        }
     return {
         "frames_in_source": irregularities["frames_in_source"],
         "frames_dropped": irregularities["frames_dropped"],
