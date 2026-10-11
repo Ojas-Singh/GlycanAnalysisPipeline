@@ -220,6 +220,49 @@ def test_the_command_line_tool_end_to_end(published, bundle_dir, tmp_path, s3_se
     tool.assert_no_credential_anywhere(work, tmp_path / "work-replace", tmp_path / "work-withdraw", reports)
 
 
+#: A stand-in for the crabwurcs executable: ``render`` writes an SVG, ``convert ... --to wurcs`` answers with a WURCS.
+RENDERER = """#!/bin/sh
+name=$(cat)
+if [ "$1" = render ]; then
+    printf '<svg xmlns="http://www.w3.org/2000/svg"><!-- %s --></svg>' "$name" > "$5"
+elif [ "$1" = convert ] && [ "$5" = wurcs ]; then
+    printf 'WURCS=2.0/stand-in/%s' "$name"
+else
+    exit 1
+fi
+"""
+
+
+def test_the_tool_completes_a_refused_entry_again_once_the_renderer_is_there(published, bundle_dir, tmp_path, s3_server):
+    """As in the first trial: crabwurcs was missing, it was installed, and the same command ran with the same work folder."""
+    once("renderer", s3_server)
+    tool = Tool(s3_server, published["bucket"], tmp_path)
+    submission = tmp_path / "submission.json"
+    submission.write_text(json.dumps(submission_record(GS, GLYCAM_NAME)))
+    command = ("publish", "--bundle", bundle_dir, "--submission", submission, "--work-dir", tmp_path / "work",
+               "--offline", "--dry-run")
+    refused = tool.run(*command, expect=2)
+    assert "REFUSED the entry is not complete: snfg.svg is missing (the SNFG renderer did not run)" in refused.stderr
+    assert not (tmp_path / "work" / "static" / GS / "snfg.svg").exists()
+
+    renderer = tmp_path / "crabwurcs"
+    renderer.write_text(RENDERER)
+    renderer.chmod(0o755)
+    tool.environment["GLYCOSHAPE_CRABWURCS_BIN"] = str(renderer)
+    dry = tool.run(*command)
+    assert "was not complete (snfg.svg is missing" in dry.stdout and "completing it again" in dry.stdout
+    assert "dry run: nothing was written to the storage; this entry would be published" in dry.stdout
+    assert (tmp_path / "work" / "static" / GS / "snfg.svg").is_file()
+    again = tool.run(*command)                                  # complete now: the folder is kept
+    assert "using the folder completed at" in again.stdout and "this entry would be published" in again.stdout
+
+    # a bundle that does not state its length, published with --id: said in words, and a warning
+    by_id = tool.run("publish", "--bundle", bundle_dir, "--id", GS, "--work-dir", tmp_path / "work-id", "--offline", "--dry-run")
+    assert "  simulation: length not given, " in by_id.stdout and "None us" not in by_id.stdout
+    assert "WARNING simulation.simulation_length_ns is not given" in by_id.stdout
+    assert [item["key"] for item in published["backend"].list_objects("publish-")] == []          # dry runs: nothing written
+
+
 def test_two_processes_publishing_at_once_do_not_lose_an_entry(published, bundle_dir, tmp_path, s3_server):
     once("two processes", s3_server)
     backend, reader = published["backend"], published["reader"]

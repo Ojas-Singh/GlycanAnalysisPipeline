@@ -72,7 +72,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         command.add_argument("--raw-bucket", help="Archive bucket (default: GLYCOSHAPE_S3_RAW_BUCKET).")
         command.add_argument("--static-prefix", help="Published prefix (default: GLYCOSHAPE_S3_STATIC_PREFIX, static).")
         command.add_argument("--raw-prefix", help="Raw prefix (default: GLYCOSHAPE_S3_RAW_PREFIX, raw).")
-        command.add_argument("--workers", type=int, default=8, help="Parallel requests (default 8).")
+        command.add_argument("--workers", type=int, default=8,
+                             help="Parallel requests (default 8); also how many copies of the switch are made at the "
+                                  "same time, which is what its duration depends on.")
         command.add_argument("--report", type=Path, help="Write the report of the run to this JSON file.")
         if name in ("publish", "replace", "withdraw", "recover"):
             command.add_argument("--lock-ttl", type=float, default=3600.0,

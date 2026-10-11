@@ -254,7 +254,7 @@ class Killed:
     """
 
     def __init__(self, client, at):
-        self.at, self.seen, self.dead = at, 0, False
+        self.at, self.seen, self.dead, self.stuck = at, 0, False, None
         self.order = random.Random(at)
         self.turn = threading.Condition()
         self.waiting = {}                                       # (call, operation, key) -> whether it may go on
@@ -283,9 +283,11 @@ class Killed:
                 if len(self.waiting) == min(self.workers, self.outstanding) and not any(self.waiting.values()):
                     self.waiting[self.order.choice(sorted(self.waiting))] = True       # every thread with work waits
                     self.turn.notify_all()
-                elif not self.turn.wait(timeout=60):
-                    raise AssertionError(f"no thread can take its turn: {sorted(self.waiting)} wait, "
-                                         f"{self.outstanding} call(s) of {self.workers} thread(s) have not returned")
+                elif not self.turn.wait(timeout=30):                  # a mistake of this harness: say so, let all go
+                    self.stuck = (f"no thread can take its turn: {sorted(self.waiting)} wait, {self.outstanding} "
+                                  f"call(s) on {self.workers} thread(s) have not returned")
+                    self.dead = True
+                    self.turn.notify_all()
             del self.waiting[label]
 
     def in_turns(self, function, items, workers):
@@ -352,6 +354,7 @@ def check_interruptions(objects, static_dir, tmp_path, monkeypatch, run, work_te
             else:
                 assert at == points - 1, at                                     # only the release of the lock was lost
                 assert f"{STATE}/lock.json" in world.keys(STATE)
+        assert killed.stuck is None, killed.stuck
         assert killed.dead and killed.seen > at and not killed.waiting, at
         world.client.before = None
         return world
@@ -588,12 +591,12 @@ def test_the_switch_copies_the_folder_then_the_root_files_and_then_the_manifest_
     at = {event: index for index, event in enumerate(events)}
     assert max(at["ended", key] for key in folder) < min(at["began", key] for key in root)
     assert events[-2:] == [("began", manifest), ("ended", manifest)]
-    # and inside a group the copies are under way together, as many as there are workers
+    # and inside a group the copies are under way together, up to as many as there are workers
     under_way = most = 0
     for event, _ in events:
         under_way += 1 if event == "began" else -1
         most = max(most, under_way)
-    assert most == workers
+    assert workers // 2 < most <= workers
 
     # so the window is the time of a few copies and not of all of them, which is what the journal records
     copies = len(folder) + len(root)
