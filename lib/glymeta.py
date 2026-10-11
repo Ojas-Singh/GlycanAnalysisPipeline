@@ -11,6 +11,69 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _string_list(values) -> List[str]:
+    """Non-empty strings of a list, stripped, the first spelling of each (case-insensitive)."""
+    if not isinstance(values, list):
+        return []
+    normalized: List[str] = []
+    seen = set()
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def search_enrichment(
+    keywords=None,
+    common_names=None,
+    description=None,
+    package=None,
+    forcefield=None,
+    source_type=None,
+    comments=None,
+) -> Dict:
+    """Curated fields of ``search_meta`` in the form :meth:`GlycanMetadataProcessor.update_glycan_metadata` merges.
+
+    ``keywords``, ``common_names`` and ``description`` are the curated ones;
+    ``package``, ``forcefield`` and ``source_type`` add the keywords
+    ``MD:<package>``, ``FF:<force field>`` and ``Source:<type>``; ``comments``
+    end a generated description.  The fields come from the PocketBase
+    records (``lib.pocketbase.extract_search_enrichment``) or from a
+    submission record (``lib.entry_complete``).
+    """
+    extra_keywords: List[str] = []
+    if isinstance(keywords, list):
+        extra_keywords.extend(str(k) for k in keywords if k)
+
+    # Derived keywords from simulation fields
+    md_package = (package or "").strip()
+    if md_package:
+        extra_keywords.append(f"MD:{md_package}")
+
+    force_field = (forcefield or "").strip()
+    if force_field:
+        extra_keywords.append(f"FF:{force_field}")
+
+    source_type = (source_type or "").strip()
+    if source_type:
+        extra_keywords.append(f"Source:{source_type}")
+
+    return {
+        "extra_keywords": extra_keywords,
+        "user_common_names": _string_list(common_names),
+        "user_description": str(description or "").strip(),
+        "user_comments": str(comments or "").strip(),
+    }
+
+
 class GlycanMetadataProcessor:
     """Class for processing and updating glycan search metadata."""
     
@@ -453,34 +516,40 @@ class GlycanMetadataProcessor:
                 glycan_record=glycan_record,
                 submission_record=submission_record,
             )
-
-            # Add extra keywords (additive, never replace)
-            extra_kw = enrichment.get("extra_keywords", [])
-            if extra_kw:
-                current = set(search_meta.get("keywords", []))
-                current.update(extra_kw)
-                search_meta["keywords"] = sorted(list(current))
-
-            # Add user-curated common names from PocketBase (additive)
-            user_common_names = enrichment.get("user_common_names", [])
-            if user_common_names:
-                current_names = set(search_meta.get("common_names", []))
-                current_names.update(user_common_names)
-                search_meta["common_names"] = sorted(list(current_names))
-
-            # Use user-curated description from PocketBase, or generate one
-            user_desc = enrichment.get("user_description", "")
-            if user_desc:
-                search_meta["description"] = user_desc
-            elif not search_meta.get("description"):
-                search_meta["description"] = self._generate_description(
-                    data, enrichment
-                )
-
+            self._apply_enrichment(data, search_meta, enrichment)
             self.logger.info(f"Enriched search_meta from PocketBase for {gs_id}")
 
         except Exception as e:
             self.logger.warning(f"PocketBase enrichment failed for {gs_id}: {e}")
+
+    def _apply_enrichment(self, data: Dict, search_meta: Dict, enrichment: Dict) -> None:
+        """Merge curated keywords, common names and description into ``search_meta``.
+
+        ``enrichment`` is what :func:`search_enrichment` returns, whether its
+        fields came from the PocketBase records or from a submission record.
+        """
+        # Add extra keywords (additive, never replace)
+        extra_kw = enrichment.get("extra_keywords", [])
+        if extra_kw:
+            current = set(search_meta.get("keywords", []))
+            current.update(extra_kw)
+            search_meta["keywords"] = sorted(list(current))
+
+        # Add user-curated common names (additive)
+        user_common_names = enrichment.get("user_common_names", [])
+        if user_common_names:
+            current_names = set(search_meta.get("common_names", []))
+            current_names.update(user_common_names)
+            search_meta["common_names"] = sorted(list(current_names))
+
+        # Use the user-curated description, or generate one
+        user_desc = enrichment.get("user_description", "")
+        if user_desc:
+            search_meta["description"] = user_desc
+        elif not search_meta.get("description"):
+            search_meta["description"] = self._generate_description(
+                data, enrichment
+            )
 
     def _generate_description(self, data: Dict, pb_enrichment: Dict) -> str:
         """Generate a natural language description for search and vector relevance.
@@ -638,12 +707,15 @@ class GlycanMetadataProcessor:
 
         return stats
 
-    def update_glycan_metadata(self, json_file_path: Union[str, Path]) -> bool:
+    def update_glycan_metadata(self, json_file_path: Union[str, Path], enrichment: Optional[Dict] = None) -> bool:
         """Update search metadata for a single glycan JSON file.
-        
+
         Args:
             json_file_path: Path to the glycan data.json file
-            
+            enrichment: curated fields to merge (:func:`search_enrichment`).
+                When given, PocketBase is not asked: the caller is the
+                source of the curated metadata.
+
         Returns:
             True if successful, False otherwise
         """
@@ -689,8 +761,11 @@ class GlycanMetadataProcessor:
             if new_common_names:
                 self.logger.info(f"Updated common names for {json_file_path.name}: {new_common_names}")
 
-            # Enrich from PocketBase (optional, gracefully degraded)
-            self._enrich_from_pocketbase(data, search_meta)
+            # Curated fields: from the caller, or from PocketBase (optional, gracefully degraded)
+            if enrichment is not None:
+                self._apply_enrichment(data, search_meta, enrichment)
+            else:
+                self._enrich_from_pocketbase(data, search_meta)
 
             # Write updated data back to file
             with storage.open(json_file_path, 'w') as f:

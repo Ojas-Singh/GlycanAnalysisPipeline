@@ -29,6 +29,7 @@ import io
 import json
 import logging
 import re
+import shutil
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable, Optional
@@ -244,6 +245,25 @@ def _emit_multimodel_pdbs(dest_level_dir: str, source_level_dir: str, cluster_da
         logger.warning(f"Failed to emit multi-model PDBs for {level_name}: {e}")
 
 
+def anomer_remarks(
+    archetype_glytoucan: str = None,
+    archetype_iupac: str = None,
+    alpha_glytoucan: str = None,
+    alpha_iupac: str = None,
+    beta_glytoucan: str = None,
+    beta_iupac: str = None,
+) -> dict:
+    """What the GlycoShape REMARK block of the alpha and of the beta PDB files names.
+
+    An anomer without an accession or name of its own is labelled with those
+    of the archetype.
+    """
+    return {
+        "alpha": {"glytoucan": alpha_glytoucan or archetype_glytoucan, "iupac": alpha_iupac or archetype_iupac},
+        "beta": {"glytoucan": beta_glytoucan or archetype_glytoucan, "iupac": beta_iupac or archetype_iupac},
+    }
+
+
 def copy_and_convert_pdbs(
     folder_path: str,
     output_dir: str,
@@ -313,10 +333,9 @@ def copy_and_convert_pdbs(
 
         # Build multi-model PDBs for every discovered clustering level; do not emit per-cluster converted PDBs.
         try:
-            anomer_meta = {
-                "alpha": {"glytoucan": alpha_glytoucan or archetype_glytoucan, "iupac": alpha_iupac or archetype_iupac},
-                "beta": {"glytoucan": beta_glytoucan or archetype_glytoucan, "iupac": beta_iupac or archetype_iupac},
-            } if identifier_remarks else None
+            anomer_meta = anomer_remarks(
+                archetype_glytoucan, archetype_iupac, alpha_glytoucan, alpha_iupac, beta_glytoucan, beta_iupac,
+            ) if identifier_remarks else None
             _emit_multimodel_pdbs(
                 dest_level_dir=dest_level_dir,
                 source_level_dir=source_output / level_name,
@@ -368,6 +387,87 @@ def copy_analysis_files(folder_path, final_output_dir: str, level_keys: Iterable
                 content = storage.read_binary(src_file)
                 storage.write_binary(f"{landscape_dst_dir}/{landscape_file}", content)
                 logger.info(f"Copied landscape file: {landscape_file}")
+
+
+def copy_static_ready(
+    source,
+    final_output_dir,
+    cluster_data: dict,
+    archetype_glytoucan: str = None,
+    archetype_iupac: str = None,
+    alpha_glytoucan: str = None,
+    alpha_iupac: str = None,
+    beta_glytoucan: str = None,
+    beta_iupac: str = None,
+) -> list:
+    """Complete a static folder from a static-ready one (:func:`write_static_ready`), on local folders.
+
+    Writes into ``final_output_dir`` what :func:`copy_and_convert_pdbs` and
+    :func:`copy_analysis_files` write there from the process folder: the
+    files of the static-ready folder, and on every PDB file the GlycoShape
+    REMARK block with the accession and the IUPAC name of its anomer
+    (:func:`anomer_remarks`).  The levels are those of ``cluster_data``; a
+    static-ready folder that holds more is reduced as the static stage
+    reduces a process folder.  Returns the relative paths written, sorted.
+    """
+    source, destination = Path(source), Path(final_output_dir)
+    levels = configured_levels()
+    remarks = anomer_remarks(
+        archetype_glytoucan, archetype_iupac, alpha_glytoucan, alpha_iupac, beta_glytoucan, beta_iupac)
+    level_keys = sorted(
+        key for key in (cluster_data or {}).get("levels", {}) if str(key).startswith("level_"))
+    written: list = []
+
+    def place(relative: str, content: bytes) -> Path:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        written.append(relative)
+        return target
+
+    for level_key in level_keys:
+        level_dir = source / "output" / level_key
+        if (level_dir / "dist.svg").is_file():
+            place(f"output/{level_key}/dist.svg", (level_dir / "dist.svg").read_bytes())
+        for fmt in ("GLYCAM", "PDB"):
+            for anomer in ("alpha", "beta"):
+                pdb = level_dir / fmt / f"{anomer}.pdb"
+                if not pdb.is_file():
+                    continue
+                target = place(f"output/{level_key}/{fmt}/{anomer}.pdb", pdb.read_bytes())
+                glypdbio._add_pdb_remarks(
+                    str(target),
+                    glytoucan_id=remarks[anomer].get("glytoucan"),
+                    iupac=remarks[anomer].get("iupac"),
+                    cluster_id=None,
+                    cluster_population=None,
+                )
+
+    tables = list(ANALYSIS_TABLES) + [f"torsion_{level_key}_reps.csv" for level_key in level_keys]
+    def copy(relative: str) -> None:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / relative, target)
+        written.append(relative)
+
+    for csv_name in tables:
+        table = source / "output" / csv_name
+        if not table.is_file():
+            continue
+        with open(table, "rb") as handle:
+            header_block = handle.read(1 << 20)
+        if csv_other_level_columns(header_block, levels):
+            place(f"output/{csv_name}", csv_for_levels(table.read_bytes(), levels))
+        else:                                   # the usual case: a large table, copied as a stream
+            copy(f"output/{csv_name}")
+    if (source / "output" / "torparts.npz").is_file():
+        copy("output/torparts.npz")
+    if (source / "output" / "info.json").is_file():
+        place("output/info.json", info_json_for_levels((source / "output" / "info.json").read_bytes(), levels))
+    for landscape_file in LANDSCAPE_FILES:
+        if (source / "landscape" / landscape_file).is_file():
+            copy(f"landscape/{landscape_file}")
+    return sorted(written)
 
 
 def make_serializable(obj):

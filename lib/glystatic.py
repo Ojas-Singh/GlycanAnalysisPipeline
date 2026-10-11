@@ -25,6 +25,7 @@ from lib.storage import get_storage_manager
 from lib.static_ready import (
     copy_analysis_files,
     copy_and_convert_pdbs,
+    copy_static_ready,
     extract_cluster_data,
     load_info_json,
     make_serializable,
@@ -301,64 +302,13 @@ def generate_glycan_id(glycam_name: str) -> str:
     return f"GS{hash_obj.hexdigest()[:6].upper()}"
 
 
-def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -> dict:
-    """
-    Process a single glycan folder and generate static data.
-    
-    Args:
-        folder_path: Path to the glycan folder containing output/ subdirectory
-        glycam_name: GLYCAM name of the glycan
-        output_static_dir: Directory where static data will be created
-    """
-    from lib.storage import get_storage_manager
-    
-    folder_path = Path(folder_path)
-    output_dir = Path(output_static_dir)
-    storage = get_storage_manager()
-    
-    logger.info(f"Processing glycan: {glycam_name} from {folder_path}")
-    
-    # Use storage abstraction layer for validation
-    storage = get_storage_manager()
-    
-    # Validate input using storage abstraction
-    if not storage.exists(folder_path):
-        raise FileNotFoundError(f"Folder path does not exist: {folder_path}")
-    
-    output_subdir = folder_path / "output"
-    if not storage.exists(output_subdir):
-        raise FileNotFoundError(f"Output subdirectory not found: {output_subdir}")
-    
-    # Load analysis data from info.json
-    try:
-        info_data = load_info_json(folder_path)
-        cluster_data = extract_cluster_data(info_data, folder_path)
-    except Exception as e:
-        logger.error(f"Failed to load info.json: {e}")
-        raise
-    
-    # Get metadata from inventory CSV
-    try:
-        metadata = get_glycan_metadata(glycam_name)
-        ID = metadata["ID"]
-        length = _simulation_length_us(metadata, glycam_name, storage)
-        package = metadata["package"]
-        forcefield = metadata["forcefield"]
-        temperature = metadata["temperature"]
-        pressure = metadata["pressure"]
-        salt = metadata["salt"]
-        comments = metadata["comments"]
-        inventory_glytoucan = metadata["glytoucan_id"]
-    except Exception as e:
-        # A GlycoShape ID is assigned by the submissions inventory/PocketBase.
-        # Never manufacture one from a name: it looks legitimate (GSxxxxxx)
-        # but cannot be reconciled with PocketBase or the public database.
-        raise ValueError(
-            f"No registered GlycoShape submission metadata for '{glycam_name}'. "
-            "Create its PocketBase submission entry with an assigned GS00xxx ID, "
-            "then rerun the static stage."
-        ) from e
+#: The simulation fields of ``archetype`` in ``data.json``, in the units the website shows:
+#: ``length`` in microseconds, ``temperature`` in kelvin, ``pressure`` in bar, ``salt`` in mM.
+SIMULATION_FIELDS = ("length", "package", "forcefield", "temperature", "pressure", "salt")
 
+
+def checked_glycoshape_id(ID, glycam_name: str) -> str:
+    """The GlycoShape ID as the name of a static folder; raises when it is not one."""
     ID = str(ID or "").strip()
     if not re.fullmatch(r"GS\d+", ID):
         raise ValueError(
@@ -366,10 +316,12 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
             "Refusing to write static output because the destination must be a "
             "registered static/GSxxxxx child directory."
         )
+    return ID
 
-    logger.info(f"Using ID: {ID}")
 
-    # Create output directory
+def fresh_output_dir(output_static_dir, ID: str, glycam_name: str, storage) -> str:
+    """Create ``<output_static_dir>/<ID>`` empty and return it; an existing local folder is replaced."""
+    output_dir = Path(output_static_dir)
     final_output_path = output_dir / ID
     if final_output_path.parent.resolve() != output_dir.resolve():
         raise ValueError(
@@ -384,7 +336,35 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
             shutil.rmtree(storage._local_backend._resolve_path(final_output_dir))
         # For Oracle, individual files will be overwritten
     storage.mkdir(final_output_dir)
-    
+    return final_output_dir
+
+
+def write_identity_files(
+    final_output_dir: str,
+    glycam_name: str,
+    ID: str,
+    cluster_data: dict,
+    simulation: dict,
+    inventory_glytoucan: str | None = None,
+    storage=None,
+) -> dict:
+    """``snfg.svg``, ``data.json``, ``glygen.json`` and ``glycosmos.json`` of a static folder.
+
+    The part of ``static/GSxxxxx/`` that needs the GlycoShape ID, the
+    submission metadata and the name services; both ways of building a
+    static folder go through it (:func:`process_glycan` from a process
+    folder, :func:`complete_static_ready` from a static-ready one).
+    ``simulation`` holds :data:`SIMULATION_FIELDS` in the published units.
+
+    Returns ``glycan_data`` (the content of ``data.json``), ``cluster_levels``
+    (the level names of the folder) and ``remarks``: the accessions and IUPAC
+    names for the REMARK block of the PDB files, as the keyword arguments of
+    ``copy_and_convert_pdbs``.
+    """
+    if storage is None:
+        storage = get_storage_manager()
+    length, package, forcefield, temperature, pressure, salt = (simulation.get(name) for name in SIMULATION_FIELDS)
+
     # Get basic glycan info
     glycam_tidy, end_pos, end_link = name_utils.glycam_info(glycam_name)
     try:
@@ -392,7 +372,7 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
     except Exception as e:
         logger.warning(f"Could not canonicalize {glycam_name}; using original glycan string: {e}")
         iupac = glycam_name
-    
+
     # Generate SNFG diagram. Always render to a temporary local file so both
     # local and Oracle storage use the same backend path.
     temp_path = None
@@ -411,298 +391,383 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
-    
+
     # Process glycan chemical data
+    iupac_alpha = f"{iupac}(a{end_pos}-"
+    iupac_beta = f"{iupac}(b{end_pos}-"
+    glycam_alpha = f"{glycam_tidy}a{end_pos}-OH"
+    glycam_beta = f"{glycam_tidy}b{end_pos}-OH"
+
+    logger.info(f"Processing glycan: {glycam_name}, IUPAC: {iupac}, GlyCAM: {glycam_tidy}")
+
+    # Get chemical properties
     try:
-        
-        iupac_alpha = f"{iupac}(a{end_pos}-"
-        iupac_beta = f"{iupac}(b{end_pos}-"
-        glycam_alpha = f"{glycam_tidy}a{end_pos}-OH"
-        glycam_beta = f"{glycam_tidy}b{end_pos}-OH"
-        
-        logger.info(f"Processing glycan: {glycam_name}, IUPAC: {iupac}, GlyCAM: {glycam_tidy}")
-        
-        # Get chemical properties
-        try:
-            mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name_utils.iupac2properties(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve properties for {iupac}: {e}")
-            mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
+        mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = name_utils.iupac2properties(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve properties for {iupac}: {e}")
+        mass, tpsa, rot_bonds, hbond_donor, hbond_acceptor = None, None, None, None, None
 
-        try:
-            composition_glycowork = glycan_to_composition(iupac)
-        except Exception:
-            composition_glycowork = None
+    try:
+        composition_glycowork = glycan_to_composition(iupac)
+    except Exception:
+        composition_glycowork = None
 
-        # Get additional data. Some submitted GLYCAM strings contain decorations
-        # that glycowork/glypy cannot parse; keep static generation best-effort.
-        try:
-            smiles = name_utils.iupac2smiles(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve SMILES for {iupac}: {e}")
-            smiles = None
-        try:
-            glycoct = name_utils.iupac2glycoct(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve GlycoCT for {iupac}: {e}")
-            glycoct = None
-        try:
-            composition = name_utils.iupac2composition(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve composition for {iupac}: {e}")
-            composition = None
-        try:
-            oxford = name_utils.get_oxford(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve Oxford notation for {iupac}: {e}")
-            oxford = None
-        
-        try:
-            termini = name_utils.iupac2termini(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve termini for {iupac}: {e}")
-            termini = None
-        
-        # Get WURCS and GlyTouCan IDs
-        try:
-            glytoucan, wurcs = name_utils.iupac2wurcs_glytoucan(iupac)
-        except Exception as e:
-            logger.warning(f"Could not retrieve WURCS/GlyTouCan for {iupac}: {e}")
-            glytoucan, wurcs = None, None
-        # Generate reducing-end variants from the complete GLYCAM strings.
-        # Unlike the legacy open-ended IUPAC spellings, these preserve the
-        # alpha/beta anomer and reducing-residue modifications in crabWURCS
-        # 0.2.2 (particularly for sulfated GAGs).
-        wurcs_alpha = name_utils.crabwurcs_convert(glycam_alpha, "glycam", "wurcs")
-        if wurcs_alpha:
-            glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha)
-        else:
-            try:
-                glytoucan_alpha, wurcs_alpha = name_utils.iupac2wurcs_glytoucan(iupac_alpha)
-            except Exception as e:
-                logger.warning(f"Could not retrieve alpha WURCS/GlyTouCan for {iupac_alpha}: {e}")
-                glytoucan_alpha, wurcs_alpha = None, None
+    # Get additional data. Some submitted GLYCAM strings contain decorations
+    # that glycowork/glypy cannot parse; keep static generation best-effort.
+    try:
+        smiles = name_utils.iupac2smiles(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve SMILES for {iupac}: {e}")
+        smiles = None
+    try:
+        glycoct = name_utils.iupac2glycoct(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve GlycoCT for {iupac}: {e}")
+        glycoct = None
+    try:
+        composition = name_utils.iupac2composition(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve composition for {iupac}: {e}")
+        composition = None
+    try:
+        oxford = name_utils.get_oxford(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve Oxford notation for {iupac}: {e}")
+        oxford = None
 
-        wurcs_beta = name_utils.crabwurcs_convert(glycam_beta, "glycam", "wurcs")
-        if wurcs_beta:
-            glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta)
-        else:
-            try:
-                glytoucan_beta, wurcs_beta = name_utils.iupac2wurcs_glytoucan(iupac_beta)
-            except Exception as e:
-                logger.warning(f"Could not retrieve beta WURCS/GlyTouCan for {iupac_beta}: {e}")
-                glytoucan_beta, wurcs_beta = None, None
+    try:
+        termini = name_utils.iupac2termini(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve termini for {iupac}: {e}")
+        termini = None
 
-        # If GlyCosmos could not convert the name, use crabWURCS locally before
-        # falling back to the older SMILES/MolWURCS route.
-        if wurcs is None:
-            wurcs = name_utils.crabwurcs_convert(iupac, "iupac-condensed", "wurcs")
-            if wurcs:
-                logger.info("Recovered WURCS locally with crabWURCS")
-                variants = name_utils.get_wurcs_variants(wurcs)
-                if variants:
-                    wurcs, wurcs_alpha, wurcs_beta = variants
-                glytoucan = name_utils.wurcs2glytoucan(wurcs)
-                glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha) if wurcs_alpha else None
-                glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta) if wurcs_beta else None
-
-        if wurcs is None and smiles:
-            try:
-                logger.info("WURCS is None after crabWURCS, trying MolWURCS")
-                wurcs = name_utils.smiles2wurcs(smiles)
-                variants = name_utils.get_wurcs_variants(wurcs)
-                if variants:
-                    wurcs, wurcs_alpha, wurcs_beta = variants
-                else:
-                    logger.warning(f"Could not derive WURCS variants for {iupac}; keeping archetype WURCS for registration")
-                glytoucan = name_utils.wurcs2glytoucan(wurcs)
-                glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha) if wurcs_alpha else None
-                glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta) if wurcs_beta else None
-            except Exception as e:
-                logger.warning(f"Could not retrieve WURCS from Mol2WURCS for {iupac}: {e}")
-                wurcs = wurcs_alpha = wurcs_beta = None
-                glytoucan = glytoucan_alpha = glytoucan_beta = None
-
-        glytoucan, glytoucan_alpha, glytoucan_beta = _apply_glytoucan_fallbacks(
-            glytoucan,
-            glytoucan_alpha,
-            glytoucan_beta,
-            inventory_glytoucan,
-        )
-
-        # Get motifs
-        try: 
-            motifs = name_utils.glytoucan2motif(glytoucan) if glytoucan else None
+    # Get WURCS and GlyTouCan IDs
+    try:
+        glytoucan, wurcs = name_utils.iupac2wurcs_glytoucan(iupac)
+    except Exception as e:
+        logger.warning(f"Could not retrieve WURCS/GlyTouCan for {iupac}: {e}")
+        glytoucan, wurcs = None, None
+    # Generate reducing-end variants from the complete GLYCAM strings.
+    # Unlike the legacy open-ended IUPAC spellings, these preserve the
+    # alpha/beta anomer and reducing-residue modifications in crabWURCS
+    # 0.2.2 (particularly for sulfated GAGs).
+    wurcs_alpha = name_utils.crabwurcs_convert(glycam_alpha, "glycam", "wurcs")
+    if wurcs_alpha:
+        glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha)
+    else:
+        try:
+            glytoucan_alpha, wurcs_alpha = name_utils.iupac2wurcs_glytoucan(iupac_alpha)
         except Exception as e:
-            logger.warning(f"Could not retrieve motifs for {iupac}: {e}")
-            motifs = None
-        
-        # Calculate molecular weight
-        mol_weight = None
-        if smiles:
-            try:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol:
-                    mol_weight = round(Descriptors.ExactMolWt(mol), 2)
-            except Exception as e:
-                logger.warning(f"Could not calculate molecular weight: {e}")
-        
-        # Extract cluster-level summaries for static JSON.
-        level_1_main_clusters = {}
-        level_2_coverage_clusters = {}
-        cluster_levels = {}
-        torsion_summary = {}
-        
-        # Extract PCA clustering metadata (silhouette scores, coverage mapping)
-        silhouette_scores = {}
-        coverage_clusters_per_main = {}
-        pca_variance = {}
-        
-        if "pca" in cluster_data:
-            pca_data = cluster_data["pca"]
-            if "main_clustering" in pca_data:
-                silhouette_scores = pca_data["main_clustering"].get("silhouette_scores", {})
-                coverage_clusters_per_main = pca_data["main_clustering"].get("coverage_clusters_per_main", {})
-            
-            # Extract PCA variance information
-            if "pca_analysis" in pca_data:
-                pca_analysis = pca_data["pca_analysis"]
-                pca_variance = {
-                    "explained_variance_ratio": pca_analysis.get("explained_variance_ratio", []),
-                    "cumulative_variance": pca_analysis.get("cumulative_variance", []),
-                    "n_components": pca_analysis.get("n_components", 10)
-                }
-        
-        torsions_block = cluster_data.get("torsions", {}) if isinstance(cluster_data, dict) else {}
-        family_summary = torsions_block.get("family_summary", {}) if isinstance(torsions_block, dict) else {}
-        if torsions_block:
-            torsion_summary = {
-                "count": torsions_block.get("count"),
-                "glycosidic": len(torsions_block.get("glycosidic", [])),
-                "non_glycosidic": len(torsions_block.get("non_glycosidic", torsions_block.get("other", []))),
-                "by_family": family_summary.get("by_family", {}),
-                "by_subtype": family_summary.get("by_subtype", {}),
-                "by_common_name": family_summary.get("by_common_name", {}),
+            logger.warning(f"Could not retrieve alpha WURCS/GlyTouCan for {iupac_alpha}: {e}")
+            glytoucan_alpha, wurcs_alpha = None, None
+
+    wurcs_beta = name_utils.crabwurcs_convert(glycam_beta, "glycam", "wurcs")
+    if wurcs_beta:
+        glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta)
+    else:
+        try:
+            glytoucan_beta, wurcs_beta = name_utils.iupac2wurcs_glytoucan(iupac_beta)
+        except Exception as e:
+            logger.warning(f"Could not retrieve beta WURCS/GlyTouCan for {iupac_beta}: {e}")
+            glytoucan_beta, wurcs_beta = None, None
+
+    # If GlyCosmos could not convert the name, use crabWURCS locally before
+    # falling back to the older SMILES/MolWURCS route.
+    if wurcs is None:
+        wurcs = name_utils.crabwurcs_convert(iupac, "iupac-condensed", "wurcs")
+        if wurcs:
+            logger.info("Recovered WURCS locally with crabWURCS")
+            variants = name_utils.get_wurcs_variants(wurcs)
+            if variants:
+                wurcs, wurcs_alpha, wurcs_beta = variants
+            glytoucan = name_utils.wurcs2glytoucan(wurcs)
+            glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha) if wurcs_alpha else None
+            glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta) if wurcs_beta else None
+
+    if wurcs is None and smiles:
+        try:
+            logger.info("WURCS is None after crabWURCS, trying MolWURCS")
+            wurcs = name_utils.smiles2wurcs(smiles)
+            variants = name_utils.get_wurcs_variants(wurcs)
+            if variants:
+                wurcs, wurcs_alpha, wurcs_beta = variants
+            else:
+                logger.warning(f"Could not derive WURCS variants for {iupac}; keeping archetype WURCS for registration")
+            glytoucan = name_utils.wurcs2glytoucan(wurcs)
+            glytoucan_alpha = name_utils.wurcs2glytoucan(wurcs_alpha) if wurcs_alpha else None
+            glytoucan_beta = name_utils.wurcs2glytoucan(wurcs_beta) if wurcs_beta else None
+        except Exception as e:
+            logger.warning(f"Could not retrieve WURCS from Mol2WURCS for {iupac}: {e}")
+            wurcs = wurcs_alpha = wurcs_beta = None
+            glytoucan = glytoucan_alpha = glytoucan_beta = None
+
+    glytoucan, glytoucan_alpha, glytoucan_beta = _apply_glytoucan_fallbacks(
+        glytoucan,
+        glytoucan_alpha,
+        glytoucan_beta,
+        inventory_glytoucan,
+    )
+
+    # Get motifs
+    try:
+        motifs = name_utils.glytoucan2motif(glytoucan) if glytoucan else None
+    except Exception as e:
+        logger.warning(f"Could not retrieve motifs for {iupac}: {e}")
+        motifs = None
+
+    # Calculate molecular weight
+    mol_weight = None
+    if smiles:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol:
+                mol_weight = round(Descriptors.ExactMolWt(mol), 2)
+        except Exception as e:
+            logger.warning(f"Could not calculate molecular weight: {e}")
+
+    # Extract cluster-level summaries for static JSON.
+    level_1_main_clusters = {}
+    level_2_coverage_clusters = {}
+    cluster_levels = {}
+    torsion_summary = {}
+
+    # Extract PCA clustering metadata (silhouette scores, coverage mapping)
+    silhouette_scores = {}
+    coverage_clusters_per_main = {}
+    pca_variance = {}
+
+    if "pca" in cluster_data:
+        pca_data = cluster_data["pca"]
+        if "main_clustering" in pca_data:
+            silhouette_scores = pca_data["main_clustering"].get("silhouette_scores", {})
+            coverage_clusters_per_main = pca_data["main_clustering"].get("coverage_clusters_per_main", {})
+
+        # Extract PCA variance information
+        if "pca_analysis" in pca_data:
+            pca_analysis = pca_data["pca_analysis"]
+            pca_variance = {
+                "explained_variance_ratio": pca_analysis.get("explained_variance_ratio", []),
+                "cumulative_variance": pca_analysis.get("cumulative_variance", []),
+                "n_components": pca_analysis.get("n_components", 10)
             }
 
-        if "levels" in cluster_data:
-            for level_key, level_data in cluster_data["levels"].items():
-                cluster_pct_map = {}
-                precision = 2 if level_key == "level_1" else 4
-                for cluster in level_data.get("clusters", []):
-                    cluster_id = cluster["cluster_id"]
-                    cluster_name = f"Cluster {cluster_id}"
-                    cluster_pct_map[cluster_name] = round(cluster["cluster_size_pct"], precision)
-
-                cluster_levels[level_key] = {
-                    "n_clusters": level_data.get("n_clusters"),
-                    "clusters": cluster_pct_map,
-                }
-
-                if level_key == "level_1":  # Main clustering (5 clusters)
-                    level_1_main_clusters = dict(cluster_pct_map)
-                elif level_key == "level_2":  # Coverage clustering
-                    level_2_coverage_clusters = dict(cluster_pct_map)
-        
-        # Build glycan data structure
-        glycan_data = {
-            "archetype": {
-                # General info
-                "ID": ID,
-                "name": glycam_name,
-                "glycam": glycam_tidy,
-                "iupac": iupac,
-                "iupac_extended": name_utils.wurcs2extendediupac(wurcs) if wurcs else None,
-                "glytoucan": glytoucan,
-                "wurcs": wurcs,
-                "glycoct": glycoct,
-                "smiles": smiles,
-                "oxford": oxford,
-
-                # Chemical properties
-                "mass": mol_weight,
-                "motifs": motifs,
-                "termini": termini,
-                "components": composition,
-                "composition": composition_glycowork,
-                "rot_bonds": rot_bonds, 
-                "hbond_donor": hbond_donor, 
-                "hbond_acceptor": hbond_acceptor,
-                
-                # cluster analysis data 
-                "entropy": cluster_data.get("entropy_nats"),
-                "clusters": level_1_main_clusters,
-                "coverage_clusters": level_2_coverage_clusters,
-                "cluster_levels": cluster_levels,
-                "torsion_summary": torsion_summary,
-                "silhouette_scores": silhouette_scores,
-                "coverage_clusters_per_main": coverage_clusters_per_main,
-                "pca_variance": pca_variance,
-                
-                # Molecular Dynamics info from inventory
-                "length": length,
-                "package": package,
-                "forcefield": forcefield,
-                "temperature": temperature,
-                "pressure": pressure,
-                "salt": salt,
-            },
-
-            "alpha": {
-                # General info
-                "ID": ID,
-                "name": glycam_name,
-                "glycam": glycam_alpha,
-                "iupac": iupac_alpha,
-                "iupac_extended": name_utils.wurcs2extendediupac(wurcs_alpha) if wurcs_alpha else None,
-                "glytoucan": glytoucan_alpha,
-                "wurcs": wurcs_alpha,
-                
-            },
-            
-            "beta": {
-                # General info  
-                "ID": ID,
-                "name": glycam_name,
-                "glycam": glycam_beta,
-                "iupac": iupac_beta,
-                "iupac_extended": name_utils.wurcs2extendediupac(wurcs_beta) if wurcs_beta else None,
-                "glytoucan": glytoucan_beta,
-                "wurcs": wurcs_beta,
-                
-                
-            },
-
-            "search_meta": {
-                "common_names": [],
-                "description": "",
-                "keywords": [],
-            }
+    torsions_block = cluster_data.get("torsions", {}) if isinstance(cluster_data, dict) else {}
+    family_summary = torsions_block.get("family_summary", {}) if isinstance(torsions_block, dict) else {}
+    if torsions_block:
+        torsion_summary = {
+            "count": torsions_block.get("count"),
+            "glycosidic": len(torsions_block.get("glycosidic", [])),
+            "non_glycosidic": len(torsions_block.get("non_glycosidic", torsions_block.get("other", []))),
+            "by_family": family_summary.get("by_family", {}),
+            "by_subtype": family_summary.get("by_subtype", {}),
+            "by_common_name": family_summary.get("by_common_name", {}),
         }
 
-        # Save data files
-        save_glycan_data(glycan_data, final_output_dir, "data")
-        glygen_data = name_utils.glytoucan2glygen(glytoucan) if glytoucan else {}
-        glycosmos_data = name_utils.glytoucan2glycosmos(glytoucan) if glytoucan else {}
-        save_glycan_data(glygen_data, final_output_dir, "glygen")
-        save_glycan_data(glycosmos_data, final_output_dir, "glycosmos")
-        
+    if "levels" in cluster_data:
+        for level_key, level_data in cluster_data["levels"].items():
+            cluster_pct_map = {}
+            precision = 2 if level_key == "level_1" else 4
+            for cluster in level_data.get("clusters", []):
+                cluster_id = cluster["cluster_id"]
+                cluster_name = f"Cluster {cluster_id}"
+                cluster_pct_map[cluster_name] = round(cluster["cluster_size_pct"], precision)
+
+            cluster_levels[level_key] = {
+                "n_clusters": level_data.get("n_clusters"),
+                "clusters": cluster_pct_map,
+            }
+
+            if level_key == "level_1":  # Main clustering (5 clusters)
+                level_1_main_clusters = dict(cluster_pct_map)
+            elif level_key == "level_2":  # Coverage clustering
+                level_2_coverage_clusters = dict(cluster_pct_map)
+
+    # Build glycan data structure
+    glycan_data = {
+        "archetype": {
+            # General info
+            "ID": ID,
+            "name": glycam_name,
+            "glycam": glycam_tidy,
+            "iupac": iupac,
+            "iupac_extended": name_utils.wurcs2extendediupac(wurcs) if wurcs else None,
+            "glytoucan": glytoucan,
+            "wurcs": wurcs,
+            "glycoct": glycoct,
+            "smiles": smiles,
+            "oxford": oxford,
+
+            # Chemical properties
+            "mass": mol_weight,
+            "motifs": motifs,
+            "termini": termini,
+            "components": composition,
+            "composition": composition_glycowork,
+            "rot_bonds": rot_bonds,
+            "hbond_donor": hbond_donor,
+            "hbond_acceptor": hbond_acceptor,
+
+            # cluster analysis data
+            "entropy": cluster_data.get("entropy_nats"),
+            "clusters": level_1_main_clusters,
+            "coverage_clusters": level_2_coverage_clusters,
+            "cluster_levels": cluster_levels,
+            "torsion_summary": torsion_summary,
+            "silhouette_scores": silhouette_scores,
+            "coverage_clusters_per_main": coverage_clusters_per_main,
+            "pca_variance": pca_variance,
+
+            # Molecular Dynamics info from inventory
+            "length": length,
+            "package": package,
+            "forcefield": forcefield,
+            "temperature": temperature,
+            "pressure": pressure,
+            "salt": salt,
+        },
+
+        "alpha": {
+            # General info
+            "ID": ID,
+            "name": glycam_name,
+            "glycam": glycam_alpha,
+            "iupac": iupac_alpha,
+            "iupac_extended": name_utils.wurcs2extendediupac(wurcs_alpha) if wurcs_alpha else None,
+            "glytoucan": glytoucan_alpha,
+            "wurcs": wurcs_alpha,
+
+        },
+
+        "beta": {
+            # General info
+            "ID": ID,
+            "name": glycam_name,
+            "glycam": glycam_beta,
+            "iupac": iupac_beta,
+            "iupac_extended": name_utils.wurcs2extendediupac(wurcs_beta) if wurcs_beta else None,
+            "glytoucan": glytoucan_beta,
+            "wurcs": wurcs_beta,
+
+
+        },
+
+        "search_meta": {
+            "common_names": [],
+            "description": "",
+            "keywords": [],
+        }
+    }
+
+    # Save data files
+    save_glycan_data(glycan_data, final_output_dir, "data")
+    glygen_data = name_utils.glytoucan2glygen(glytoucan) if glytoucan else {}
+    glycosmos_data = name_utils.glytoucan2glycosmos(glytoucan) if glytoucan else {}
+    save_glycan_data(glygen_data, final_output_dir, "glygen")
+    save_glycan_data(glycosmos_data, final_output_dir, "glycosmos")
+
+    return {
+        "glycan_data": glycan_data,
+        "cluster_levels": cluster_levels,
+        "remarks": {
+            "archetype_glytoucan": glytoucan,
+            "archetype_iupac": iupac,
+            "alpha_glytoucan": glytoucan_alpha,
+            "alpha_iupac": iupac_alpha,
+            "beta_glytoucan": glytoucan_beta,
+            "beta_iupac": iupac_beta,
+        },
+    }
+
+
+def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -> dict:
+    """
+    Process a single glycan folder and generate static data.
+
+    Args:
+        folder_path: Path to the glycan folder containing output/ subdirectory
+        glycam_name: GLYCAM name of the glycan
+        output_static_dir: Directory where static data will be created
+    """
+    from lib.storage import get_storage_manager
+
+    folder_path = Path(folder_path)
+    storage = get_storage_manager()
+
+    logger.info(f"Processing glycan: {glycam_name} from {folder_path}")
+
+    # Use storage abstraction layer for validation
+    storage = get_storage_manager()
+
+    # Validate input using storage abstraction
+    if not storage.exists(folder_path):
+        raise FileNotFoundError(f"Folder path does not exist: {folder_path}")
+
+    output_subdir = folder_path / "output"
+    if not storage.exists(output_subdir):
+        raise FileNotFoundError(f"Output subdirectory not found: {output_subdir}")
+
+    # Load analysis data from info.json
+    try:
+        info_data = load_info_json(folder_path)
+        cluster_data = extract_cluster_data(info_data, folder_path)
+    except Exception as e:
+        logger.error(f"Failed to load info.json: {e}")
+        raise
+
+    # Get metadata from inventory CSV
+    try:
+        metadata = get_glycan_metadata(glycam_name)
+        ID = metadata["ID"]
+        simulation = {
+            "length": _simulation_length_us(metadata, glycam_name, storage),
+            "package": metadata["package"],
+            "forcefield": metadata["forcefield"],
+            "temperature": metadata["temperature"],
+            "pressure": metadata["pressure"],
+            "salt": metadata["salt"],
+        }
+        comments = metadata["comments"]
+        inventory_glytoucan = metadata["glytoucan_id"]
+    except Exception as e:
+        # A GlycoShape ID is assigned by the submissions inventory/PocketBase.
+        # Never manufacture one from a name: it looks legitimate (GSxxxxxx)
+        # but cannot be reconciled with PocketBase or the public database.
+        raise ValueError(
+            f"No registered GlycoShape submission metadata for '{glycam_name}'. "
+            "Create its PocketBase submission entry with an assigned GS00xxx ID, "
+            "then rerun the static stage."
+        ) from e
+
+    ID = checked_glycoshape_id(ID, glycam_name)
+
+    logger.info(f"Using ID: {ID}")
+
+    # Create output directory
+    final_output_dir = fresh_output_dir(output_static_dir, ID, glycam_name, storage)
+
+    try:
+        # snfg.svg, data.json, glygen.json, glycosmos.json
+        identity = write_identity_files(
+            final_output_dir,
+            glycam_name,
+            ID,
+            cluster_data,
+            simulation,
+            inventory_glytoucan=inventory_glytoucan,
+            storage=storage,
+        )
+
         # Copy and convert PDB files
         copy_and_convert_pdbs(
-            folder_path, 
-            final_output_dir, 
+            folder_path,
+            final_output_dir,
             glycam_name,
-            archetype_glytoucan=glytoucan,
-            archetype_iupac=iupac,
-            alpha_glytoucan=glytoucan_alpha,
-            alpha_iupac=iupac_alpha,
-            beta_glytoucan=glytoucan_beta,
-            beta_iupac=iupac_beta,
-            cluster_data=cluster_data
+            cluster_data=cluster_data,
+            **identity["remarks"],
         )
-        
+
         # Tables, info.json, torparts.npz and the frozen PCA landscape
-        copy_analysis_files(folder_path, final_output_dir, cluster_levels.keys())
+        copy_analysis_files(folder_path, final_output_dir, identity["cluster_levels"].keys())
 
         logger.info(f"Successfully processed {glycam_name} -> {final_output_dir}")
         return {
@@ -713,6 +778,72 @@ def process_glycan(folder_path: str, glycam_name: str, output_static_dir: str) -
 
     except Exception as e:
         logger.error(f"Failed to process glycan data for {glycam_name}: {e}")
+        raise
+
+
+def complete_static_ready(
+    static_ready_dir,
+    glycam_name: str,
+    glycoshape_id: str,
+    output_static_dir,
+    simulation: dict,
+    inventory_glytoucan: str | None = None,
+) -> dict:
+    """``static/GSxxxxx/`` from a static-ready folder and an explicit submission.
+
+    ``static_ready_dir`` is what ``lib.static_ready.write_static_ready`` (the
+    one-entry mode, ``scripts/run_entry.py``) wrote: ``output/`` and
+    ``landscape/`` without identifiers.  The GlycoShape ID and the simulation
+    metadata are arguments here instead of being looked up, and no process
+    folder and no other glycan is needed.  The folder that comes out is the
+    one :func:`process_glycan` writes from the process folder the
+    static-ready one was made of, for the same ID and metadata: both write
+    the identifier files with :func:`write_identity_files`, and the shared
+    files are those of ``lib.static_ready`` under the same REMARK block.
+
+    ``simulation`` holds :data:`SIMULATION_FIELDS` in the published units.
+    Local folders only.  Returns the keys of :func:`process_glycan` plus
+    ``glycan_data``.
+    """
+    from lib.storage import get_storage_manager
+
+    source = Path(static_ready_dir)
+    if not (source / "output").is_dir():
+        raise FileNotFoundError(f"Output subdirectory not found: {source / 'output'}")
+    storage = get_storage_manager()
+    try:
+        cluster_data = extract_cluster_data(load_info_json(source), source)
+    except Exception as e:
+        logger.error(f"Failed to load info.json: {e}")
+        raise
+    ID = checked_glycoshape_id(glycoshape_id, glycam_name)
+    logger.info(f"Using ID: {ID}")
+    final_output_dir = fresh_output_dir(output_static_dir, ID, glycam_name, storage)
+    try:
+        identity = write_identity_files(
+            final_output_dir,
+            glycam_name,
+            ID,
+            cluster_data,
+            simulation,
+            inventory_glytoucan=inventory_glytoucan,
+            storage=storage,
+        )
+        copy_static_ready(
+            source,
+            final_output_dir,
+            cluster_data=cluster_data,
+            **identity["remarks"],
+        )
+        logger.info(f"Successfully completed {glycam_name} -> {final_output_dir}")
+        return {
+            "glycoshape_id": ID,
+            "final_output_dir": str(final_output_dir),
+            "local_output_dir": str(final_output_dir),
+            "glycan_data": identity["glycan_data"],
+        }
+    except Exception as e:
+        logger.error(f"Failed to complete the static folder of {glycam_name}: {e}")
         raise
 
 
