@@ -161,6 +161,13 @@ crabwurcs_executable = (
     or _default_crabwurcs
 )
 
+# Web lookups of the static stage (GlyCosmos, GlyTouCan, GlyGen, PubChem); see
+# lib/lookups.py. The timeout bounds every request that names none itself;
+# GLYCOSHAPE_OFFLINE=1 answers every lookup as "not available" without a
+# request, so an entry is written with what the local tools give.
+lookup_timeout = _float_env("GLYCOSHAPE_LOOKUP_TIMEOUT", 30.0, minimum=1.0)
+lookups_offline = os.environ.get("GLYCOSHAPE_OFFLINE", "").strip().lower() in ("true", "1", "yes")
+
 for thread_var in (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",

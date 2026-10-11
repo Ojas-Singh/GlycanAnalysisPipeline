@@ -8,6 +8,7 @@ Provides unified interface for file operations with support for:
 - Fallback and compatibility between storage backends
 """
 
+import contextlib
 import os
 import io
 import json
@@ -17,6 +18,7 @@ import fnmatch
 import hashlib
 import mimetypes
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
@@ -1096,6 +1098,39 @@ class S3StorageBackend(StorageBackend):
         """Write text content to an object."""
         self.write_binary(path, content.encode(encoding))
 
+    def write_binary_if_absent(self, path: Union[str, Path], content: bytes) -> Optional[bool]:
+        """Create a small object only when no object has this key (``If-None-Match: *``).
+
+        ``True``: the object was created.  ``False``: an object is there and
+        was left alone (the service answered 412, or 409 for a write that
+        raced this one).  ``None``: the client or the service does not know
+        conditional writes; nothing is known about the key then, and the
+        caller has to fall back to a plain write.  A service that accepts
+        the header and ignores it cannot be told apart here: see
+        ``lib.entry_publish.conditional_writes``, which probes for that.
+        """
+        bucket, key = self._locate(path)
+        try:
+            self._client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=content,
+                ContentType=_content_type(key),
+                Metadata={SHA256_METADATA_KEY: hashlib.sha256(content).hexdigest()},
+                IfNoneMatch="*",
+            )
+        except TypeError:                 # a client without the parameter
+            return None
+        except Exception as exc:
+            code, status = _s3_error(exc)
+            if status in (409, 412) or code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                return False
+            if status == 501 or code in ("NotImplemented", "InvalidArgument", "InvalidRequest") \
+                    or type(exc).__name__ == "ParamValidationError":
+                return None
+            raise
+        return True
+
     def upload_file(
         self,
         local_path: Union[str, Path],
@@ -1602,6 +1637,31 @@ def get_storage_manager() -> StorageManager:
     if _storage_manager is None:
         _storage_manager = StorageManager()
     return _storage_manager
+
+
+_local_storage_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def local_storage() -> Iterator[None]:
+    """Local files for the pipeline functions that go through the storage manager.
+
+    Inside the block the storage manager of the process is the local file
+    system, whatever ``GLYCOSHAPE_STORAGE``, ``GLYCOSHAPE_ORACLE_PAR_URL`` or
+    a ``.env`` file selects; the manager that was there is put back
+    afterwards.  For code that works on local folders only (completing and
+    publishing one entry) in a process whose environment names a remote
+    storage.  The manager is one per process, so one thread at a time is
+    inside such a block; another one waits.
+    """
+    global _storage_manager
+    with _local_storage_lock:
+        previous = _storage_manager
+        _storage_manager = StorageManager(LocalStorageBackend())
+        try:
+            yield
+        finally:
+            _storage_manager = previous
 
 
 def reset_storage_manager() -> None:

@@ -444,37 +444,21 @@ def extract_search_enrichment(
     - ``user_description``: user-provided description from PocketBase
     - ``user_comments``: user-provided comments for description fallback
     """
-    extra_keywords: List[str] = []
+    # The rules are those of lib.glymeta.search_enrichment, which a submission
+    # record goes through as well; here the fields come from the two records.
+    from lib.glymeta import search_enrichment
+
     glycan_record = glycan_record or {}
     submission_record = submission_record or {}
-
-    user_keywords = glycan_record.get("keywords")
-    if isinstance(user_keywords, list):
-        extra_keywords.extend(str(k) for k in user_keywords if k)
-
-    # Derived keywords from simulation fields
-    md_package = (submission_record.get("md_package") or "").strip()
-    if md_package:
-        extra_keywords.append(f"MD:{md_package}")
-
-    force_field = (submission_record.get("force_field") or "").strip()
-    if force_field:
-        extra_keywords.append(f"FF:{force_field}")
-
-    source_type = (submission_record.get("source_type") or "").strip()
-    if source_type:
-        extra_keywords.append(f"Source:{source_type}")
-
-    user_common_names = _normalize_string_list(glycan_record.get("common_names"))
-
-    user_description = str(glycan_record.get("description") or "").strip()
-
-    return {
-        "extra_keywords": extra_keywords,
-        "user_common_names": user_common_names,
-        "user_description": user_description,
-        "user_comments": str(submission_record.get("comments") or "").strip(),
-    }
+    return search_enrichment(
+        keywords=glycan_record.get("keywords"),
+        common_names=glycan_record.get("common_names"),
+        description=glycan_record.get("description"),
+        package=submission_record.get("md_package"),
+        forcefield=submission_record.get("force_field"),
+        source_type=submission_record.get("source_type"),
+        comments=submission_record.get("comments"),
+    )
 
 
 # ---------------------------------------------------------------------------
