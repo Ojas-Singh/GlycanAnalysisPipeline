@@ -37,9 +37,14 @@ file the *stored* manifest lists is stored with the listed content.
    copy and step 6 the stored manifest describes files that have been
    replaced: a reader that is behind fails its verification, keeps its
    database and tries again at its next synchronisation; a reader that is
-   up to date does nothing.  The window is the time of these copies.
-6. *Manifest.*  The new ``sync_manifest.json`` is copied into place, as one
-   object.  Readers see the new database.
+   up to date does nothing.  The window is the time of these copies, so
+   they run ``workers`` at a time, in two groups (:func:`roll_forward`):
+   the changed files of the glycan folder, which only a reader without the
+   published folder of this glycan fetches, and then the root files, which
+   every reader that is behind fetches.
+6. *Manifest.*  When every copy of step 5 has succeeded, and not before,
+   the new ``sync_manifest.json`` is copied into place, as one object.
+   Readers see the new database.
 7. *Afterwards.*  Files of the glycan that the new manifest no longer lists
    are deleted (all of them for a withdrawal), the record of the entry and
    the list of withdrawn IDs are written, the staged objects are removed
@@ -110,6 +115,7 @@ Log = Callable[[str], None]
 Checkpoint = Callable[[str], None]
 _PROCESS_LOCKS: Dict[Tuple[int, str], threading.Lock] = {}
 _PROCESS_LOCKS_GUARD = threading.Lock()
+_COUNT_GUARD = threading.Lock()
 
 
 class PublishEntryError(Exception):
@@ -240,9 +246,10 @@ class Store:
         self.backend, self.stats, self.dry_run = backend, stats, dry_run
 
     def _count(self, operation: str, **amounts: int) -> None:
-        self.stats["requests"][operation] = self.stats["requests"].get(operation, 0) + 1
-        for name, amount in amounts.items():
-            self.stats[name] = self.stats.get(name, 0) + amount
+        with _COUNT_GUARD:                                      # requests are made from several threads
+            self.stats["requests"][operation] = self.stats["requests"].get(operation, 0) + 1
+            for name, amount in amounts.items():
+                self.stats[name] = self.stats.get(name, 0) + amount
 
     def _writing(self, key: str) -> None:
         if self.dry_run:
@@ -500,26 +507,74 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
     Everything it needs is in the storage: the staged objects and the
     pending document.  An object that is already at its key with the size
     and SHA-256 it should have is left alone.
+
+    The window in which the stored manifest describes replaced files is the
+    time of the copies, so they run ``target.workers`` at a time, and what
+    has to be asked of the storage is asked before the first of them.  The
+    order that is kept:
+
+    * *Before the first copy*: which files are not at their keys yet, and
+      that each of them is staged (so is the manifest).  A run that could
+      not finish the switch from the storage does not begin or widen it.
+    * *The changed files of the glycan folder*, in any order.  A reader
+      fetches them only when it does not have the published folder of this
+      glycan; one that is behind for another reason is not affected yet.
+    * *The root files*, in any order, when every copy of the folder has
+      returned.  Every reader that is behind fetches every root file, so
+      once the first of these copies is done all of them fail: this group
+      comes last and is the short one, however long the folder takes.
+    * *The manifest*, alone, when every copy above has succeeded and none is
+      in flight: the stored manifest never lists a file that is not at its
+      key.  The files it lists and no stored manifest listed were uploaded
+      before ``pending.json`` was written; the files it no longer lists are
+      deleted after it.
+
+    A copy that fails stops the switch: the copies in flight are waited for,
+    those not started are not made, the manifest is not written and
+    ``pending.json`` stays.  Whatever subset of the files was switched then,
+    it is the state of step 5, which the next call completes by looking at
+    every key again.
     """
-    def place(item: Dict[str, Any]) -> bool:
+    def waits(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The item when it still has to be copied onto its key (its staged copy has to be there), or None."""
         if store.holds(item["key"], item["size"], item["sha256"]):
-            return False
+            return None
         staged = target.staged(item["sha256"])
         if not store.holds(staged, item["size"], item["sha256"]):
             raise PublishEntryError(
                 f"the staged copy of {item['key']} is missing or damaged ({staged}): the pending "
                 f"{pending['action']} of {pending['glycoshape_id']} cannot be completed from the storage")
-        store.copy(staged, item["key"], item["size"], item["sha256"])
-        return True
+        return item
 
-    switched = 0
-    window_started = time.perf_counter()
+    def place(item: Dict[str, Any]) -> str:
+        store.copy(target.staged(item["sha256"]), item["key"], item["size"], item["sha256"])
+        return item["key"]
+
+    def place_together(items: List[Dict[str, Any]]) -> int:
+        """Copy the items onto their keys, ``workers`` at a time; when this returns or raises none is in flight."""
+        with contextlib.closing(parallel_map(place, items, target.workers)) as placed:
+            for key in placed:
+                checkpoint(f"switched:{key}")
+        return len(items)
+
+    def of_the_root(item: Dict[str, Any]) -> bool:
+        """A file at the root of the database (every other switched file is ``<glycan>/...``)."""
+        return "/" not in item["key"][len(target.static_prefix) + 1:]
+
     try:
-        for item in pending["switch"]:
-            switched += place(item)
-            checkpoint(f"switched:{item['key']}")
-        manifest_written = place(pending["manifest"])
+        with contextlib.closing(parallel_map(waits, pending["switch"] + [pending["manifest"]], target.workers)) as looked:
+            waiting = {item["key"] for item in looked if item is not None}
+        of_folder = [item for item in pending["switch"] if item["key"] in waiting and not of_the_root(item)]
+        of_root = [item for item in pending["switch"] if item["key"] in waiting and of_the_root(item)]
+        manifest_written = pending["manifest"]["key"] in waiting
+        window_started = time.perf_counter()
+        switched = place_together(of_folder)
+        root_started = time.perf_counter()
+        switched += place_together(of_root)
+        if manifest_written:
+            place(pending["manifest"])
         window = round(time.perf_counter() - window_started, 3)
+        root_window = round(time.perf_counter() - root_started, 3)
         checkpoint("manifest")
     except PublishEntryError:
         raise
@@ -528,8 +583,10 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
             f"stopped while the changed files were switched ({type(exc).__name__}: {exc}); the published manifest "
             "may describe files that have been replaced, so a reader that is behind fails and retries: "
             "run the command again (or publish_entry.py recover) to finish") from exc
-    log(f"switched {switched} file(s) and {'wrote' if manifest_written else 'found'} "
-        f"{pending['manifest']['key']} (global_hash {pending['target_global_hash'][:16]}...) in {window} s")
+    log(f"switched {switched} file(s) ({len(of_folder)} of the glycan folder, then {len(of_root)} root file(s); "
+        f"{target.workers} at a time) and {'wrote' if manifest_written else 'found'} "
+        f"{pending['manifest']['key']} (global_hash {pending['target_global_hash'][:16]}...) in {window} s, "
+        f"{root_window} s of them for the root files and the manifest")
 
     # 7. Afterwards.  The published prefix is the new database from here on.
     try:
@@ -566,7 +623,7 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
             f"the new database is published, and clearing up stopped ({type(exc).__name__}: {exc}): "
             "run the command again (or publish_entry.py recover) to finish") from exc
     return {"switched": switched, "manifest_written": manifest_written, "deleted": len(doomed),
-            "switch_seconds": window}
+            "switch_seconds": window, "switch_root_seconds": root_window}
 
 
 def recover(target: Target, log: Log = print, checkpoint: Checkpoint = _noop, owner: Optional[str] = None,
@@ -1323,6 +1380,7 @@ def publish_entry(
                     {"glycam_name": name, "record": record, "withdrawn": {} if tombstone is not None else None},
                     owner, lock, lock_ttl, log, checkpoint)
                 journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
+                report["switch"] = done
                 _remember(cache_dir, derived_dir, derived)
                 report["status"] = "published"
     report["seconds"] = round(time.perf_counter() - started, 3)
@@ -1492,6 +1550,7 @@ def withdraw_entry(
                                "global_hash_before": database.global_hash}},
                 owner, lock, lock_ttl, log, checkpoint)
             journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
+            report["switch"] = done
             _remember(cache_dir, derived_dir, derived)
             report["status"] = "withdrawn"
             journal.data["status"] = "withdrawn"
