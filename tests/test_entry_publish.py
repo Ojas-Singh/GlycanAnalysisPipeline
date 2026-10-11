@@ -5,8 +5,10 @@ entry is the bundle of the synthetic glycan.  ``Reader`` is the website.  No tes
 """
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -32,6 +34,7 @@ from static_tree import full_bake, manifest_without_times, root_files
 from synthetic_glycan import GLYCAM_NAME
 
 pytestmark = pytest.mark.usefixtures("no_internet")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 GS = "GS01067"
 SECOND_NAME = "DManpa1-2DManpb1-OH"
 STATE = "publish-state/static"
@@ -928,6 +931,29 @@ def test_a_folder_with_lookups_that_were_not_answered_is_kept_until_a_refresh(wo
     third = world.publish(bundle_dir, dry_run=True, refresh=True)
     assert calls and third["entry"]["lookups"]["unanswered"] == [] and third["entry"]["gaps"] == []
     assert third["entry"]["hash"] != first["entry"]["hash"]
+
+
+def test_the_tool_says_that_the_length_is_not_given_and_only_warns(world, bundle_dir, capsys):
+    """A bundle without a simulated length, published with --id: the dry run does not print ``None us``."""
+    spec = importlib.util.spec_from_file_location("publish_entry_tool", REPO_ROOT / "scripts" / "publish_entry.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    given = {"length": 2.5, "package": "GROMACS", "forcefield": "GLYCAM_06j", "temperature": 300.0, "pressure": 1.0, "salt": 150.0}
+    assert tool._simulation_line(given) == "2.5 us, GROMACS, GLYCAM_06j, 300.0 K, 1.0 bar, 150.0 mM"       # as before
+    assert tool._simulation_line({**given, "length": None, "salt": 0.0}) == (
+        "length not given, GROMACS, GLYCAM_06j, 300.0 K, 1.0 bar, 0.0 mM")
+
+    submission = entry_complete.submission_from_bundle(entry_complete.load_bundle(bundle_dir), GS)
+    assert "simulation_length_ns" not in submission["simulation"]
+    report = world.publish(bundle_dir, submission, dry_run=True)
+    assert report["ok"] and report["entry"]["simulation"]["length"] is None
+    capsys.readouterr()
+    tool._print_entry(report)
+    status = tool._finish(argparse.Namespace(report=None), report)
+    printed = capsys.readouterr().out.splitlines()
+    line = next(text for text in printed if text.startswith("  simulation: "))
+    assert line.startswith("  simulation: length not given, ") and "None" not in line
+    assert "WARNING simulation.simulation_length_ns is not given" in printed and status == tool.EXIT_DONE
 
 
 def test_what_is_stored_has_to_be_what_its_manifest_describes(world, bundle_dir):
