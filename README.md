@@ -12,6 +12,7 @@ GAP takes the trajectories of one glycan (all its simulations, dry) and produces
 |---|---|---|---|
 | Raw archive | One entry per glycan, named by its GLYCAM name: `trajectory.xtc` at the precision of the source, `topology.pdb`, `structure.mol2`, `manifest.json` with checksums | Anywhere; object storage keeps it under `raw/<GLYCAM name>/` | [Raw trajectory archive](#raw-trajectory-archive) |
 | Analysis of one entry | Store, PCA, clustering, torsions, representative structures; a self-contained result folder with `result.json` | A compute node, without network | [One entry on a compute node](#one-entry-on-a-compute-node) |
+| A run on the cluster | The dry trajectories of the replicas of a run become one archive entry, its analysis and one bundle file to upload; an existing entry can be extended | Inside the simulation job, without network | [A run on the cluster](#a-run-on-the-cluster) |
 | Whole-database runs | The same analysis over a data directory, then the static folder with identifiers and metadata | Login node and Slurm array | [Running](#running-), [Staged Oracle/Slurm workflow](#staged-oracleslurm-workflow) |
 | Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
 
@@ -288,7 +289,9 @@ environment says. In a job script:
 `slurm/run_entry_amd.sh` runs it as a job of its own. Exit status: `0` done,
 `1` the analysis failed (the step and the message are printed, and are in
 `result.json` and `run.log`), `2` the input or the result folder cannot be
-used (message printed; nothing is computed).
+used (message printed; nothing is computed). For the replicas of a simulation
+run, `scripts/make_entry.py` does the conversion to an entry, this analysis
+and the bundle to upload in one command: [A run on the cluster](#a-run-on-the-cluster).
 
 The result folder is self-contained:
 
@@ -347,6 +350,105 @@ atom pairs of the PCA landscape (pairs of the heavy atoms outside the reducing
 329-atom glycan (172 such atoms, 14,706 pairs), 0.8 GB for 50,005 frames of a
 97-atom one (62 atoms, 1,891 pairs). Everything else is small next to it.
 
+## A run on the cluster
+
+A simulation run leaves one dry multi-model PDB per replica. One command, run in the job that simulated them, turns the replicas into what publishing needs: the archive entry, its analysis and one file to upload. It uses no network and no service.
+
+```bash
+# Once, on the login node (needs the network): the environment of the node command
+uv venv --python 3.10 "$GAP/.venv-node"
+uv pip install --python "$GAP/.venv-node/bin/python" -r "$GAP/requirements-node.txt"
+
+# In the job, after the simulations and their post-processing (192 cores, --cpus-per-task 1)
+"$GAP/.venv-node/bin/python" "$GAP/scripts/make_entry.py" \
+    --glycam-name "$GLYCAM_NAME" --workers 16 --output "$RUN/bundle.tar" \
+    --replica-map "$RUN/replica_map.txt" --frame-stride 5 \
+    --md-package GROMACS --force-field GLYCAM_06j --temperature-k 300 --pressure-bar 1 \
+    --salt-concentration-mm 200 --run-id "$RUN_ID" --summary "$RUN/bundle.summary.json" || exit 1
+```
+
+The replicas are given as arguments (a folder with `glycan.dry.pdb` and `glycan.dry.mol2`, or `simulation.pdb` and `structure.mol2`; or the PDB file, its MOL2 next to it; `NAME=PATH` names one) or with `--replica-map`, the `folder|name` file a run already has. The command
+
+1. checks on the first frames that all replicas have the same atoms in the same order, and their MOL2 files the same atoms and bonds;
+2. converts them into one archive entry in `--workers` processes, each replica verified against its own text and recorded as a [segment](#raw-trajectory-archive) (no concatenated `simulation.pdb` is written);
+3. analyses the entry as [`run_entry.py`](#one-entry-on-a-compute-node) does;
+4. writes the bundle and reads it back the way the receiving side does.
+
+| Option | |
+|---|---|
+| `--glycam-name` (required) | the full GLYCAM name; it names the entry and is written as `name.json`. `info.json` is taken from `--info`, else from the first replica folder that has one, and archived unchanged (a different `indexOrderedSequence` in it is a warning in the manifest) |
+| `--workers` (required) | cores to use. There is no default: a simulation job has `--cpus-per-task 1`, so `SLURM_CPUS_PER_TASK` says nothing useful. The command has to be started where it may use that many cores (in the batch script itself, or with `srun --exact --ntasks=1 --cpus-per-task=N`, not as one task of one CPU); `source.host.cores_available` of `bundle.json` records what it was given, with a warning when that is fewer than `--workers` |
+| `--output` (required) | the bundle; it appears under this name only when it is complete, and a bundle that an earlier run left there is removed first: after a run there is its bundle, or none |
+| `--frame-stride N`, or `--time-per-frame-ps T` | the dry trajectory holds every N-th saved frame (`trajin ... 1 last 5` is 5); with `production.mdp` in the replica folder the time per frame is `dt x nstxout-compressed x N`. Recorded per segment; without either it is null |
+| `--md-package`, `--force-field`, `--temperature-k`, `--pressure-bar`, `--salt-concentration-mm`, `--comments`, `--glytoucan-id`, `--run-id`, `--simulation-length-ns` | metadata of the run for publishing, copied into `bundle.json` with the unit in the name of the key; the run identifier, package, force field, temperature, pressure and salt concentration are also recorded with every segment of the manifest (`run`), which outlives the bundle |
+| `--replica-prefix TEXT` | put before the name of every replica, for example the identifier of the run; the segments of an entry are told apart by their names |
+| `--extend ENTRY` | merge and extend, see below |
+| `--levels`, `--mol2`, `--source-name`, `--repair`, `--work-dir`, `--keep-work`, `--force`, `--summary FILE`, `--verbose` | as their help says |
+
+Standard output is one line (`make_entry: ok: <name>: <frames> frames of <atoms> atoms (...), <kept> kept; clusters ...; bundle <path> <MB> sha256 <hash>; <seconds> s with <n> workers`); everything else goes to standard error, and `--summary` writes the same as JSON. Exit status: `0` the bundle was written, `1` the analysis or the bundle failed (the step and the message are printed; `result.json` and `run.log` are in the work folder), `2` the input cannot be used (the message says why, for example which atom of which replica differs or which replica ends inside a frame; nothing is computed).
+
+The work is done in `<output>.work` (`--work-dir`), which is removed when the bundle is there. After an interruption, or a failure, run the same command again: an entry that was converted from exactly these files (they are hashed: a replica that was simulated again has the same size) and an analysis that is current for it are reused, anything else is done again. Run one command per output at a time.
+
+### The bundle
+
+A plain `tar` file (ustar, not compressed) with these members, in this order:
+
+```
+bundle.json     schema "glycoshape-entry-bundle", schema_version 1, glycam_name, created (UTC), pipeline
+                {commit, uncommitted_changes, version, converter_version, python, packages}, levels,
+                files {path: {size, sha256}} for every other member, source {...}, extends
+archive/        trajectory.xtc, topology.pdb, structure.mol2, manifest.json, info.json, name.json: the archive
+                entry (in a bundle its folder is "archive", not the folder its manifest names)
+static/         output/..., landscape/...: the static-ready files of run_entry.py
+result.json     as run_entry.py writes it
+run.log
+```
+
+`pipeline.version` is the SHA-256 of `main.py` and `lib/*.py` (`code_sha256` of `result.json`); `commit` is null where the code is not a git checkout. `source` says what the entry was made from: `replicas` (name, frames, first frame, time per frame, size and SHA-256 of the PDB and the MOL2, the settings read from `production.mdp`), `trajectory` (atoms, frames, how many of them from this run and from an extended entry), and the metadata of the run:
+
+| Key of `source` | Unit |
+|---|---|
+| `simulation_length_ns` | nanoseconds, summed over the replicas of this run (not of an entry that is extended). From the frames, `(frames - 1) x time_per_frame_ps`, when the time per frame is known, else `dt x nsteps` of every `production.mdp`, else null; `simulation_length_from` says which. `--simulation-length-ns` overrides it |
+| `time_per_frame_ps` | picoseconds |
+| `temperature_k`, `pressure_bar`, `salt_concentration_mm` | kelvin, bar, millimolar NaCl |
+| `md_package`, `force_field`, `comments`, `glytoucan_id`, `run_id` | text |
+
+`extends` is null, or `{glycam_name, manifest_sha256, frames}` of the entry that was extended.
+
+It is not compressed: `trajectory.xtc` is 60 to 64 % of a bundle and gzip takes 3 to 10 % off it; the CSV files (a third of a bundle) halve. On the three glycans below gzip would save 22 to 29 % (97 of the 441 MB of the largest, for 13 s of one core on the node). The receiving side would then have to decompress untrusted input before it can check anything, and a member could no longer be read at its offset in the file. A bundle is already a tenth of the `simulation.pdb` that is uploaded today (441 MB for 4.29 GB).
+
+`lib.entry_bundle.open_bundle(tar_path, extract_to)` is the receiving side. It treats the bundle as untrusted (it is made under a member's account and unpacked on a server) and returns the folder, with exactly the layout above, only when everything checks; otherwise it raises `BundleError` and leaves nothing behind. It needs the standard library only. Checked are: a plain tar whose first member is `bundle.json` of this schema; after it exactly the listed members in order, each a regular file with a plain header (no link, device, directory, sparse file, extended or long-name header) of the listed size and SHA-256, and nothing after them; every path relative, without `..`, hidden or unusual names, and one of `archive/<file of an entry>`, `static/...`, `result.json`, `run.log`; no member above `max_member_bytes` and all together not above `max_bytes` (16 GiB), before anything is read; the files a publishable entry needs for its levels are there; `archive/manifest.json` and `result.json` are of the GLYCAM name of `bundle.json` (and of `expected_glycam_name`), the manifest lists the archive files of the bundle with their sizes and hashes, the result was computed from exactly that manifest and those files with those levels and records exactly the static files of the bundle; `extends` agrees with the manifest. `check_bundle` does the same without unpacking, `load_bundle_dir` checks an unpacked folder again. `lib.archive.verify_entry(<folder>/archive, check_folder=False)` additionally decodes the trajectory.
+
+### Merge and extend
+
+When the glycan is already in the database, the new trajectories can be added to the stored ones and the union analysed:
+
+```bash
+.venv/bin/python scripts/archive_s3.py download --archive-dir "$RUN/stored" --glycan "$GLYCAM_NAME"   # login node
+"$GAP/.venv-node/bin/python" "$GAP/scripts/make_entry.py" --glycam-name "$GLYCAM_NAME" --workers 16 \
+    --output "$RUN/bundle.tar" --extend "$RUN/stored/<entry folder>" --replica-map "$RUN/replica_map.txt" \
+    --replica-prefix "$RUN_ID-" --frame-stride 5
+```
+
+The frames of the stored entry come first and are taken over as the bytes they are (see [Extending an entry](#raw-trajectory-archive)); the replicas follow. The stored entry is checked against its manifest first and is only read. Its name has to be `--glycam-name`, and the replicas have to have its atoms, the same names, residues and order, or the command stops with exit status 2 and says which atom differs. A replica may not have the name of a segment the stored entry already has (runs name their replicas alike: use `--replica-prefix`). `bundle.json` then has `extends` with the SHA-256 of the manifest of the stored entry: publishing replaces the stored entry only if that is still the manifest in the storage. `source.simulation_length_ns` covers the new replicas only; the length of the whole is the stored length plus it. An entry that was made from a damaged source keeps the record of that in its segment and stays listed as repaired.
+
+### Time and memory
+
+Measured on a 20-core ARM machine with the replicas on a local disk: the whole command under `/usr/bin/time`, each run started while nothing else used the machine. The memory is the larger of the maximum resident set of the main process and the peak of the summed proportional set sizes of all processes of the command (sampled twice a second).
+
+| Glycan | Replicas | `--workers` | Time | Peak memory | Bundle |
+|---|---|---|---|---|---|
+| 97 atoms, 50,005 frames | 3 (384 MB of text) | 8 | 14 s | 1.9 GiB | 48 MB |
+| | | 16 | 16 s | 3.0 GiB | |
+| 231 atoms, 40,004 frames | 2 (731 MB) | 8 | 18 s | 3.1 GiB | 82 MB |
+| | | 16 | 20 s | 3.6 GiB | |
+| 329 atoms, 160,016 frames | 4 (4.29 GB) | 8 | 91 s | 19.0 GiB | 441 MB |
+| | | 16 | 90 s | 19.4 GiB | |
+
+Sixteen workers were not faster than eight there. Of the 91 s of the largest, 6 s are the conversion (four replicas in four processes), 84 s the analysis (clustering 37 s, PCA 18 s, figures 14 s) and 1 s the bundle with reading it back. The memory is that of the analysis ([One entry on a compute node](#one-entry-on-a-compute-node)): one matrix of 8 bytes x retained frames x atom pairs. Extending a stored entry of 120,012 frames with 5,000 new ones took 64 s and 14.4 GiB with 8 workers (346 MB bundle).
+
+`requirements-node.txt` is the part of `requirements.txt` that the node command loads: 13 packages, 36 with what they depend on, 0.87 GB installed (the environment of `requirements.txt` with the test tools is 1.3 GB). The command fails without any one of the 13. Importing everything it loads takes 0.8 s and 0.28 GB; on a trajectory of 480 frames the whole command takes 2 to 4 s and 0.35 GB. `lib/entry_bundle.py`, the receiving side, imports the standard library only.
+
 ## Raw trajectory archive
 
 The raw data can be kept in a compact archive instead of multi-model PDB text. One entry is one glycan:
@@ -364,7 +466,8 @@ The raw data can be kept in a compact archive instead of multi-model PDB text. O
     info.json, name.json     unchanged, when the source has them
     manifest.json            GLYCAM name, atoms, frames, box, size and SHA-256 of every file and of the
                              source simulation.pdb, what the verification measured, converter version/date;
-                             for a damaged source also "source_irregularities"
+                             for a damaged source also "source_irregularities"; for an entry made of
+                             several trajectories also "segments", for one that extends another "extends"
 ```
 
 - **Coordinates are exact.** They go from the PDB columns to the XTC as integers of 0.001 Å, so the archive holds the digits of the source; `-0.000` is stored as `0.000` and counted in the manifest. Step and time of a frame are its index from 0 (the source has no times). The box of each frame is the `CRYST1` in force at that frame, so a file made of several runs written one after the other keeps the box of each run, and the manifest lists the frame at which each starts (as it does for `END` and other records found between frames). The 1 × 1 × 1 Å placeholder cell that PDB writers emit when there is no box is recorded in the manifest and `topology.pdb` but not written as a box.
@@ -378,6 +481,8 @@ The raw data can be kept in a compact archive instead of multi-model PDB text. O
 
   Refused with `--repair` too: a frame that `ENDMDL` ends with another atom count, atom records that are not those of the first frame (also in a cut frame), an unreadable coordinate, a first frame that is not complete, atom records with neither `MODEL` before nor `ENDMDL` after them, text other than `CRYST1` on a cut line, and a source in which more than 1000 frames or `MODEL` records are of the first two kinds (each is listed in the manifest). The manifest of a repaired entry has `source_irregularities`: `frames_in_source`, `frames_kept`, `frames_dropped`, `bytes_ignored`, `truncated` (the file ends inside a frame) and `items`, one per frame or record in source order with `kind`, `action` (`dropped`, `kept`, `ignored`), `source_frame` (its index among the frames of the source), `frames_kept_before` (the frames of the archive before it, which is the index of the next frame of the archive), `offset` and `bytes` (its place in `simulation.pdb`), the SHA-256 of those bytes, `bytes_ignored`, `atoms_found` against `atoms_expected`, `cut_line_bytes`, `followed_by`, and for the frame the file ends in `file_truncated` and `file_size`; the frames without `MODEL` record follow as one item with their count, indices and offsets. `frames`, the steps of the XTC, `box.cells[].first_frame` and `records_between_frames.*.before_frame` count the frames of the archive; `warnings` says that the entry was repaired. A manifest without `source_irregularities` is that of a regular source, and a regular source is converted to the same bytes with and without `--repair`. Verification is the same for the frames that are kept, and the record is checked against the file a second way: the `MODEL` and `ENDMDL` records are located by a search of its bytes, their numbers have to be those the record implies, the n-th `ENDMDL` has to lie in the bytes the n-th frame of the archive was read from (frames kept without one aside), and every item is read at its offset (its place among the frames, no `ENDMDL`, SHA-256, number of whole atom records). `index.json` lists the repaired entries under `repaired` and gives the record of each a `repaired` summary; the report has `repaired`, and the run prints a `REPAIRED` line per entry. A rerun skips a repaired entry like any other, with or without `--repair`; `--verify-only --data-dir` reads each source the way its manifest says.
 - **MODEL numbers** are not kept: a frame is its position in the trajectory, whatever the number on its `MODEL` record (they wrap, restart with every run, or are missing). The manifest summarises them under `source.model_numbers` (first, last, largest, whether they count up by one); `-1` there stands for a record without a number, and for a repaired source such records are counted under `model_records_without_number` with an example of their text.
+- **Several trajectories in one entry.** `lib.archive_segments.convert_segments` writes one entry from the replicas of a run, each a multi-model PDB of its own, and optionally after the frames of an existing entry ([A run on the cluster](#a-run-on-the-cluster) uses it). Every replica is read and verified against its own text as above, in parallel, into a part of the trajectory that carries the step numbers it has in the whole; the parts are appended byte for byte (an XTC has no header and its frames do not refer to each other), so nothing is concatenated as text and the trajectory is the one the converter makes of the concatenated file. The manifest has every key above and in addition `segments`, one record per trajectory in frame order: `name`, `first_frame`, `frames`, `coordinates_sha256` of its frames, its bytes in `trajectory.xtc` (`trajectory_offset`, `trajectory_bytes`), `time_per_frame_ps` (null when unknown), `run` (what the caller knew about the simulation), its `box`, `source` (file name, size, SHA-256, `model_numbers`, ...), its own `verification`, and `source_irregularities` when that replica was archived with repair. `source` of the manifest then describes all of them: `file` is null, `size` the sum, `sha256` the SHA-256 of the SHA-256 values of the source files in order. Every replica has to have the same atoms as the first (the same number, and name, residue name and residue number of every atom, in order), else nothing is written and the message names the first atom that differs; a difference in other columns of the atom records (serial number, chain, element) is a warning and is recorded as `atom_records` of the segment. A replica without `CRYST1` has no box (in a concatenated file the cell of the run before it would stay in force). A manifest without `segments` is that of one `simulation.pdb`; such entries are written exactly as before. Readers need not know about segments: `ArchiveEntry`, the store step, `index.json` and the transfers read the entry like any other, `verify_entry` also checks the coordinates of every segment against its record, and `repair_summary` (and with it `repaired` in the index) adds up the segments that came from a damaged source.
+- **Extending an entry.** With `extend=<entry folder>` the frames of that entry come first, as the bytes they are: its `trajectory.xtc` is the beginning of the new one and is not decoded and encoded again, and its `topology.pdb`, `structure.mol2` and `info.json` are kept. The new trajectories have to have its atoms (as above; an error says what differs). The manifest gets `extends` (`glycam_name`, `manifest_sha256` of the extended entry, `frames`, the size and hashes of its trajectory, its `files`, `previous` for an entry that was extended before), and the extended entry becomes the first segment (its segments, if it had any) with `carried_from`; an entry that was repaired keeps its `source_irregularities` in that segment. `lib.archive_segments.check_extension(new, old)` checks an extension against the entry it claims to extend: the SHA-256 of the manifest, the first bytes of the trajectory, and every frame decoded from both.
 
 ```bash
 # Convert (resumable: entries whose manifest verifies are skipped; the source is only read)

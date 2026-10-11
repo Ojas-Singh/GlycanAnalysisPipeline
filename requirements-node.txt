@@ -1,0 +1,22 @@
+# What scripts/make_entry.py and scripts/run_entry.py load on a compute node: the conversion to an archive
+# entry, the process stage, the static-ready files and the bundle. A part of requirements.txt, with the
+# same versions; nothing here is used to reach the network (requests is imported by lib/storage.py).
+#
+#   uv venv --python 3.10 .venv-node
+#   uv pip install --python .venv-node/bin/python -r requirements-node.txt
+#
+# Not needed on a node, and left to requirements.txt: glycowork, glypy, bio, rdflib, oxigraph, tqdm,
+# python-dotenv, boto3 (names, metadata, RDF, object storage: publishing).
+numpy==2.2.4
+scipy==1.15.2
+scikit-learn
+networkx==3.4.2
+matplotlib==3.10.1
+pandas>=2.0.0
+pyarrow==19.0.1
+seaborn==0.13.2
+rdkit==2024.9.6
+polars==1.33.1
+zarr==2.18.3
+requests>=2.31.0
+mdtraj==1.10.3
