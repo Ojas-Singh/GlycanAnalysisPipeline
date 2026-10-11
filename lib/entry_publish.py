@@ -42,8 +42,8 @@ file the *stored* manifest lists is stored with the listed content.
    object.  Readers see the new database.
 7. *Afterwards.*  Files of the glycan that the new manifest no longer lists
    are deleted (all of them for a withdrawal), the record of the entry and
-   the list of withdrawn IDs are written, ``pending.json`` and the staged
-   objects are removed.
+   the list of withdrawn IDs are written, the staged objects are removed
+   and, last, ``pending.json``.
 
 Every step first looks at what is stored and skips an object that is there
 with the same size and SHA-256, so the same command can be run again after
@@ -52,14 +52,25 @@ retry publishes the same bytes.
 
 Two publishers
 --------------
-One process publishes at a time (a lock in the process).  Against a second
-process there is a lock object ``<state>/<static>/lock.json`` with an owner
-and an expiry, and ``pending.json`` is claimed before anything is switched.
-Where the storage honours conditional writes (``If-None-Match``; probed, see
-:func:`conditional_writes`) both are created atomically and two publishers
-cannot interleave.  Where it does not, they are written and read back: this
-stops a second run that starts while one is under way, and cannot stop two
-that start within the same second.
+One process publishes at a time (a lock in the process): that is the
+intended use, and it is all the serialisation a single service needs.
+Against a second process (a manual run) there are three guards in the
+storage: a lock object ``<state>/<static>/lock.json`` with an owner and an
+expiry, taken before anything is read; ``pending.json``, claimed before
+anything is switched; and a comparison of the stored manifest with the one
+the change was derived from, made after that claim.
+
+Where the storage honours conditional writes (``If-None-Match``; found out
+with a probe, :func:`conditional_writes`) a free lock and ``pending.json``
+are created by one publisher only.  Then no two publishers switch at once
+and no change is lost: the one that comes second is refused at the lock, or
+stops before its switch and, run again, derives its change from the new
+database.  Where the storage does not honour them, the objects are written
+and read back: this stops a run that starts while another is under way, and
+cannot stop two that take the same step within the same moment.  The
+takeover of an expired lock is never atomic.  ``scripts/static_s3.py
+publish`` and ``scripts/archive_s3.py upload`` do not take the lock: they
+must not run while an entry is published.
 
 Withdrawing publishes a manifest without the entry first and deletes
 ``static/GSxxxxx/`` afterwards; the raw entry stays, and the ID is recorded
@@ -171,6 +182,7 @@ class Target:
     history_prefix: str = "raw-history"
     workers: int = 8
     _conditional: Optional[bool] = field(default=None, repr=False)
+    _conditional_reported: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         for name in ("static_prefix", "raw_prefix", "staging_prefix", "state_prefix", "history_prefix"):
@@ -443,6 +455,10 @@ def acquire_lock(target: Target, store: Store, owner: str, action: str, glycan_i
     if not _claim(target, store, target.lock_key, document, replace=existing is not None):
         holder = read_lock(target, store) or {}
         raise LockHeld(f"the database was locked by {holder.get('owner', 'another publisher')} at the same moment")
+    if target._conditional is False and not target._conditional_reported:
+        target._conditional_reported = True
+        log("the storage does not honour conditional writes: the lock is written and read back, which does not "
+            "separate two publishers that start at the same moment")
     return document
 
 
@@ -496,11 +512,13 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
         return True
 
     switched = 0
+    window_started = time.perf_counter()
     try:
         for item in pending["switch"]:
             switched += place(item)
             checkpoint(f"switched:{item['key']}")
         manifest_written = place(pending["manifest"])
+        window = round(time.perf_counter() - window_started, 3)
         checkpoint("manifest")
     except PublishEntryError:
         raise
@@ -510,7 +528,7 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
             "may describe files that have been replaced, so a reader that is behind fails and retries: "
             "run the command again (or publish_entry.py recover) to finish") from exc
     log(f"switched {switched} file(s) and {'wrote' if manifest_written else 'found'} "
-        f"{pending['manifest']['key']} (global_hash {pending['target_global_hash'][:16]}...)")
+        f"{pending['manifest']['key']} (global_hash {pending['target_global_hash'][:16]}...) in {window} s")
 
     # 7. Afterwards.  The published prefix is the new database from here on.
     try:
@@ -546,7 +564,8 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
         raise PublishEntryError(
             f"the new database is published, and clearing up stopped ({type(exc).__name__}: {exc}): "
             "run the command again (or publish_entry.py recover) to finish") from exc
-    return {"switched": switched, "manifest_written": manifest_written, "deleted": len(doomed)}
+    return {"switched": switched, "manifest_written": manifest_written, "deleted": len(doomed),
+            "switch_seconds": window}
 
 
 def recover(target: Target, log: Log = print, checkpoint: Checkpoint = _noop, owner: Optional[str] = None,
@@ -1203,6 +1222,7 @@ def publish_entry(
             stack.enter_context(_in_process(target))
             lock = acquire_lock(target, static_store, owner, action, glycan_id, lock_ttl, break_lock, log)
             stack.callback(lambda: _release_quietly(target, static_store, lock, log))
+            report["conditional_writes"] = target._conditional
             pending = read_pending(target, static_store)
             if pending is not None:                              # an interrupted publication goes first
                 log(f"completing the interrupted {pending['action']} of {pending['glycoshape_id']} (by {pending['owner']})")
@@ -1396,6 +1416,7 @@ def withdraw_entry(
             stack.enter_context(_in_process(target))
             lock = acquire_lock(target, store, owner, WITHDRAW, glycan_id, lock_ttl, break_lock, log)
             stack.callback(lambda: _release_quietly(target, store, lock, log))
+            report["conditional_writes"] = target._conditional
             pending = read_pending(target, store)
             if pending is not None:
                 log(f"completing the interrupted {pending['action']} of {pending['glycoshape_id']} (by {pending['owner']})")

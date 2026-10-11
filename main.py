@@ -2424,8 +2424,16 @@ def main():
         default=None,
         help='Clustering levels to compute, require and export: 1,2 (default, or GLYCOSHAPE_CLUSTER_LEVELS) or 1,2,3'
     )
+    parser.add_argument(
+        '--offline',
+        action='store_true',
+        help='Make no web lookup in the static stage (GlyCosmos, GlyTouCan, GlyGen, PubChem); same as GLYCOSHAPE_OFFLINE=1'
+    )
 
     args = parser.parse_args()
+    if args.offline:
+        config.lookups_offline = True
+        logger.info("Offline: the static stage makes no web lookup")
     if args.levels is not None:
         config.cluster_levels = args.levels
     logger.info(f"Clustering levels: {','.join(str(level) for level in config.cluster_levels)}")

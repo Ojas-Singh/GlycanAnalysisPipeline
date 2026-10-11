@@ -21,6 +21,12 @@ those around a call to :func:`write_static_ready`; the one-entry mode
 ``lib.static_levels`` reduces a published static folder to fewer levels with
 the same functions: :func:`info_json_for_levels`, :func:`csv_for_levels` and
 :func:`save_glycan_data`, the writer of ``data.json``.
+
+The way back is :func:`copy_static_ready`: it completes a static folder from
+a static-ready one by putting the identifier REMARK block on its PDB files
+(``lib.glystatic.complete_static_ready``, for an entry that arrives as a
+bundle, calls it where ``process_glycan`` calls :func:`copy_and_convert_pdbs`
+and :func:`copy_analysis_files`).
 """
 from __future__ import annotations
 

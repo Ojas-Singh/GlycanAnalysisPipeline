@@ -14,6 +14,7 @@ GAP takes the trajectories of one glycan (all its simulations, dry) and produces
 | Analysis of one entry | Store, PCA, clustering, torsions, representative structures; a self-contained result folder with `result.json` | A compute node, without network | [One entry on a compute node](#one-entry-on-a-compute-node) |
 | Whole-database runs | The same analysis over a data directory, then the static folder with identifiers and metadata | Login node and Slurm array | [Running](#running-), [Staged Oracle/Slurm workflow](#staged-oracleslurm-workflow) |
 | Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
+| Publishing one entry | The bundle of one analysed entry becomes `static/GSxxxxx/` and `raw/<GLYCAM name>/`; the root files and `sync_manifest.json` follow from the stored ones. Also: replace, withdraw | The server that approves entries; S3-compatible storage | [One entry: `scripts/publish_entry.py`](#one-entry-scriptspublish_entrypy) |
 
 Level 3 (a coverage set of up to 512 structures) is no longer produced by default; `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3` brings it back, and folders that still contain it are accepted.
 
@@ -77,6 +78,8 @@ export GLYCOSHAPE_STORE_FRAME_CHUNK=128
 export GLYCOSHAPE_CLUSTER_LEVELS=1,2
 export GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM=3.0
 export GLYCOSHAPE_FRAME_QUALITY_BLOCK_FRAMES=1024
+export GLYCOSHAPE_LOOKUP_TIMEOUT=30     # seconds per request to GlyCosmos, GlyTouCan, GlyGen, PubChem
+export GLYCOSHAPE_OFFLINE=0             # 1: make no such request; entries are written without what they would have answered
 export GLYCOSHAPE_SNFG_RENDERER=crabwurcs
 # Optional when crabwurcs is not on PATH:
 export GLYCOSHAPE_CRABWURCS_BIN=/path/to/crabwurcs
@@ -225,7 +228,7 @@ When every folder is there the root files are written in the order of the finali
 - **Resume** by running the same command again: a glycan folder that is in the destination is finished and skipped. A glycan that fails (for example an unreadable `info.json`, or a folder that lacks a Level 1 or 2 file) is reported and left out, the others are done, the root files are not written and the exit status is 1. Delete `sync_manifest.json` in the destination to have the root files written again.
 - **Nothing else is written into the destination.** Staging folders, the per-glycan records, a lock and `report.json` (per glycan: files kept, rewritten, dropped, bytes before and after) are in the work folder, `<dest>.work` unless `--work-dir` names another (on the file system of the destination). It can be deleted afterwards.
 - **Hard links.** A kept file of a glycan folder is one file with two names. This tool never writes into one, and neither do the static stage and the finalization run on local folders (the files they rewrite in place, which are the root files and `data.json`, are copied here, not linked). Anything else that edits such a file in place in one database changes the other: delete the source afterwards, or use `--copy`.
-- **Not byte-reproducible**, here as in the pipeline: the archives carry the modification times of their members (the new `data.json`), `sync_manifest.json` its `generated_at` and the times of the files, and `GLYCOSHAPE_RDF.ttl`, had it been converted again, would be the same graph with its lines in another order. Everything else is.
+- **Reproducible but for the times in the manifest**: `sync_manifest.json` carries its `generated_at` and the modification times of the files, which no hash covers. Everything else is a function of the source, the archives included (see [Reproducible root files](#reproducible-root-files)).
 - **The source is checked on the way.** Every file that is taken from it, kept or read to be rewritten, is compared with the SHA-256 that the `sync_manifest.json` of the source records, and the new `GLYCOSHAPE.json` with the one of the source (equal but for `cluster_levels.level_3`). A difference is a warning in the output and in the report: the source is then not the database its manifest describes (an incomplete copy, a file changed afterwards).
 
 A database of the size of the published one (1,001 glycans, 29 GB without the Level 3 structures, of which 13 GB `torsion_all.csv` and 4.5 GB `info.json`) took one minute with 8 workers and 2 GB of memory, half of it for the glycan folders and half for the archives and the manifest; eight glycans of the largest size in work together took 5 GB. `--skip-finalize` stops after the glycan folders.
@@ -334,9 +337,12 @@ metadata or the network:
 Publishing can start from either half of the result: run the static stage on
 the processed data (`python main.py --mode static-only --process-dir
 <result-folder>/process ...`, which writes the same files plus the ones
-above), or copy `static/` to `static/GSxxxxx/` and add the files above.
-`lib/static_ready.py` is the single implementation of the shared files; the
-static stage calls it. The static stage takes the GLYCAM name from the name of
+above), or hand the static-ready half over as a bundle and let
+[`scripts/publish_entry.py`](#one-entry-scriptspublish_entrypy) add the files
+above and publish the entry. The two give the same folder: `lib/static_ready.py`
+is the single implementation of the shared files and
+`lib.glystatic.write_identity_files` of the identifier files; both ways call
+them. The static stage takes the GLYCAM name from the name of
 the process folder, which for an archive entry with a long name is the
 shortened folder name: the name to publish under is `glycam_name` in
 `result.json`.
@@ -479,6 +485,77 @@ The website reads `static/sync_manifest.json` and then downloads the files it li
 If the upload is interrupted in step 1 or 2, which is where the time goes, the published prefix is exactly what it was: the old manifest and every file it lists. Step 3 cannot be made invisible, because two objects cannot be replaced at once: from the first copy until the manifest is written, the published manifest describes files that have been replaced. A website that already has the published `global_hash` does nothing in that window; one that is behind fails its verification, keeps its database and retries. Run `publish` again after any interruption: it continues from what is stored. Without a published manifest (the first publish) there is no reader, and files are replaced in place.
 
 `publish` exits non-zero when it stopped, and also when the manifest was written but step 5 failed (it says which). `check` exits non-zero and lists the files that are missing or differ. `--quick` trusts the SHA-256 metadata, so it does not notice an object whose content was changed by other means; the full check does.
+
+### One entry: `scripts/publish_entry.py`
+
+A new glycan does not need the whole pipeline on a login node any more. The cluster job analyses the entry ([One entry on a compute node](#one-entry-on-a-compute-node)) and hands the result over as a bundle; the server that approves entries publishes it. Nothing here asks PocketBase: the caller owns the registry of GlycoShape IDs and passes the ID in.
+
+```bash
+.venv/bin/python scripts/publish_entry.py publish  --bundle run-17/ --submission run-17.json --dry-run   # what an administrator approves
+.venv/bin/python scripts/publish_entry.py publish  --bundle run-17/ --submission run-17.json --expect-hash <hash of the dry run>
+.venv/bin/python scripts/publish_entry.py replace  --bundle run-18/ --submission run-18.json              # same ID, new content
+.venv/bin/python scripts/publish_entry.py withdraw --id GS01067 --work-dir withdraw-GS01067
+.venv/bin/python scripts/publish_entry.py status   --id GS01067 --check
+.venv/bin/python scripts/publish_entry.py recover                                                        # finish an interrupted switch
+```
+
+**Input.** An extracted, validated bundle directory (`bundle.json` with the size and SHA-256 of every file, `archive/` the raw entry, `static/` the static-ready folder, `result.json`, `run.log`) and a submission record:
+
+```json
+{
+  "schema": "glycoshape-submission", "schema_version": 1,
+  "glycoshape_id": "GS01067",
+  "glycam_name": "DManpa1-2DManpa1-OH",
+  "simulation": {
+    "simulation_length_ns": 2500.0,
+    "md_package": "GROMACS", "force_field": "GLYCAM_06j",
+    "temperature_k": 300.0, "pressure_bar": 1.0, "salt_concentration_mm": 150.0,
+    "source_type": "manual", "comments": ""
+  },
+  "glytoucan_id": "",
+  "curated": {"common_names": [], "aliases": [], "description": "", "keywords": []}
+}
+```
+
+The simulation fields are named as in `source` of `bundle.json` (`--id GS01067` instead of `--submission` takes them from there). Every quantity has its unit in its name; `simulation_length`, `temperature`, `pressure` or `salt_concentration` without one is refused, because the length has been entered in nanoseconds by one client and in microseconds by another. `simulation_length_us` is accepted in place of `simulation_length_ns`. The units are converted once, in `lib/entry_complete.py`, to those of `data.json`: `length` in microseconds (`simulation_length_ns / 1000`), `temperature` in kelvin, `pressure` in bar, `salt` in mM. The length is the aggregated one of the entry: for a bundle that extends a published entry, `source` states the new run only and the published length has to be added. Values that look like a unit mistake (a length under 10 ns or over 1 ms, a temperature outside 200 to 500 K) are accepted and reported as warnings.
+
+**The glycan folder** is completed in the work folder (`<bundle>.publish`, or `--work-dir`) by `lib.entry_complete.complete_entry`: `data.json` with the search metadata, `snfg.svg`, `glygen.json`, `glycosmos.json`, `output/` and `landscape/` with the REMARK block on the PDB files, and `GSxxxxx.zip`. It is the folder `main.py --mode static-only` writes for the same ID and metadata: both call the same functions (`lib.glystatic.write_identity_files`, `lib.static_ready`, `lib.glymeta`, `lib.glybake.write_archive`). Curated aliases that the names of the entry do not already give are kept under `search_meta.aliases`, a key that only such an entry has.
+
+**Web lookups** (GlyCosmos and GlyTouCan, GlyGen, PubChem) go through `lib/lookups.py`: each request has a timeout (`GLYCOSHAPE_LOOKUP_TIMEOUT`, `--lookup-timeout`), all of them together a budget (`--lookup-budget`, 300 s), and `--offline` (or `GLYCOSHAPE_OFFLINE=1`, also `main.py --offline`) makes none. An entry is published with what was answered. What was asked and what was not answered is in the report, and stays with the entry in the storage (`publish-state/static/entries/GSxxxxx.json`: `lookups`, and `gaps`, the identity fields that are empty), so a later `replace --refresh-metadata` knows what to retry; `status --id` prints it. An entry without WURCS and accession, or without its SNFG image, is refused unless `--allow-incomplete` is given (the static stage calls such a folder incomplete as well).
+
+**The root files** are not built from all glycan folders but derived from the stored ones (`lib/static_delta.py`): `GLYCOSHAPE.json` with one key inserted, replaced or removed; `GlycoShape.zip` with one member more or less; `GLYCOSHAPE_RDF.ttl` converted from the new inventory; the two `missing_*` reports with the lines of the changed glycan exchanged; `sync_manifest.json` with one glycan entry and the entries of these root files changed and `global_hash` recomputed. No other glycan folder is read: the publication works on a bucket that holds only the root objects. The result is byte for byte what the finalization writes for the changed tree, apart from `generated_at` and the `mtime` values of the manifest.
+
+**Checked before anything is written** to the raw or the published prefix (the lock is the one object written before): the hashes of the bundle; that the archive entry, the result and the bundle are of one glycan and that the result was computed from these raw files; the levels (`--levels`) and the pipeline of the bundle (`--accept-pipeline-version`, `--accept-pipeline-commit`, converter version, `--require-clean`); that the ID is not the ID of another glycan and the glycan not published under another ID; for `publish` that the ID is new, for `replace` that it is published; that a withdrawn ID comes back only for its own glycan; that the stored root files are those of the stored manifest; that the stored raw entry is the one the bundle extends, or the same (`--overwrite-raw` for another one); `--expect-hash`. Exit status 2 and every reason, on stderr and in `--report`.
+
+**Order**, and what the website sees:
+
+| Step | What is written | A reader of `static/` sees | Interrupted here |
+|---|---|---|---|
+| 1 | `raw/<GLYCAM name>/` files, `manifest.json` last; then `raw/index.json` | the old database | the raw entry has no manifest (incomplete) until the run is repeated |
+| 2 | files of `static/GSxxxxx/` under keys no stored manifest lists | the old database | objects that nothing lists |
+| 3 | replacements (root files, changed files of a replaced glycan) and the new manifest under `publish-staging/static/<SHA-256>` | the old database | staged objects; removed by the next run |
+| 4 | `publish-state/static/pending.json`: what is about to be switched | the old database | the next run (or `recover`) completes the switch from the storage |
+| 5 | staged files are copied onto their keys inside the storage | old manifest, some files already new: a reader that is behind fails its verification, keeps its database and retries at its next synchronisation; one that is up to date does nothing | as during the step, until the next run or `recover` |
+| 6 | `sync_manifest.json` is copied into place | the new database | |
+| 7 | stale files of the glycan are deleted (the whole folder for a withdrawal), the record of the entry and `withdrawn.json` are written, the staged objects and then `pending.json` are removed | the new database | objects that nothing lists; removed by the next run |
+
+Every step skips an object that is stored with the same size and SHA-256, and the journal in the work folder (`journal.json`) keeps the completed folder and the derived root files, so the same command continues an interrupted run and publishes the same bytes. Any later command first completes a pending switch. `status` shows the lock, a pending publication and the state of one entry.
+
+**Replace.** Files that did not change are not sent. A bundle whose `extends` names the stored raw manifest replaces the raw entry in place: the previous trajectory is dropped, since the new one holds its frames, and the previous `manifest.json` is kept under `raw-history/<GLYCAM name>/<its SHA-256>/` (the record of what the earlier publication was computed from). A raw entry that the bundle does not extend is replaced only with `--overwrite-raw`, and then all of its files are copied to the history prefix first (`--keep-previous-raw`).
+
+**Withdraw** publishes a manifest without the entry first, then deletes `static/GSxxxxx/`. The raw entry stays. The ID is recorded in `publish-state/static/withdrawn.json`: it can come back for the same glycan and is refused for any other.
+
+**Two publishers.** One process publishes at a time; a single service serialises its publications this way. Against a second process there are a lock object (`publish-state/static/lock.json`: owner, host, process, expiry; exit status 3 for whoever finds it), the claim of `pending.json` before the switch, and a comparison of the stored manifest with the one the change was derived from. Where the storage honours conditional writes (`If-None-Match`; the tool probes for it and says when it does not) a free lock and `pending.json` are created by one publisher only, and no change is lost. Where it does not, they are written and read back, which does not separate two publishers that take the same step at the same moment. A lock is taken over when it has expired (`--lock-ttl`, one hour), when its process on this machine no longer exists, or with `--break-lock`. `scripts/static_s3.py publish` and `scripts/archive_s3.py upload` do not take the lock and must not run during a publication. Once entries are published this way the storage is the database: `static_s3.py publish` from a local tree that does not have them would publish a manifest without them (and delete their folders with `--delete-stale`), and `archive_s3.py upload` from a local archive without them would write an `index.json` that no longer lists them (their objects stay and are reported as extra). Bring a local tree up to date from the storage before using either.
+
+**Cost.** Adding one glycan (231 atoms, 40,004 frames; bundle 82 MB) to the published database of 1,001 glycans, against a local MinIO that held only the root objects: 17 s for the dry run (1.1 GB peak memory, of which the RDF conversion needs most; 127 MB downloaded) and 5 s for the publication that follows it in the same work folder (229 MB uploaded: 50 MB raw entry, 32 MB folder, 139 MB root files and 7 MB manifest; 146 MB copied inside the storage; the switch took 0.5 s). `--cache-dir` keeps the root files of the last publication, so the next one downloads only the manifest.
+
+#### GlycoShape IDs
+
+`lib/id_registry.py` has what the registry of the caller needs and stores nothing itself: `next_id(issued, inventory)` is one more than the highest ID ever issued or published (GS01067 today: the old registry issued up to GS01066 while GS01063 is the highest published one; a gap is never filled), and `seed_registry(inventory, issued, names)` pairs GLYCAM names and IDs from `GLYCOSHAPE.json` and the records of the old registry and lists what a person has to decide (a name with several IDs, an ID with several names, records without an ID). The key is the full GLYCAM name, `archetype.name` of the inventory; `archetype.glycam` lacks the last five characters of it, the anomer, position and `-OH` of the reducing end.
+
+#### Reproducible root files
+
+`GSxxxxx.zip` and `GlycoShape.zip` are written with their members in the order of their names and one fixed time stamp (`lib.glybake.write_archive`), so an archive is a function of what it holds. An archive that already holds exactly the files of its folder is kept as it is: the archives of the published database keep their bytes until the content of their folder changes. `GlycoShape.zip` is always written anew, in the new form. `GLYCOSHAPE_RDF.ttl` is a function of `GLYCOSHAPE.json` (blank nodes are numbered in the order of the input). `archetype.termini` of `data.json` keeps the order glycowork returns (it came from a set before and changed from run to run). What remains outside any hash are the times in `sync_manifest.json`.
 
 ### Tests
 

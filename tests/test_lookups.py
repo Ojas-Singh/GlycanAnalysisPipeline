@@ -59,6 +59,12 @@ def test_every_request_of_the_name_services_goes_through_the_lookups_module():
     assert "timeout=MOLWURCS_TIMEOUT_SECONDS" in code            # the Java fallback is bounded as well
 
 
+def test_the_pipeline_has_an_offline_switch():
+    source = (REPO_ROOT / "main.py").read_text()
+    assert "'--offline'" in source and "config.lookups_offline = True" in source
+    assert config.lookups_offline is False and config.lookup_timeout == 30.0     # the defaults
+
+
 def test_a_request_without_a_timeout_of_its_own_gets_the_configured_one(monkeypatch):
     services = Services(monkeypatch, lambda method, url, **kw: Response([{"taxon": "9606"}]))
     assert name_utils.glytoucan2glycosmos("G00001AA") == [{"taxon": "9606"}]
