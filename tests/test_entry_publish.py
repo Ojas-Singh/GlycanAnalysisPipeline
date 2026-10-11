@@ -703,7 +703,7 @@ def test_a_replacement_by_an_extended_entry_overwrites_the_raw_entry_and_keeps_i
                            work_dir=tmp_path / "work-extended")
     assert report["status"] == "published" and report["raw"]["relation"] == "extension"
     assert report["raw"]["previous_manifest_sha256"] == first_sha256
-    assert report["raw"]["history"] == [f"raw-history/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
+    assert report["raw"]["history"] == [f"raw-history/raw/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
     assert set(report["raw"]["upload"]) == {"info.json", "trajectory.xtc", "manifest.json"}      # topology and MOL2 are the same
     # the previous trajectory is gone (the new one holds its frames); the manifest that described it is kept
     assert world.keys("raw-history/") == report["raw"]["history"]
@@ -741,7 +741,9 @@ def test_a_raw_entry_is_only_overwritten_when_asked_and_then_kept_in_the_history
     report = world.publish(unrelated, action="replace", work_dir=tmp_path / "work-unrelated-3", policy=Policy(overwrite_raw=True))
     assert report["status"] == "published" and report["raw"]["relation"] == "overwrite"
     previous = hashlib.sha256((bundle_dir / "archive" / "manifest.json").read_bytes()).hexdigest()
-    kept = {key[len(f"raw-history/{GLYCAM_NAME}/{previous}/"):]: content for key, content in stored_tree(world.backend, "raw-history/").items()}
+    history = f"raw-history/raw/{GLYCAM_NAME}/{previous}/"
+    assert all(key.startswith(history) for key in world.keys("raw-history/"))
+    kept = {key[len(history):]: content for key, content in stored_tree(world.backend, "raw-history/").items()}
     assert kept == {key[len(f"raw/{GLYCAM_NAME}/"):]: content for key, content in stored_before.items()
                     if key.startswith(f"raw/{GLYCAM_NAME}/")}                    # every file of the replaced entry
 
@@ -1084,3 +1086,80 @@ def test_the_prefixes_of_a_target_do_not_overlap(fake_s3):
                   {"static_prefix": ""}, {"staging_prefix": "/"}):
         with pytest.raises(PublishEntryError):
             Target(backend, backend, **wrong)
+
+
+def places(target):
+    """Every key prefix a publication to this target writes below."""
+    return [f"{target.static_prefix}/", f"{target.raw_prefix}/", f"{target.state_prefix}/{target.static_prefix}/",
+            f"{target.staging_prefix}/{target.static_prefix}/", f"{target.history_prefix}/{target.raw_prefix}/"]
+
+
+def test_what_a_target_keeps_outside_the_published_prefixes_is_under_its_own_prefixes(fake_s3):
+    backend, _ = fake_s3
+    real = Target(backend, backend)
+    trial = Target(backend, backend, static_prefix="trial-publish/static", raw_prefix="trial-publish/raw")
+    assert (real.lock_key, real.pending_key, real.withdrawn_key, real.record_key("GS01067"), real.staged("abc")) == (
+        "publish-state/static/lock.json", "publish-state/static/pending.json", "publish-state/static/withdrawn.json",
+        "publish-state/static/entries/GS01067.json", "publish-staging/static/abc")
+    assert real.history(GLYCAM_NAME) == f"raw-history/raw/{GLYCAM_NAME}/"
+    assert (trial.lock_key, trial.pending_key, trial.withdrawn_key, trial.record_key("GS01067"), trial.staged("abc")) == (
+        "publish-state/trial-publish/static/lock.json", "publish-state/trial-publish/static/pending.json",
+        "publish-state/trial-publish/static/withdrawn.json", "publish-state/trial-publish/static/entries/GS01067.json",
+        "publish-staging/trial-publish/static/abc")
+    assert trial.history(GLYCAM_NAME) == f"raw-history/trial-publish/raw/{GLYCAM_NAME}/"
+    for target in (real, trial):
+        for key in (target.lock_key, target.pending_key, target.withdrawn_key, target.record_key("GS01067"),
+                    target.staged("abc"), target.history(GLYCAM_NAME) + "0" * 64 + "/manifest.json"):
+            assert sum(key.startswith(place) for place in places(target)) == 1, key
+    # no place of one environment lies inside a place of the other
+    assert not [(mine, other) for mine in places(real) for other in places(trial)
+                if mine.startswith(other) or other.startswith(mine)]
+
+
+def test_a_trial_under_other_prefixes_of_the_same_bucket_shares_no_key_with_the_real_one(
+        world, bundle_dir, extended_bundle, tmp_path):
+    for key in world.keys("static/") + world.keys("raw/"):                  # the same database and archive, as a trial
+        world.backend.copy(key, f"trial/{key}")
+    trial = Target(static=world.backend, raw=world.backend, static_prefix="trial/static", raw_prefix="trial/raw", workers=4)
+    website = Reader(world.backend, tmp_path / "trial-website", prefix="trial/static")
+    # a publisher of the real database holds its lock meanwhile: it is not the lock of the trial
+    entry_publish.acquire_lock(world.target, world.store(), "elsewhere:77:abcd1234", "replace", "GS00002", ttl=600, log=quiet)
+    lock_of(world, host="elsewhere")
+    real_before = {key: content for key, content in stored_tree(world.backend, "").items() if not key.startswith("trial/")}
+    world.client.calls.clear()
+
+    def in_the_trial(action, bundle, submission, name):
+        return entry_publish.publish_entry(action, bundle, submission, trial, work_dir=tmp_path / name, log=quiet)
+
+    assert in_the_trial("publish", bundle_dir, record(), "work-trial")["status"] == "published"
+    replaced = in_the_trial("replace", extended_bundle, record(simulation={"simulation_length_ns": 3100.0}), "work-trial-2")
+    first_sha256 = hashlib.sha256((bundle_dir / "archive" / "manifest.json").read_bytes()).hexdigest()
+    assert replaced["status"] == "published" and replaced["raw"]["key_prefix"] == f"trial/raw/{GLYCAM_NAME}/"
+    assert replaced["raw"]["history"] == [f"raw-history/trial/raw/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
+    assert website.try_sync() is None and website.glycans() == sorted(PUBLISHED + (GS,))
+    assert entry_publish.withdraw_entry("GS00002", trial, tmp_path / "work-trial-3", log=quiet)["status"] == "withdrawn"
+
+    # everything the trial wrote is in its own places, and what the real one keeps is byte for byte what it was
+    written = sorted({call[2] for call in world.writes()})
+    assert written and all(sum(key.startswith(place) for place in places(trial)) == 1 for key in written), written
+    assert not [key for key in written if any(key.startswith(place) for place in places(world.target))]
+    assert {key: content for key, content in stored_tree(world.backend, "").items() if not key.startswith("trial/")
+            and not any(key.startswith(place) for place in places(trial))} == real_before
+    assert world.keys("raw-history/") == replaced["raw"]["history"]
+    assert world.keys("publish-state/") == [
+        f"{STATE}/lock.json", "publish-state/trial/static/entries/GS00002.json",
+        f"publish-state/trial/static/entries/{GS}.json", "publish-state/trial/static/withdrawn.json"]
+    assert world.keys("publish-staging/") == []
+
+    # and the real one is published afterwards as if there had been no trial
+    world.backend.unlink(f"{STATE}/lock.json")
+    assert world.publish(bundle_dir)["status"] == "published"
+    again = world.publish(extended_bundle, record(simulation={"simulation_length_ns": 3100.0}), action="replace",
+                          work_dir=tmp_path / "work-real-2")
+    assert again["raw"]["relation"] == "extension"
+    assert again["raw"]["history"] == [f"raw-history/raw/{GLYCAM_NAME}/{first_sha256}/manifest.json"]
+    assert world.keys("raw-history/") == sorted(again["raw"]["history"] + replaced["raw"]["history"])
+    assert entry_publish.status(world.target, "GS00002")["entry"]["state"] == "published"
+    assert entry_publish.status(trial, "GS00002")["entry"]["state"] == "withdrawn"
+    assert world.reader.try_sync() is None and world.reader.glycans() == sorted(PUBLISHED + (GS,))
+    assert website.try_sync() is None and website.glycans() == sorted(set(PUBLISHED + (GS,)) - {"GS00002"})

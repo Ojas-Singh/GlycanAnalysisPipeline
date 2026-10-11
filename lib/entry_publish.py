@@ -178,6 +178,13 @@ class Target:
     ``state_prefix`` (lock, pending publication, records, withdrawn IDs) in
     the database bucket, ``history_prefix`` (what a replaced raw entry was)
     in the archive bucket.
+
+    Each of the three is followed by the prefix it belongs to, so that two
+    databases or two archives in one bucket (a trial next to the real one)
+    share no key: ``<staging>/<static prefix>/`` and
+    ``<state>/<static prefix>/`` for the static side,
+    ``<history>/<raw prefix>/`` for the raw side.  The prefixes of two
+    environments must not lie inside each other.
     """
 
     static: Any
@@ -222,6 +229,16 @@ class Target:
 
     def staged(self, sha256: str) -> str:
         return f"{self.staging_prefix}/{self.static_prefix}/{sha256}"
+
+    def history(self, glycam_name: str) -> str:
+        """Key prefix of what the raw entry of a glycan was before it was replaced, by the SHA-256 of its manifest.
+
+        ``raw-history/raw/<GLYCAM name>/`` with the defaults: under the raw
+        prefix like the state of the static side under the static prefix,
+        without an exception for the default one, so that a listing of
+        ``raw-history/<raw prefix>/`` is the history of that archive only.
+        """
+        return f"{self.history_prefix}/{self.raw_prefix}/{glycam_name}/"
 
     @property
     def lock_key(self) -> str:
@@ -790,7 +807,7 @@ def plan_raw(target: Target, store: Store, bundle: entry_complete.Bundle, policy
     stored_manifest = store.read_optional(key_prefix + archive.MANIFEST_FILE) if key_prefix + archive.MANIFEST_FILE in listing else None
     stored_sha256 = None if stored_manifest is None else hashlib.sha256(stored_manifest).hexdigest()
     extends = bundle.extends
-    history_prefix = f"{target.history_prefix}/{name}/"
+    history_prefix = target.history(name)
     if not listing:
         relation = "new"
     elif all(stored_ok.values()):

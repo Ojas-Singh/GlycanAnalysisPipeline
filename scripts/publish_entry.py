@@ -112,7 +112,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             command.add_argument("--overwrite-raw", action="store_true",
                                  help="Replace a stored raw entry by one that does not extend it.")
             command.add_argument("--keep-previous-raw", choices=("auto", "manifest", "all"), default="auto",
-                                 help="What of a replaced raw entry is copied to raw-history/ first (default auto: "
+                                 help="What of a replaced raw entry is copied to raw-history/<raw prefix>/ first (default auto: "
                                       "its manifest when the new entry extends it, every file otherwise).")
         if name == "withdraw":
             command.add_argument("--id", required=True, help="GlycoShape ID to withdraw.")
