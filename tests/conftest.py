@@ -212,6 +212,48 @@ def s3_bucket(s3_settings):
         client.delete_bucket(Bucket=bucket)
 
 
+# ---------------------------------------------------------------------------
+# Publishing one entry
+# ---------------------------------------------------------------------------
+_LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+@pytest.fixture
+def no_internet(monkeypatch):
+    """Any attempt to reach another machine fails the test; the S3 servers of this machine stay reachable."""
+    connect, resolve = socket.socket.connect, socket.getaddrinfo
+
+    def guarded_connect(self, address, *args, **kwargs):
+        if self.family in (socket.AF_INET, socket.AF_INET6) and address[0] not in _LOOPBACK:
+            raise AssertionError(f"network access attempted: {address}")
+        return connect(self, address, *args, **kwargs)
+
+    def guarded_resolve(host, *args, **kwargs):
+        if host not in _LOOPBACK:
+            raise AssertionError(f"name lookup attempted: {host}")
+        return resolve(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_resolve)
+
+
+@pytest.fixture(scope="session")
+def synthetic_entry(tmp_path_factory):
+    """Source, archive entry and result folder of the synthetic glycan: one run of the process stage per session."""
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    from bundle_fixtures import synthetic_run
+
+    return synthetic_run(tmp_path_factory.mktemp("synthetic-entry"), info={"simulationLength": 480.0})
+
+
+@pytest.fixture
+def bundle_dir(synthetic_entry, tmp_path):
+    """A bundle directory of the synthetic glycan that a test may change."""
+    from bundle_fixtures import make_bundle
+
+    return make_bundle(tmp_path / "bundle", synthetic_entry["result"], synthetic_entry["archive"])
+
+
 @pytest.fixture
 def long_name(s3_server):
     """The 267-character GLYCAM name, for a server that can store it as a key segment."""
