@@ -1244,7 +1244,8 @@ def _merged_is_current(
 
 def _segment_plan(segments: Sequence[Dict[str, Any]]) -> List[Tuple[Any, ...]]:
     return [(segment["name"], segment["first_frame"], segment["frames"], segment["coordinates_sha256"],
-             segment.get("time_per_frame_ps")) for segment in segments]
+             segment.get("time_per_frame_ps"), json.dumps(segment.get("run"), sort_keys=True))
+            for segment in segments]
 
 
 def merge_entries(
@@ -1256,6 +1257,8 @@ def merge_entries(
     absorbed_id: Optional[str] = None,
     kept_time_per_frame_ps: Optional[float] = None,
     absorbed_time_per_frame_ps: Optional[float] = None,
+    kept_run: Optional[Dict[str, Any]] = None,
+    absorbed_run: Optional[Dict[str, Any]] = None,
     force: bool = False,
 ) -> Dict[str, Any]:
     """Write one entry with the frames of two stored entries of one glycan, under the name of ``kept``.
@@ -1284,7 +1287,11 @@ def merge_entries(
     manifest SHA-256), with ``first_frame`` and ``trajectory_offset`` in the
     whole.  An entry of one ``simulation.pdb`` is one segment, named by its
     source folder for ``kept`` and ``absorbed_id`` (or its GLYCAM name) for
-    ``absorbed``, with the time per frame given here.  The segments of an
+    ``absorbed``, with the time per frame given here.  ``kept_run`` and
+    ``absorbed_run`` (JSON values; for example ``{"salt_concentration_mm":
+    200.0}``, what the published entry says about its simulations) are
+    written into the ``run`` record of every segment of that entry, over
+    what the record had.  The segments of an
     absorbed entry that has some are named ``<absorbed_id>/<their name>``
     (``GS00453/replica_1``), so that every name is that of one segment.
     The manifest has ``extends`` for ``kept`` (as an extension has: the
@@ -1361,7 +1368,8 @@ def merge_entries(
     # The segments: those of the kept entry, then those of the absorbed one.
     frames_before = int(kept_manifest["frames"])
     bytes_before = int(kept_manifest["files"][archive.TRAJECTORY_FILE]["size"])
-    segments = _carried_segments(kept_manifest, kept_sha256, kept_time_per_frame_ps)
+    segments = [dict(segment, run={**(segment.get("run") or {}), **kept_run}) if kept_run else segment
+                for segment in _carried_segments(kept_manifest, kept_sha256, kept_time_per_frame_ps)]
     named = bool(archive.segments_of(absorbed_manifest))
     for segment in _carried_segments(absorbed_manifest, absorbed_sha256, absorbed_time_per_frame_ps):
         segments.append(dict(
@@ -1372,6 +1380,7 @@ def merge_entries(
             trajectory_offset=bytes_before + int(segment["trajectory_offset"]),
             merged_from={"glycoshape_id": absorbed_id, "glycam_name": absorbed_manifest["glycam_name"],
                          "manifest_sha256": absorbed_sha256},
+            **({"run": {**(segment.get("run") or {}), **absorbed_run}} if absorbed_run else {}),
         ))
     names = [segment["name"] for segment in segments]
     if len(set(names)) != len(names):

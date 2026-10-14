@@ -755,9 +755,12 @@ def test_an_absorbed_entry_of_one_simulation_pdb_is_one_segment_named_by_its_id(
     absorbed = stored_entry(tmp_path / "absorbed", ABSORBED, random_coords(20, ATOMS, seed=43), header=CELLS[2],
                             model=runs_by_model_numbers(10))
     manifest = segs.merge_entries(kept, absorbed, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453",
-                                  kept_time_per_frame_ps=50.0)["manifest"]
+                                  kept_time_per_frame_ps=50.0, kept_run={"salt_concentration_mm": 200.0},
+                                  absorbed_run={"salt_concentration_mm": 150.0})["manifest"]
     assert [(s["name"], s["first_frame"], s["frames"], s["time_per_frame_ps"]) for s in manifest["segments"]] == [
         (KEPT, 0, 20, 50.0), ("GS00453", 20, 20, None)]
+    # what each published entry said about its simulations, in the run record of its segments
+    assert [s["run"] for s in manifest["segments"]] == [{"salt_concentration_mm": 200.0}, {"salt_concentration_mm": 150.0}]
     assert manifest["segments"][1]["carried_from"]["segment"] is None
     assert manifest["box"]["kind"] == "constant"
     # the runs of each part as its source recorded them; those of the absorbed entry under its ID
@@ -767,6 +770,10 @@ def test_an_absorbed_entry_of_one_simulation_pdb_is_one_segment_named_by_its_id(
     assert [(run.name, run.first_frame, run.frames) for run in runs] == [
         ("stored_run_1", 0, 10), ("stored_run_2", 10, 10), ("GS00453/run_1", 20, 10), ("GS00453/run_2", 30, 10)]
     assert archive.verify_entry(Path(tmp_path / "merged" / KEPT))["ok"]
+    from lib import entry_ops
+
+    assert entry_ops.salt_by_run(manifest) == {"stored_run_1": 200.0, "stored_run_2": 200.0,
+                                               "GS00453/run_1": 150.0, "GS00453/run_2": 150.0}
     # without IDs the absorbed entry is named by its GLYCAM name
     manifest = segs.merge_entries(kept, absorbed, tmp_path / "merged-2")["manifest"]
     assert manifest["segments"][1]["name"] == ABSORBED and manifest["merged_from"]["glycoshape_id"] is None

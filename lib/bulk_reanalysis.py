@@ -355,7 +355,7 @@ def _complete_one(task: Dict[str, Any]) -> Dict[str, Any]:
             folder / "result" / "static", row["complete_as"], tuple(task["levels"]), submission, staging,
             offline=task["offline"], lookup_timeout=task.get("lookup_timeout"), lookup_budget=task.get("lookup_budget"),
             names=curation["names"], aliases=curation.get("aliases") or [], keywords=curation.get("keywords") or {},
-            public_note=curation.get("public_note") or "")
+            public_note=curation.get("public_note") or "", salt_by_run=curation.get("salt_by_run"))
         report = entry_complete.folder_report(target_folder, completed_data, task["levels"], summary, submission,
                                               list(submission.warnings))
         diagnostics = folder / "result" / "static" / replicas.STATIC_PATH

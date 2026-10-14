@@ -10,6 +10,7 @@
     reanalyse         analyse the stored raw entry of a published glycan again and publish it in place
     merge             one ID per simulated glycan: give the kept ID the frames of another ID of the same glycan,
                       publish the union, withdraw the other ID and move its raw entry to the history
+                      (--drop-runs: withdraw the other ID without pooling its runs; the kept entry stays as it is)
 
 ``publish`` and ``replace`` take an extracted bundle directory (bundle.json,
 archive/, static/, result.json, run.log) and a submission record::
@@ -42,8 +43,10 @@ publish-state/<static>/history/, and take --expect-hash like ``publish``.
 
 ``merge`` keeps ``--id`` and withdraws ``--from`` (lib/entry_ops.py, ``merge``)::
 
-    publish_entry.py merge --id GS00303 --from GS00453 --accept-difference salt --note "same glycan" \
+    publish_entry.py merge --id GS00303 --from GS00453 --accept-salt-difference --note "same glycan" \
         --analysis-workers 12 --memory-limit-gb 30 --work-dir w/ --dry-run --report r.json
+    publish_entry.py merge --id GS00037 --from GS00013 --drop-runs --note "the beta anomer is kept" \
+        --work-dir w/ --dry-run --report r.json
 
 Exit status: 0 done (or a dry run that would be published), 1 stopped (run
 again), 2 refused by a check (nothing was written), 3 the database is locked
@@ -126,7 +129,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             command.add_argument("--accept-difference", action="append", default=[], metavar="FIELD",
                                  help="Merge although the simulation conditions differ in FIELD (repeatable: package, "
                                       "forcefield, water, temperature, pressure, salt, time_per_frame); the value of "
-                                      "--id stands, and the difference is kept in the history.")
+                                      "--id stands (for salt every run keeps its own), and the difference is kept in "
+                                      "the history.")
+            command.add_argument("--accept-salt-difference", action="store_true",
+                                 help="The same as --accept-difference salt: the runs keep their own salt "
+                                      "concentrations (archetype.salt_by_run), for a glycan whose charge makes the salt "
+                                      "not matter.")
+            command.add_argument("--drop-runs", action="store_true",
+                                 help="Withdraw --from without pooling its runs (the same glycan simulated as the other "
+                                      "reducing-end anomer): no raw merge, no analysis, the folder of --id stays as it "
+                                      "is; the simulation conditions are reported, not compared.")
             command.add_argument("--note", default="", help="Why; kept in the history.")
             command.add_argument("--author", default="", help="Who asked; kept in the history.")
             command.add_argument("--analysis-workers", type=int, default=8, help="Cores of the analysis (default 8).")
@@ -224,6 +236,10 @@ def _simulation_line(simulation: dict) -> str:
 def _print_entry(report: dict) -> None:
     entry = report.get("entry")
     if not entry:
+        return
+    if entry.get("unchanged"):                  # merge --drop-runs: the folder of the kept ID stays as it is
+        _say(f"entry {report['glycoshape_id']} {str(report.get('glycam_name'))[:90]}: unchanged")
+        _say(f"  folder: {entry['file_count']} files, {_megabytes(entry['total_size'])}, hash {entry['hash']}")
         return
     identity = entry["identity"]["archetype"]
     _say(f"entry {report['glycoshape_id']} {report['glycam_name'][:90]}")
@@ -369,13 +385,23 @@ def _print_operation(report: dict) -> None:
     merge = report.get("merge")
     if merge:
         frames = merge["frames"]
-        _say(f"merge: {merge['from']} ({str(merge['from_glycam_name'])[:70]}) into {report['glycoshape_id']}; "
-             f"frames {frames['kept']} + {frames['absorbed']} = {frames['total']}"
-             + (f"; {len(merge['segments'])} segment(s)" if merge.get("segments") else ""))
+        if merge.get("drop_runs"):
+            anomers = merge.get("anomers") or {}
+            _say(f"merge --drop-runs: {merge['from']} ({str(merge['from_glycam_name'])[:70]}, {anomers.get('absorbed')}) "
+                 f"into {report['glycoshape_id']} ({anomers.get('kept')}); its {frames['absorbed']} frames are not "
+                 f"pooled; {report['glycoshape_id']} keeps its {frames['kept']} frames and its folder")
+        else:
+            _say(f"merge: {merge['from']} ({str(merge['from_glycam_name'])[:70]}) into {report['glycoshape_id']}; "
+                 f"frames {frames['kept']} + {frames['absorbed']} = {frames['total']}"
+                 + (f"; {len(merge['segments'])} segment(s)" if merge.get("segments") else ""))
         for item in merge["differences"]:
             _say(f"  {item['field']}: {report['glycoshape_id']} {item['kept']}, {merge['from']} {item['absorbed']} "
-                 + (f"(accepted: the value of {report['glycoshape_id']} stands)" if item["accepted"]
+                 + ("(reported only: the runs are not pooled)" if merge.get("drop_runs")
+                    else "(accepted: every run keeps its own)" if item["accepted"] and item["field"] == "salt"
+                    else f"(accepted: the value of {report['glycoshape_id']} stands)" if item["accepted"]
                     else f"(refused without --accept-difference {item['field']})"))
+        if merge.get("salt_by_run"):
+            _say("  salt by run: " + ", ".join(f"{name} {value:g} mM" for name, value in merge["salt_by_run"].items()))
     rename = report.get("rename")
     if rename:
         raw = rename.get("raw") or {}
@@ -413,7 +439,8 @@ def _print_operation(report: dict) -> None:
     withdrawal = report.get("withdrawal")
     if withdrawal:
         static = withdrawal.get("static") or {}
-        _say(f"withdraw {withdrawal['glycoshape_id']} (merged into {withdrawal['merged_into']}): {withdrawal['status']}"
+        _say(f"withdraw {withdrawal['glycoshape_id']} (merged into {withdrawal['merged_into']}"
+             f"{'' if withdrawal.get('runs_pooled', True) else ', runs not pooled'}): {withdrawal['status']}"
              + (f"; {static['delete_afterwards']} file(s) deleted afterwards" if "delete_afterwards" in static else "")
              + (f"; global_hash -> {static['target_global_hash'][:16]}..." if static.get("target_global_hash") else ""))
         raw = withdrawal.get("raw")
@@ -446,8 +473,9 @@ def _operation(args: argparse.Namespace) -> int:
             report = entry_ops.update_metadata(changes, _target(args), args.work_dir, **common)
         elif args.command == "merge":
             report = entry_ops.merge(
-                args.id, args.from_id, _target(args), args.work_dir, accept_differences=args.accept_difference,
-                note=args.note, author=args.author, workers=args.analysis_workers,
+                args.id, args.from_id, _target(args), args.work_dir,
+                accept_differences=args.accept_difference + (["salt"] if args.accept_salt_difference else []),
+                note=args.note, author=args.author, drop_runs=args.drop_runs, workers=args.analysis_workers,
                 memory_limit_gb=args.memory_limit_gb, **common)
         else:
             submission = None

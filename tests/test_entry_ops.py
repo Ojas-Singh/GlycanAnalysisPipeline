@@ -154,6 +154,20 @@ def test_a_changes_record_is_checked_field_by_field():
         entry_ops.Changes.parse({**changes_record(), "schema_version": 2})
 
 
+def test_the_salt_of_every_run_is_read_back_from_a_published_entry():
+    data = {"archetype": {"ID": GS, "salt": "150\u2013200", "salt_by_run": {"run_1": 200.0, "GS00453/run_1": 150},
+                          "temperature": 300.0}, "search_meta": {}}
+    submission, curation, notes = entry_ops.published_submission(data, GLYCAM_NAME)
+    assert "salt_concentration_mm" not in submission["simulation"] and submission["simulation"]["temperature_k"] == 300.0
+    assert curation["salt_by_run"] == {"run_1": 200.0, "GS00453/run_1": 150.0}
+    assert any("the salt of every run is kept" in note for note in notes)
+    # one salt for the entry replaces the salt of every run
+    _, after = entry_ops.apply_changes(submission, curation, entry_ops.Changes(
+        glycoshape_id=GS, simulation={"salt_concentration_mm": 150.0}), GLYCAM_NAME, GLYCAM_NAME)
+    assert "salt_by_run" not in after
+    assert entry_complete.salt_range([200.0, 150.0]) == "150\u2013200"
+
+
 def test_names_of_the_reducing_end():
     assert entry_ops.reducing_end_anomer("DGalpb1-4DGlcpNAcb1-OH") == "beta"
     assert entry_ops.with_anomer("DGalpb1-4DGlcpNAcb1-OH", "alpha") == "DGalpb1-4DGlcpNAca1-OH"
@@ -485,7 +499,8 @@ def test_a_dry_run_of_a_merge_reports_everything_and_writes_nothing(pair, made_b
     assert report["ok"], report["refused"]
     assert pair.writes() == [] and stored_tree(pair.backend, "") == before
     assert report["status"] == "planned" and report["glycoshape_id"] == GS and report["glycam_name"] == GLYCAM_NAME
-    assert any("salt concentration differs" in warning and "accepted" in warning for warning in report["warnings"])
+    assert f"the salt concentration differs ({GS} 150.0 mM, {OTHER_GS} 200.0 mM); accepted: every run keeps its own " \
+           "(archetype.salt is their range, archetype.salt_by_run the salt of each run)" in report["warnings"]
     merge = report["merge"]
     assert (merge["from"], merge["from_glycam_name"], merge["glycam_name"]) == (OTHER_GS, ALT_NAME, GLYCAM_NAME)
     assert merge["frames"] == {"kept": 480, "absorbed": 480, "total": 960}
@@ -495,10 +510,13 @@ def test_a_dry_run_of_a_merge_reports_everything_and_writes_nothing(pair, made_b
         (f"{OTHER_GS}/{names[0]}", 480, OTHER_GS), (f"{OTHER_GS}/{names[1]}", 680, OTHER_GS),
         (f"{OTHER_GS}/{names[2]}", 810, OTHER_GS)]
     assert merge["accepted_differences"] == ["salt"] and merge["differences"][0]["accepted"]
+    assert merge["drop_runs"] is False and merge["anomers"] == {"kept": "alpha", "absorbed": "alpha"}
+    assert merge["salt_by_run"] == {**{name: 150.0 for name in names}, **{f"{OTHER_GS}/{name}": 200.0 for name in names}}
     assert report["memory"]["frames"] == 960 and report["analysis"]["frame_quality"]
     # the kept ID: a new version with the sum of the lengths and its own salt; the raw entry is an extension
     assert len(report["entry"]["hash"]) == 64 and report["entry"]["simulation"]["length"] == 5.0
-    assert report["diff"]["simulation"] == {"length": {"before": 2.5, "after": 5.0}}
+    assert report["diff"]["simulation"] == {"length": {"before": 2.5, "after": 5.0},
+                                            "salt": {"before": 150.0, "after": "150\u2013200"}}
     assert report["raw"]["relation"] == "extension" and "trajectory.xtc" in report["raw"]["upload"]
     assert report["raw"]["history"] == [f"raw-history/raw/{GLYCAM_NAME}/"
                                         f"{report['merge']['kept_manifest_sha256']}/manifest.json"]
@@ -536,8 +554,11 @@ def test_a_merge_gives_the_kept_id_the_frames_of_both_and_withdraws_the_other(pa
     assert OTHER_GS not in pair.reader.glycans() and GS in pair.reader.glycans()
     assert pair.reader.global_hash == report["database_after"]["global_hash"]
     data = pair.data()
-    assert data["archetype"]["length"] == 5.0 and data["archetype"]["salt"] == 150.0
-    assert data["archetype"]["name"] == GLYCAM_NAME
+    names = segment_names(made_bundle)
+    by_run = {**{name: 150.0 for name in names}, **{f"{OTHER_GS}/{name}": 200.0 for name in names}}
+    assert data["archetype"]["length"] == 5.0 and data["archetype"]["name"] == GLYCAM_NAME
+    assert data["archetype"]["salt"] == "150\u2013200" and data["archetype"]["salt_by_run"] == by_run
+    assert list(data["archetype"])[list(data["archetype"]).index("salt") + 1] == "salt_by_run"
 
     # the raw entry of the kept ID holds the frames of both, and extends the one it was
     manifest = json.loads(pair.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))
@@ -547,6 +568,7 @@ def test_a_merge_gives_the_kept_id_the_frames_of_both_and_withdraws_the_other(pa
     assert [s["name"] for s in manifest["segments"]] == names + [f"{OTHER_GS}/{name}" for name in names]
     assert [s["carried_from"]["glycam_name"] for s in manifest["segments"]] == [GLYCAM_NAME] * 3 + [ALT_NAME] * 3
     assert [s.get("merged_from", {}).get("glycoshape_id") for s in manifest["segments"]] == [None] * 3 + [OTHER_GS] * 3
+    assert [s["run"]["salt_concentration_mm"] for s in manifest["segments"]] == [150.0] * 3 + [200.0] * 3
     assert pair.backend.read_binary(f"raw-history/raw/{GLYCAM_NAME}/{kept_sha256}/manifest.json") == kept_manifest
     from lib import archive_transfer
 
@@ -589,6 +611,14 @@ def test_a_merge_gives_the_kept_id_the_frames_of_both_and_withdraws_the_other(pa
     assert {call[2] for call in pair.writes()} <= {f"{STATE}/lock.json"} | {
         call[2] for call in pair.writes() if call[2].startswith(f"{STATE}/probe-")}
     assert pair.merge(work="work-2", dry_run=True)["status"] == "already-merged"
+
+    # later operations keep the salt of every run; one salt for the entry replaces it
+    pair.update(changes_record(curated={"description": "Two mannoses."}), work="work-3")
+    assert pair.reader.try_sync() is None and pair.data()["archetype"]["salt_by_run"] == by_run
+    assert pair.data()["archetype"]["salt"] == "150\u2013200"
+    pair.update(changes_record(simulation={"salt_concentration_mm": 150.0}), work="work-4")
+    assert pair.reader.try_sync() is None and pair.data()["archetype"]["salt"] == 150.0
+    assert "salt_by_run" not in pair.data()["archetype"]
 
 
 def test_an_interrupted_merge_is_continued_by_the_same_command(pair):
@@ -667,19 +697,181 @@ def test_the_command_line_of_a_merge(pair, monkeypatch, tmp_path, capsys):
     assert _cli(pair, monkeypatch, common + ["--dry-run"]) == 2
     assert "--accept-difference salt" in json.loads(report.read_text())["refused"][0]
     capsys.readouterr()
-    assert _cli(pair, monkeypatch, common + ["--dry-run", "--accept-difference", "salt", "--note", "one glycan"]) == 0
+    assert _cli(pair, monkeypatch, common + ["--dry-run", "--accept-salt-difference", "--note", "one glycan"]) == 0
     written = json.loads(report.read_text())
+    assert written["merge"]["accepted_differences"] == ["salt"]
     out = capsys.readouterr().out
     assert f"merge: {OTHER_GS} ({ALT_NAME}) into {GS}; frames 480 + 480 = 960; 6 segment(s)" in out
-    assert f"  salt: {GS} 150.0, {OTHER_GS} 200.0 (accepted: the value of {GS} stands)" in out
+    assert f"  salt: {GS} 150.0, {OTHER_GS} 200.0 (accepted: every run keeps its own)" in out
+    assert "  salt by run: " in out and f"{OTHER_GS}/" in out
+    assert "WARNING the salt concentration differs" in out
     assert f"withdraw {OTHER_GS} (merged into {GS}): planned" in out
     assert f"raw raw/{ALT_NAME}/ -> raw-history/raw/{ALT_NAME}/" in out
     assert "dry run: nothing was written to the storage; planned" in out
-    assert _cli(pair, monkeypatch, common + ["--accept-difference", "salt", "--note", "one glycan",
+    assert _cli(pair, monkeypatch, common + ["--accept-salt-difference", "--note", "one glycan",
                                              "--expect-hash", written["entry"]["hash"]]) == 0
     assert f"merge: merged {OTHER_GS} into {GS}" in capsys.readouterr().out
     assert json.loads(report.read_text())["status"] == "merged"
     assert pair.reader.try_sync() is None and OTHER_GS not in pair.reader.glycans()
+
+
+# ---------------------------------------------------------------------------
+# merge --drop-runs: the same glycan simulated as each reducing-end anomer
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def prepared_anomers(tmp_path_factory, prepared, made_bundle):
+    """The database of ``prepared`` with the beta anomer of the synthetic glycan published as GS01068 (salt 200 mM)."""
+    root = tmp_path_factory.mktemp("published-anomers")
+    client = FakeS3Client("bucket")
+    client.objects = copy.deepcopy(prepared["objects"])
+    backend = S3StorageBackend(client, bucket="bucket", sleep=lambda seconds: None)
+    with pytest.MonkeyPatch.context() as patching:
+        fake_services.install(patching)
+        publish_second(Target(static=backend, raw=backend, workers=4), made_bundle, root, name=BETA_NAME)
+    return {"objects": client.objects}
+
+
+@pytest.fixture
+def anomers(prepared_anomers, tmp_path, monkeypatch):
+    fake_services.install(monkeypatch)
+    return World(prepared_anomers, tmp_path)
+
+
+def drop(world, **options):
+    """Keep the beta anomer (the linkage that occurs in nature), drop the alpha one."""
+    return world.merge(kept=OTHER_GS, absorbed=GS, drop_runs=True, **options)
+
+
+def test_a_dry_run_of_a_drop_reports_the_withdrawal_and_writes_nothing(anomers):
+    alpha, beta = anomers.data(GS), anomers.data(OTHER_GS)
+    assert alpha["archetype"]["wurcs"] == beta["archetype"]["wurcs"]
+    assert alpha["archetype"]["glytoucan"] == beta["archetype"]["glytoucan"]
+    # pooled, the two anomers are refused: their runs are of two molecules
+    refused = anomers.merge(kept=OTHER_GS, absorbed=GS, work="pooled", dry_run=True, accept_differences=["salt"])
+    assert refused["refused"] == [f"{OTHER_GS} and {GS} do not have the same reducing end: beta and alpha anomer"]
+    before = stored_tree(anomers.backend, "")
+    report = drop(anomers, dry_run=True, note="the beta anomer is kept")
+    assert anomers.writes() == [] and stored_tree(anomers.backend, "") == before
+    assert report["ok"], report["refused"]
+    assert report["operation"] == "merge" and report["status"] == "planned" and report["glycoshape_id"] == OTHER_GS
+    merge = report["merge"]
+    assert merge["drop_runs"] is True and merge["anomers"] == {"kept": "beta", "absorbed": "alpha"}
+    assert (merge["from"], merge["from_glycam_name"], merge["glycam_name"]) == (GS, GLYCAM_NAME, BETA_NAME)
+    assert merge["frames"] == {"kept": 480, "absorbed": 480, "total": 480} and merge["segments"] is None
+    # the conditions are reported, not refused
+    assert merge["differences"] == [{"field": "salt", "what": "salt concentration", "unit": "mM", "kept": 200.0,
+                                     "absorbed": 150.0}] and merge["accepted_differences"] == []
+    assert f"the salt concentration differs ({OTHER_GS} 200.0 mM, {GS} 150.0 mM): reported only, the runs of {GS} " \
+           "are not pooled" in report["warnings"]
+    # the kept entry: as it is published
+    published = stored_manifest_entry(anomers, OTHER_GS)
+    assert report["kept"] == {"status": "unchanged", "hash": published["hash"], "history": None}
+    assert report["entry"] == {"hash": published["hash"], "file_count": published["file_count"],
+                               "total_size": published["total_size"], "unchanged": True}
+    assert "analysis" not in report and "raw" not in report and "diff" not in report
+    assert report["static"]["base_global_hash"] == report["static"]["target_global_hash"]
+    withdrawal = report["withdrawal"]
+    assert (withdrawal["glycoshape_id"], withdrawal["status"], withdrawal["merged_into"], withdrawal["runs_pooled"]) == (
+        GS, "planned", OTHER_GS, False)
+    assert withdrawal["static"]["base_global_hash"] == report["database"]["global_hash"]
+    assert withdrawal["raw"]["relation"] == "move" and withdrawal["raw"]["from_key_prefix"] == f"raw/{GLYCAM_NAME}/"
+
+
+def stored_manifest_entry(world, glycan_id):
+    return json.loads(world.backend.read_binary("static/sync_manifest.json"))["glycans"][glycan_id]
+
+
+def test_a_drop_withdraws_the_other_anomer_and_leaves_the_kept_folder_as_it_is(anomers):
+    kept_folder = {key: anomers.backend.read_binary(key) for key in anomers.keys(f"static/{OTHER_GS}/")}
+    kept_raw = {key: anomers.backend.read_binary(key) for key in anomers.keys(f"raw/{BETA_NAME}/")}
+    dropped_raw = {key: anomers.backend.read_binary(key) for key in anomers.keys(f"raw/{GLYCAM_NAME}/")}
+    dropped_sha256 = hashlib.sha256(dropped_raw[f"raw/{GLYCAM_NAME}/manifest.json"]).hexdigest()
+    dry = drop(anomers, dry_run=True, note="the beta anomer is kept", author="curator")
+    report = drop(anomers, expect_hash=dry["entry"]["hash"], note="the beta anomer is kept", author="curator")
+    assert report["status"] == "merged" and report["kept"]["status"] == "unchanged", report["refused"]
+    assert report["withdrawal"]["status"] == "withdrawn"
+    assert report["database_after"]["global_hash"] == dry["withdrawal"]["static"]["target_global_hash"]
+
+    # the kept ID: its folder, its raw entry and its history as they were
+    assert {key: anomers.backend.read_binary(key) for key in anomers.keys(f"static/{OTHER_GS}/")} == kept_folder
+    assert stored_manifest_entry(anomers, OTHER_GS)["hash"] == dry["entry"]["hash"]
+    assert {key: anomers.backend.read_binary(key) for key in anomers.keys(f"raw/{BETA_NAME}/")} == kept_raw
+    assert [item["action"] for item in versions(anomers, OTHER_GS)] == ["publish"]
+    assert anomers.reader.try_sync() is None and GS not in anomers.reader.glycans()
+    assert anomers.data(OTHER_GS)["archetype"]["salt"] == 200.0
+
+    # the dropped ID: withdrawn into the kept one, its runs not pooled
+    withdrawn = json.loads(anomers.backend.read_binary(f"{STATE}/withdrawn.json"))["withdrawn"][GS]
+    assert (withdrawn["merged_into"], withdrawn["runs_pooled"], withdrawn["raw_manifest_sha256"]) == (
+        OTHER_GS, False, dropped_sha256)
+    assert withdrawn["reason"] == f"dropped into {OTHER_GS} without its runs: the beta anomer is kept"
+    history = [item for item in versions_of(anomers, GS) if item["action"] == "withdraw"]
+    assert len(history) == 1 and history[0]["merged_into"] == OTHER_GS and history[0]["runs_pooled"] is False
+
+    # its raw entry: in the history with its record, out of raw/ and of the index
+    assert anomers.keys(f"raw/{GLYCAM_NAME}/") == []
+    root = f"raw-history/raw/{GLYCAM_NAME}/{dropped_sha256}/"
+    for key, content in dropped_raw.items():
+        assert anomers.backend.read_binary(root + key[len(f"raw/{GLYCAM_NAME}/"):]) == content
+    record = json.loads(anomers.backend.read_binary(root + "merged.json"))
+    assert (record["kind"], record["runs_pooled"], record["from"], record["into"]) == ("drop", False, GLYCAM_NAME, BETA_NAME)
+    assert (record["from_glycoshape_id"], record["into_glycoshape_id"], record["author"]) == (GS, OTHER_GS, "curator")
+    index = json.loads(anomers.backend.read_binary("raw/index.json"))
+    assert GLYCAM_NAME not in {item["glycam_name"] for item in index["records"]}
+
+    # again: nothing left to do
+    anomers.client.calls.clear()
+    again = drop(anomers, expect_hash=dry["entry"]["hash"])
+    assert again["status"] == "already-merged" and again["withdrawal"]["raw"]["relation"] == "moved"
+    assert {call[2] for call in anomers.writes()} <= {f"{STATE}/lock.json"} | {
+        call[2] for call in anomers.writes() if call[2].startswith(f"{STATE}/probe-")}
+    # a pooled merge of the dropped ID is refused, and a drop of a pooled one
+    refused = anomers.merge(kept=OTHER_GS, absorbed=GS, work="pooled", dry_run=True)
+    assert refused["refused"] == [f"{GS} was merged into {OTHER_GS} without its runs (--drop-runs)"]
+
+
+def versions_of(world, glycan_id):
+    return [json.loads(world.backend.read_binary(key)) for key in world.keys(f"{STATE}/history/{glycan_id}/")]
+
+
+def test_a_drop_is_refused_for_another_glycan_and_for_a_kept_entry_that_changed(anomers, made_bundle):
+    report = anomers.merge(kept=OTHER_GS, absorbed=OTHER_GS, drop_runs=True, dry_run=True)
+    assert report["refused"] == [f"{OTHER_GS} cannot be merged into itself: name two IDs"]
+    report = anomers.merge(kept=OTHER_GS, absorbed="GS09999", drop_runs=True, work="w1", dry_run=True)
+    assert report["refused"] == ["GS09999 is not published"]
+    publish_second(anomers.target, made_bundle, anomers.tmp, glycan_id="GS01069", name="DGlcpa1-2DManpb1-OH")
+    report = anomers.merge(kept=OTHER_GS, absorbed="GS01069", drop_runs=True, work="w2", dry_run=True)
+    assert report["refused"][0] == f"{OTHER_GS} and GS01069 are not the same glycan: their archetype WURCS differ"
+    assert report["refused"][1].startswith(f"{OTHER_GS} and GS01069 have other GlyTouCan accessions")
+
+    # approved, then the kept entry changed: refused, nothing written
+    dry = drop(anomers, work="w3", dry_run=True)
+    anomers.update(changes_record(glycoshape_id=OTHER_GS, simulation={"temperature_k": 310.0}), work="w4")
+    before = stored_tree(anomers.backend, "static/")
+    with pytest.raises(Refused) as refused:
+        drop(anomers, work="w3", expect_hash=dry["entry"]["hash"])
+    assert refused.value.report["refused"] == [
+        f"the folder of {OTHER_GS} has the hash {stored_manifest_entry(anomers, OTHER_GS)['hash'][:16]}... and "
+        f"{dry['entry']['hash'][:16]}... was approved"]
+    assert stored_tree(anomers.backend, "static/") == before and anomers.keys(f"static/{GS}/")   # still published
+
+
+def test_the_command_line_of_a_drop(anomers, monkeypatch, tmp_path, capsys):
+    report = tmp_path / "report.json"
+    common = ["merge", "--id", OTHER_GS, "--from", GS, "--drop-runs", "--note", "beta kept", "--work-dir",
+              str(tmp_path / "w"), "--report", str(report)]
+    assert _cli(anomers, monkeypatch, common + ["--dry-run"]) == 0
+    written = json.loads(report.read_text())
+    assert written["merge"]["drop_runs"] is True and written["kept"]["status"] == "unchanged"
+    out = capsys.readouterr().out
+    assert f"merge --drop-runs: {GS} ({GLYCAM_NAME}, alpha) into {OTHER_GS} (beta); its 480 frames are not pooled; " \
+           f"{OTHER_GS} keeps its 480 frames and its folder" in out
+    assert f"entry {OTHER_GS} {BETA_NAME}: unchanged" in out
+    assert f"  salt: {OTHER_GS} 200.0, {GS} 150.0 (reported only: the runs are not pooled)" in out
+    assert f"withdraw {GS} (merged into {OTHER_GS}, runs not pooled): planned" in out
+    assert _cli(anomers, monkeypatch, common + ["--expect-hash", written["entry"]["hash"]]) == 0
+    assert f"merge: merged {GS} into {OTHER_GS}" in capsys.readouterr().out
+    assert anomers.reader.try_sync() is None and GS not in anomers.reader.glycans()
 
 
 # ---------------------------------------------------------------------------

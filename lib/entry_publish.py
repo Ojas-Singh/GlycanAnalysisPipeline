@@ -1553,7 +1553,7 @@ def withdraw_entry(
     owner: Optional[str] = None,
     log: Log = print,
     checkpoint: Checkpoint = _noop,
-    merged_into: Optional[str] = None,
+    merged: Optional[Dict[str, Any]] = None,
     held_lock: Optional[Dict[str, Any]] = None,
     database: Optional[Database] = None,
     stats: Optional[Dict[str, Any]] = None,
@@ -1567,9 +1567,11 @@ def withdraw_entry(
     for any other.  ``glycam_name``, when given, has to be the name the ID
     is published for.  Returns a report; raises as :func:`publish_entry`.
 
-    For ``lib.entry_ops.merge``: ``merged_into`` (the ID that holds the
-    frames of this glycan now) is kept in the record, the history and the
-    entry of ``withdrawn.json``; ``held_lock`` is the lock of the caller,
+    For ``lib.entry_ops.merge``: ``merged`` (``merged_into``, the ID that
+    stands for this glycan now; ``runs_pooled``, whether that ID took the
+    frames of this one; ``raw_manifest_sha256`` of the raw entry of this
+    one) is kept in the record, the history and the entry of
+    ``withdrawn.json``; ``held_lock`` is the lock of the caller,
     which this run then neither takes nor releases (nor completes a pending
     publication: the caller did); ``database`` is the database to derive
     from instead of the stored one (a dry run that follows another change);
@@ -1662,8 +1664,8 @@ def withdraw_entry(
             }
             tombstone = {"glycam_name": name, "withdrawn_at": record["withdrawn_at"], "reason": reason,
                          "global_hash_before": database.global_hash}
-            if merged_into is not None:
-                record["merged_into"] = tombstone["merged_into"] = merged_into
+            for key, value in (merged or {}).items():
+                record[key] = tombstone[key] = value
             history = {"key": target.history_key(glycan_id, derived["global_hash"], WITHDRAW),
                        "document": {**record, "kind": "version",
                                     "folder_hash_before": (database.manifest["glycans"].get(glycan_id) or {}).get("hash")}}

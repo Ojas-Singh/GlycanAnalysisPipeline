@@ -210,7 +210,17 @@ have the same). Aldoses are flipped exactly as before.
   single-entry `reanalyse` of them runs on the Spark (128 GB, where the R2 keys are) with the same command.
 * One glycan published under two IDs (audit issue `duplicate-entry`, action `merge-ids`; for example GS00303 and
   GS00453, G30648VY with its branches written in another order): `publish_entry.py merge --id GS00303 --from GS00453
-  --accept-difference salt --note "..." --work-dir ... --dry-run`, then the same with `--expect-hash`. GS00303 keeps
+  --accept-salt-difference --note "..." --work-dir ... --dry-run`, then the same with `--expect-hash`. GS00303 keeps
   the frames of both (60,006) and the sum of the lengths, GS00453 is withdrawn with `merged_into` and its raw entry
-  goes to `raw-history/`. Their salt differs (200 and 150 mM): without `--accept-difference salt` the merge is
-  refused, and with it the 200 mM of GS00303 stands; decide that before approving.
+  goes to `raw-history/`. Their salt differs (200 and 150 mM; the glycan is neutral): without
+  `--accept-salt-difference` the merge is refused, and with it every run keeps its own salt (`archetype.salt`
+  `"150–200"`, `archetype.salt_by_run`).
+* The same glycan simulated once as each reducing-end anomer, published under two IDs (keep the beta entry, the
+  linkage that occurs in nature): `publish_entry.py merge --id KEEP --from DROP --drop-runs --note "..." --work-dir
+  ... --dry-run`, then with `--expect-hash`. The runs are not pooled and the kept folder does not change; DROP is
+  withdrawn (`merged_into`, `runs_pooled: false`) and its raw entry goes to `raw-history/`. The nine pairs (keep,
+  drop): GS00037/GS00013, GS00355/GS00679, GS00358/GS00680, GS00359/GS00671, GS00455/GS00578, GS00797/GS00814,
+  GS00800/GS00816, GS00803/GS00856, GS00804/GS00832. Checked read-only against the published folders and the archive
+  copy: every pair has one archetype WURCS and accession, beta kept and alpha dropped, both raw entries; the reports
+  will list other salt for GS00355, GS00358 and GS00359 (150 and 200 mM) and for GS00455/GS00578 also the package
+  (AMBER and GROMACS) and the time per frame.
