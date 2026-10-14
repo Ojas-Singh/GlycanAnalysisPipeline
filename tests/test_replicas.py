@@ -15,14 +15,18 @@ DATA = Path(__file__).resolve().parent / "fixtures"
 # ---------------------------------------------------------------------------
 # Synthetic entries
 # ---------------------------------------------------------------------------
-def _metadata():
-    """Torsion metadata of one Man a1-6 Man linkage (phi, psi, omega), as info.json records it."""
+def _metadata(version=1):
+    """Torsion metadata of one Man a1-6 Man linkage (phi, psi, omega), as info.json records it.
+
+    Version 1 of the torsion definitions stored omega as C4-C5-C6-O6, version 2 as O5-C5-C6-O6.
+    """
+    omega = ["C4", "C5", "C6", "O6"] if version == 1 else ["O5", "C5", "C6", "O6"]
     return [
         {"canonical_name": "2_1_phi", "family": "glycosidic", "atom_names": ["O5", "C1", "O6", "C6"],
          "residue_ids": [2, 2, 1, 1], "residue_names": ["0MA", "0MA", "2MA", "2MA"]},
         {"canonical_name": "2_1_psi", "family": "glycosidic", "atom_names": ["C1", "O6", "C6", "C5"],
          "residue_ids": [2, 1, 1, 1], "residue_names": ["0MA", "2MA", "2MA", "2MA"]},
-        {"canonical_name": "2_1_omega", "family": "glycosidic", "atom_names": ["C4", "C5", "C6", "O6"],
+        {"canonical_name": "2_1_omega", "family": "glycosidic", "atom_names": omega,
          "residue_ids": [1, 1, 1, 1], "residue_names": ["2MA", "2MA", "2MA", "2MA"]},
     ]
 
@@ -51,13 +55,19 @@ def _run(rng, frames, populations, omega=None, switch=0.02):
     return cluster, pcs, torsions
 
 
-def synthetic(runs, keep=None):
-    """FrameTables and the manifest of an old entry whose runs are recorded by END records."""
+def synthetic(runs, keep=None, version=1):
+    """FrameTables and the manifest of an old entry whose runs are recorded by END records.
+
+    The omega of ``runs`` is given on the scale of version 1 (C4-C5-C6-O6: gg +60, gt 180, tg -60); with
+    ``version=2`` the same conformations are stored on the IUPAC scale, 120 degrees lower.
+    """
     rng = np.random.default_rng(7)
     parts = [_run(rng, **run) for run in runs]
     cluster = np.concatenate([p[0] for p in parts])
     pcs = np.concatenate([p[1] for p in parts])
     torsions = np.concatenate([p[2] for p in parts])
+    if version == 2:
+        torsions[:, 2] = (torsions[:, 2] - 120.0 + 180.0) % 360.0 - 180.0
     frames = len(cluster)
     source_frame = np.arange(frames) if keep is None else np.flatnonzero(keep)
     lengths = [run["frames"] for run in runs]
@@ -68,7 +78,7 @@ def synthetic(runs, keep=None):
                            "records_between_frames": {"END": {"count": len(ends), "before_frame": ends}}}}
     tables = replicas.FrameTables(source_frame=source_frame, cluster=cluster[source_frame], pcs=pcs[source_frame],
                                   torsions=torsions[source_frame], torsion_names=["2_1_phi", "2_1_psi", "2_1_omega"],
-                                  torsion_metadata=_metadata())
+                                  torsion_metadata=_metadata(version), conventions_version=version)
     return tables, manifest
 
 
@@ -214,6 +224,110 @@ def test_one_stuck_omega_alone_is_a_suggestion():
     assert doc["verdict"]["value"] == "more_sampling_suggested"
     codes = [reason["code"] for reason in doc["verdict"]["reasons"]]
     assert "omega_never_changes" in codes and "population_tv" not in codes and "cluster_missing" not in codes
+
+
+# ---------------------------------------------------------------------------
+# omega rotamers under the two torsion definitions
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("info,version", [
+    ({}, 1),                                                                         # published before October 2026
+    ({"torsions": {"metadata": []}}, 1),
+    ({"torsions": {"conventions": {"omega": "C4-C5-C6-O6 of the acceptor ..."}}}, 1),  # text conventions of PR #7
+    ({"torsions": {"conventions": {"version": 2}}}, 2),
+])
+def test_the_conventions_version_is_read_from_info_json(info, version):
+    assert replicas.conventions_version(info) == version
+
+
+STUCK = [{"frames": 3000, "populations": [1, 0, 0, 0, 0], "omega": 60.0},     # gg (C4-C5-C6-O6 +60)
+         {"frames": 3000, "populations": [0, 1, 0, 0, 0], "omega": 180.0},    # gt
+         {"frames": 3000, "populations": [0, 0, 1, 0, 0], "omega": -60.0}]    # tg
+
+
+def test_version_1_omega_c4_c5_c6_o6_names_the_thirds_gg_gt_tg():
+    tables, manifest = synthetic(STUCK, version=1)
+    doc = replicas.diagnose(tables, replicas.replica_boundaries(manifest))
+    assert doc["torsion_conventions_version"] == 1
+    omega = doc["linkages"][0]["torsions"]["omega"]
+    assert omega["rotamer_names"] == ["gg", "gt", "tg"] and omega["rotamer_centres"] == [-60.0, 60.0, 180.0]
+    stuck = next(r for r in doc["verdict"]["reasons"] if r["code"] == "omega_never_changes")["replicas"]
+    assert [s["rotamer"] for s in stuck] == ["gg", "gt", "tg"]
+
+
+def test_version_2_omega_o5_c5_c6_o6_names_the_thirds_gt_tg_gg():
+    tables, manifest = synthetic(STUCK, version=2)
+    doc = replicas.diagnose(tables, replicas.replica_boundaries(manifest))
+    assert doc["torsion_conventions_version"] == 2
+    omega = doc["linkages"][0]["torsions"]["omega"]
+    assert omega["rotamer_names"] == ["gt", "tg", "gg"] and omega["rotamer_centres"] == [60.0, 180.0, -60.0]
+    # the same conformations get the same names under both versions
+    stuck = next(r for r in doc["verdict"]["reasons"] if r["code"] == "omega_never_changes")["replicas"]
+    assert [s["rotamer"] for s in stuck] == ["gg", "gt", "tg"]
+
+
+def by_rotamer(omega):
+    """Occupancy of every replica by rotamer name."""
+    return [dict(zip(omega["rotamer_names"], occupancy)) for occupancy in omega["rotamers"]]
+
+
+def test_occupancies_of_the_two_versions_agree_by_rotamer_name():
+    runs = [{"frames": 4000, "populations": EVEN}, {"frames": 4000, "populations": EVEN, "switch": 0.005}]
+    docs = []
+    for version in (1, 2):
+        tables, manifest = synthetic(runs, version=version)
+        docs.append(replicas.diagnose(tables, replicas.replica_boundaries(manifest)))
+    old, new = (doc["linkages"][0]["torsions"]["omega"] for doc in docs)
+    assert old["rotamers"] != new["rotamers"]                       # the thirds are in another order
+    assert by_rotamer(old) == by_rotamer(new)
+    assert old["transitions"] == new["transitions"]
+    assert docs[0]["verdict"] == docs[1]["verdict"]
+
+
+def _sia_2_8_metadata(version):
+    omega = ["C6", "C7", "C8", "O8"] if version == 1 else ["O7", "C7", "C8", "O8"]
+    return [
+        {"canonical_name": "3_2_phi", "family": "glycosidic", "atom_names": ["O6", "C2", "O8", "C8"],
+         "residue_ids": [3, 3, 2, 2], "residue_names": ["0SA", "0SA", "8SA", "8SA"]},
+        {"canonical_name": "3_2_psi", "family": "glycosidic", "atom_names": ["C2", "O8", "C8", "C7"],
+         "residue_ids": [3, 2, 2, 2], "residue_names": ["0SA", "8SA", "8SA", "8SA"]},
+        {"canonical_name": "3_2_omega", "family": "glycosidic", "atom_names": omega,
+         "residue_ids": [2, 2, 2, 2], "residue_names": ["8SA", "8SA", "8SA", "8SA"]},
+    ]
+
+
+@pytest.mark.parametrize("version,centres", [(1, [-60.0, 60.0, 180.0]), (2, [60.0, 180.0, -60.0])])
+def test_omega_of_a_2_8_linkage_has_the_iupac_centres_of_its_thirds(version, centres):
+    (link,) = replicas.linkages_of(_sia_2_8_metadata(version), ["3_2_phi", "3_2_psi", "3_2_omega"], version)
+    assert (link["class"], link["subclass"]) == ("sia", "sia 2-8")
+    # O7-C7-C8-O8 at the centre of each third; no gg/gt/tg names for the C7-C8 bond
+    assert list(link["omega_rotamer_centres"]) == centres and "omega_rotamer_names" not in link
+
+
+def test_omega_atoms_that_contradict_the_version_are_refused():
+    with pytest.raises(replicas.ReplicaError, match="disagree"):
+        replicas.linkages_of(_metadata(1), ["2_1_phi", "2_1_psi", "2_1_omega"], 2)
+    with pytest.raises(replicas.ReplicaError, match="disagree"):
+        replicas.linkages_of(_sia_2_8_metadata(2), ["3_2_phi", "3_2_psi", "3_2_omega"], 1)
+
+
+def test_a_static_entry_of_version_2_is_read_as_version_2(tmp_path):
+    import polars as pl
+
+    tables, manifest = synthetic([{"frames": 2000, "populations": EVEN}] * 2, version=2)
+    n = len(tables.source_frame)
+    output = tmp_path / "output"
+    output.mkdir()
+    pl.DataFrame({"frame": np.arange(n), "PC1": tables.pcs[:, 0].astype(float), "PC2": tables.pcs[:, 1].astype(float),
+                  "source_frame": tables.source_frame, "cluster": tables.cluster}).write_csv(output / "pca.csv")
+    pl.DataFrame({"frame": np.arange(n), "source_frame": tables.source_frame,
+                  **{name: tables.torsions[:, j] for j, name in enumerate(tables.torsion_names)},
+                  "cluster": tables.cluster}).write_csv(output / "torsion_glycosidic.csv")
+    (output / "info.json").write_text(json.dumps(
+        {"torsions": {"metadata": _metadata(2), "conventions": {"version": 2}}}))
+    read = replicas.tables_from_static(tmp_path)
+    assert read.conventions_version == 2
+    doc = replicas.diagnose_static(tmp_path, manifest, glycam_name="x")
+    assert doc["linkages"][0]["torsions"]["omega"]["rotamer_names"] == ["gt", "tg", "gg"]
 
 
 def test_short_and_filtered_replicas_are_not_compared():

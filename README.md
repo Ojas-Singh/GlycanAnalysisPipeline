@@ -173,13 +173,24 @@ in it, both by the numbers they are published under (`Cluster 0` the largest).
 
 Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
 
-Before PCA, the store step repairs connectivity using chemically plausible
-bonds observed at covalent distance in the trajectory. It then excludes only
-frames containing non-finite coordinates or a recovered covalent bond longer
-than `GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM` (default 3.0 Å). Inter-frame atom
-movement and whole-molecule translation are diagnostic only. Frame provenance
-is recorded in `data/frame_quality.parquet`, `data/frame_map.parquet`, and
-`data/frame_filter.json`.
+Before PCA, the store step recovers the bonds (`lib/frame_quality.py`). The
+MOL2 bond table is completed from distances: an undeclared pair of atoms whose
+elements may bond is a bond when it lies within the sum of their covalent
+radii plus 0.35 Å in most of 128 frames spread over the trajectory (302 MOL2
+files of the collection lack the bond of a branch, 15 a bond inside a residue).
+Parts that are still apart are joined by the closest pairs seen at covalent
+distance. The ring of every residue whose GLYCAM name gives a template
+(`lib/residue_templates.py`: aldo- and 2-keto-pyranoses and furanoses,
+sialic acids) must then be closed, with no bond across it. A pair at covalent
+distance that would exceed the valence of an atom, or a ring that stays open,
+stops the analysis of the entry with the atoms named. The store step then
+excludes only frames containing non-finite coordinates or a recovered covalent
+bond longer than `GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM` (default 3.0 Å).
+Inter-frame atom movement and whole-molecule translation are diagnostic only.
+Frame provenance is recorded in `data/frame_quality.parquet`,
+`data/frame_map.parquet`, and `data/frame_filter.json` (with the number of
+bonds completed from distances and of bonds that join parts; filter version
+2, so a folder stored by an earlier version is stored again).
 
 ```bash
 python main.py --mode process-only --data-dir data --process-dir process
@@ -249,22 +260,39 @@ The torsions of an entry are in `output/torsion_all.csv` (every frame),
 `torsion_glycosidic.csv` and `torsion_level_*_reps.csv`, in degrees from -180
 to 180; `info.json` describes every column (`torsions.metadata`: the four
 atoms, their residues, the family and subtype) and states the definitions
-below (`torsions.conventions`). A glycosidic torsion is named
-`<donor residue>_<acceptor residue>_<phi|psi|omega>`.
+below with the four atoms of every case (`torsions.conventions`, version 2). A
+glycosidic torsion is named `<donor residue>_<acceptor residue>_<phi|psi|omega>`.
+
+The definitions are those of the IUPAC-IUB recommendations (1981; Eur. J.
+Biochem. 131, 5–7, 1983), with heavy atoms only, for every linkage; primed
+atoms belong to the donor, x is the acceptor position:
 
 | Torsion | Atoms |
 |---|---|
-| φ | ring oxygen, anomeric carbon, glycosidic oxygen, acceptor carbon: O5–C1–O–Cx (pyranose donor), O4–C1–O–Cx (aldofuranose), O5–C2–O–Cx (ketofuranose), O6–C2–O–Cx (sialic acid) |
-| ψ | C1–O–Cx–A (C2–O–Cx–A for C2 donors): A is the ring oxygen when Cx is an anomeric carbon, otherwise C(x−1) or C(x+1), whichever the bond table lists first, so check the atoms in the metadata before comparing the ψ of two linkages |
-| ω | **C4–C5–C6–O6** of the acceptor of a 1–6 linkage (C6–C7–C8–O8 of a sialic acid in a 2–8 linkage) |
+| φ | O5′–C1′–Ox–Cx; O4′–C1′ for an aldofuranose donor (Araf, Galf), O6′–C2′ for a 2-ketopyranose (sialic acids, Kdn, Kdo), O5′–C2′ for a 2-ketofuranose (Fruf) |
+| ψ | C1′–Ox–Cx–**C(x−1)** (C2′ for 2-ketose donors): C1′–O4–C4–C3 for 1–4, C2′–O3–C3–C2 for Neu5Ac α2–3. Where the acceptor has no C(x−1): its ring oxygen for a 1–1 linkage to an aldose, C2 for a 2–1 linkage to the C1 of a ketose |
+| ω | **O5–C5–C6–O6** for a 1–6 linkage (the same angle as O6–C6–C5–O5); generally O–C(x−1)–Cx–Ox for an acceptor carbon outside the ring, with the ring oxygen when C(x−1) is in the ring: O4–C4–C5–O5 for 1–5 to Araf, O7–C7–C8–O8 for 2–8 and O8–C8–C9–O9 for 2–9 to a sialic acid, O5–C2–C1–O1 for 2–1 to Fruf |
 
-The stored ω is not the O5–C5–C6–O6 of the IUPAC recommendation. In a
-D-hexopyranose C4 lies about 120° from O5 about the C5–C6 bond, so the stored
-value is the IUPAC ω plus about 120°: the rotamers gg, gt and tg (−60°, +60°
-and 180° with O5–C5–C6–O6) are near **+60°, 180° and −60°** on the stored
-scale. The values are kept on this scale because the website and other tools
-read them. A free C6 hydroxyl (no glycosidic linkage) is a residue-local
-torsion, stored as O5–C5–C6–O6.
+On this scale the rotamers of a 1–6 linkage to a D-hexopyranose are gg −60°,
+gt +60° and tg 180°, and a free C6 hydroxyl (a residue-local torsion, also
+O5–C5–C6–O6) is on the same scale.
+
+The omega of a group that is not a sugar on such an exocyclic carbon (a
+6-O-sulfate, phosphocholine, a 9-O-acetyl or 9-O-methyl sialic acid) has the
+atoms of a glycosidic ω but is a **substituent** torsion: family
+`substituent`, listed in `torsions.substituent` (not in `torsions.glycosidic`,
+`torsion_glycosidic.csv` or the distribution plots), named
+`<substituent residue>_<sugar residue>_omega`, and still a column of
+`torsion_all.csv`.
+
+**Definitions version 1** (entries analysed before October 2026): ψ took
+C(x−1) or C(x+1), whichever the bond table listed first (C(x+1) for 2,716 ψ of
+C1 donors and 264 of C2 donors), ω was C4–C5–C6–O6 (C6–C7–C8–O8 for 2–8),
+which is the IUPAC ω plus about 120° (gg, gt, tg near +60°, 180°, −60°), and
+the ω of 6-O-sulfates was listed as glycosidic. A process folder whose torsion
+table has other columns than the current definitions give is taken as
+unfinished, and its torsions and what is derived from them are computed again
+(`v2.torsion_table_is_current`).
 
 ## Staged Oracle/Slurm workflow
 
@@ -499,7 +527,7 @@ The measurements are those of the sampling-robustness analysis of the thesis (se
 
 | | |
 |---|---|
-| per replica | frames, retained frames, time per frame and simulated time; Level 1 population (fraction of its frames in each cluster); the Level 1 clusters that hold at least 10% of the pooled frames and less than 1% of its own; rotamer occupancy (thirds of the circle around 60°, 180° and −60°; gg, gt, tg for ω of a 1–6 or 2–6 linkage) and rotamer transitions of every glycosidic torsion; TV and overlap between its two halves; the rank of the jump into its first frame (below) |
+| per replica | frames, retained frames, time per frame and simulated time; Level 1 population (fraction of its frames in each cluster); the Level 1 clusters that hold at least 10% of the pooled frames and less than 1% of its own; rotamer occupancy (thirds of the circle around 60°, 180° and −60° of the stored angle; for ω of a 1–6 or 2–6 linkage gt, tg, gg in an entry of torsion definitions version 2 and gg, gt, tg in one of version 1, read from `torsions.conventions` of `info.json`) and rotamer transitions of every glycosidic torsion; TV and overlap between its two halves; the rank of the jump into its first frame (below) |
 | between replicas | over all pairs of full-length replicas, the mean and the largest: total variation distance (TV) of the populations, 0.5 Σ\|p − q\|, the share of frames that would have to change cluster; overlap of the (PC1, PC2) distributions, Σ min(P, Q) on a 25 × 25 grid over the 0.5th to 99.5th percentile of the frames of the entry; Jensen–Shannon divergence (base 2) of every glycosidic torsion, 36 bins of 10°, and of every linkage (its largest torsion); the standard error of each pooled population |
 | halves | first against second half of one replica (within) and first half of one against second half of another (across): the same amount of data either way |
 | floor | the same between-replica measures after the frames were dealt at random to the replicas: what uncorrelated frames of one distribution give for this many frames, against which a disagreement is read. One deal, seeded with the number of the GlycoShape ID as in the thesis; on the node, before an entry has an ID, with its GLYCAM name, so that the two differ by the noise of the deal (for GS00877 a TV of 0.006 against 0.0096) |
@@ -540,7 +568,8 @@ The thresholds apply to the values as the file shows them (four decimals), as in
 **The file.** `replicas.json` (schema `glycoshape-replica-diagnostics`, version 1; compact JSON, 10 to 130 KB, median 33 KB) is a function of the entry and the parameters only: no time stamp, the same analysis gives the same bytes. Its keys:
 
 ```
-schema, schema_version, glycam_name, glycoshape_id (null before publishing), generator, parameters
+schema, schema_version, glycam_name, glycoshape_id (null before publishing), generator, parameters,
+              torsion_conventions_version (1 or 2: the omega scale of the entry)
 frames        trajectory, retained, unassigned
 boundaries    basis, recorded_by, replicas, full_length_replicas, full_length_by, evidence
 replicas[]    index, name, first_frame, frames, retained, basis, recorded_by, segment, time_per_frame_ps,
@@ -552,7 +581,8 @@ halves        population_tv_within/across, overlap_within/across
 floor         population_tv, overlap, seed
 linkages[]    donor, acceptor, label, class, subclass, positions, jsd, jsd_torsion, jsd_floor, jsd_within, jsd_across,
               rotamer_absdiff, rotamer_missing, torsions {phi|psi|omega: name, jsd, jsd_max, jsd_floor, jsd_within,
-              jsd_across, rotamer_absdiff, rotamers[replica][3], transitions[replica], rotamer_names (gg, gt, tg)}
+              jsd_across, rotamer_absdiff, rotamers[replica][3], transitions[replica], rotamer_centres (IUPAC angle of each
+              third of an omega), rotamer_names (gg/gt/tg of each third, 1-6 and 2-6)}
 torsion_histograms   bins, from_degrees, torsions[] {name, counts[replica][36]}: the torsions whose replicas agree least
 verdict       value, reasons[], criteria, thresholds
 landscape     pc1_range, pc2_range, grid, sigma_cells, mass; pooled[] {mass, lines}; replicas[] {replica, frames_outside,

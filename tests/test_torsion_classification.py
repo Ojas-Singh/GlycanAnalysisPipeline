@@ -11,6 +11,7 @@ from lib.torsion import (
     get_glycan_torsions_enhanced,
     plot_torsion_distribution,
 )
+from test_torsion_definitions import linkage_torsions, load
 
 
 class GlycosidicOmegaClassificationTests(unittest.TestCase):
@@ -39,32 +40,28 @@ class GlycosidicOmegaClassificationTests(unittest.TestCase):
         )
 
     def test_inter_residue_o6_linkage_is_glycosidic_omega(self):
-        bonds = pl.DataFrame({"a": [0, 1, 2, 3], "b": [1, 2, 3, 4]})
-        metadata = build_torsion_metadata(
-            [(0, 1, 2, 3)],
-            self._atoms(),
-            bonds_df=bonds,
-        )
+        # Fuc(a1-6)GlcNAc: O6 of GlcNAc bonded to the anomeric carbon of a sugar
+        found, *_ = linkage_torsions("fuc_a1_6_glcnac")
+        self.assertEqual(found["3_2_omega"], ("glycosidic", ["O5_2", "C5_2", "C6_2", "O6_2"]))
 
-        self.assertEqual(metadata[0]["family"], "glycosidic")
-        self.assertEqual(metadata[0]["subtype"], "omega")
-        self.assertEqual(metadata[0]["canonical_name"], "3_2_omega")
-
-    def test_o6_sulfate_substitution_retains_omega(self):
-        atoms = self._atoms().with_columns(
-            pl.Series("name", ["C4", "C5", "C6", "O6", "S1"]),
-            pl.Series("res_name", ["UYA", "UYA", "UYA", "UYA", "SO3"]),
-        )
-        bonds = pl.DataFrame({"a": [0, 1, 2, 3], "b": [1, 2, 3, 4]})
-        metadata = build_torsion_metadata(
-            [(0, 1, 2, 3)],
-            atoms,
-            bonds_df=bonds,
-        )
-
-        self.assertEqual(metadata[0]["family"], "glycosidic")
-        self.assertEqual(metadata[0]["subtype"], "omega")
-        self.assertEqual(metadata[0]["canonical_name"], "3_2_omega")
+    def test_o6_sulfate_omega_is_a_substituent_torsion(self):
+        # Gal6S(b1-4)Glc: the sulfate (residue 4) on O6 of Gal is not a sugar.  Its omega
+        # is kept, under the same name, as a substituent torsion apart from the
+        # glycosidic ones (it was listed among them).
+        found, metadata, atoms, xyz = linkage_torsions("gal6s_b1_4_glc")
+        entry = next(e for e in metadata if e["canonical_name"] == "4_3_omega")
+        self.assertEqual(entry["family"], "substituent")
+        self.assertEqual(entry["subtype"], "omega")
+        self.assertNotIn("glycosidic_name", entry)
+        self.assertEqual(entry["residue_names"], ["6LB"] * 4)
+        glycosidic = [e["canonical_name"] for e in metadata if e["family"] == "glycosidic"]
+        self.assertEqual(sorted(glycosidic), ["3_2_phi", "3_2_psi"])
+        # the column is still computed: the torsion is in the list the values are taken from
+        atoms_df, bonds_df, _ = load("gal6s_b1_4_glc")
+        self.assertIn(tuple(entry["atom_indices"]), get_glycan_torsions_enhanced(atoms_df, bonds_df))
+        # the free C6 of Glc stays residue-local
+        local = [e for e in metadata if e["family"] == "residue_local" and e["central_bond_atoms"] == ["C5", "C6"]]
+        self.assertEqual([e["residue_ids"][0] for e in local], [2])
 
     @staticmethod
     def _neu5_atoms():
@@ -88,50 +85,11 @@ class GlycosidicOmegaClassificationTests(unittest.TestCase):
         self.assertEqual(metadata[0]["family"], "residue_local")
         self.assertNotEqual(metadata[0]["subtype"], "omega")
 
-    def test_neu5_alpha2_8_linkage_has_glycosidic_omega(self):
-        bonds = pl.DataFrame(
-            {
-                "a": [0, 1, 2, 3, 4, 5],
-                "b": [1, 2, 3, 5, 5, 6],
-            }
-        )
-        torsions = get_glycan_torsions_enhanced(self._neu5_atoms(), bonds)
-        self.assertIn((0, 1, 2, 3), torsions)
-
-        metadata = build_torsion_metadata(
-            torsions,
-            self._neu5_atoms(),
-            bonds_df=bonds,
-        )
-        omega = [entry for entry in metadata if entry["subtype"] == "omega"]
-        self.assertEqual(len(omega), 1)
-        self.assertEqual(omega[0]["family"], "glycosidic")
-        self.assertEqual(omega[0]["canonical_name"], "3_2_omega")
-
-    def test_neu5_alpha2_8_linkage_has_phi_and_psi(self):
-        bonds = pl.DataFrame(
-            {
-                "a": [0, 1, 2, 3, 4, 5],
-                "b": [1, 2, 3, 5, 5, 6],
-            }
-        )
-        torsions = get_glycan_torsions_enhanced(self._neu5_atoms(), bonds)
-        self.assertIn((4, 5, 3, 2), torsions)
-        self.assertIn((5, 3, 2, 1), torsions)
-
-        metadata = build_torsion_metadata(
-            torsions,
-            self._neu5_atoms(),
-            bonds_df=bonds,
-        )
-        glycosidic = {
-            entry["subtype"]: entry["canonical_name"]
-            for entry in metadata
-            if entry["family"] == "glycosidic"
-        }
-        self.assertEqual(glycosidic["phi"], "3_2_phi")
-        self.assertEqual(glycosidic["psi"], "3_2_psi")
-        self.assertEqual(glycosidic["omega"], "3_2_omega")
+    def test_neu5_alpha2_8_linkage_has_phi_psi_and_omega(self):
+        found, *_ = linkage_torsions("neu5ac_a2_8")
+        self.assertEqual(found["3_2_phi"], ("glycosidic", ["O6_3", "C2_3", "O8_2", "C8_2"]))
+        self.assertEqual(found["3_2_psi"], ("glycosidic", ["C2_3", "O8_2", "C8_2", "C7_2"]))
+        self.assertEqual(found["3_2_omega"], ("glycosidic", ["O7_2", "C7_2", "C8_2", "O8_2"]))
 
     def test_neu5_phi_psi_name_classification(self):
         self.assertEqual(
@@ -139,37 +97,14 @@ class GlycosidicOmegaClassificationTests(unittest.TestCase):
             "3_2_phi",
         )
         self.assertEqual(
-            classify_glycosidic_from_name("C2_3-O3_2-C3_2-C4_2"),
+            classify_glycosidic_from_name("C2_3-O3_2-C3_2-C2_2"),
             "3_2_psi",
         )
 
     def test_neu5_alpha2_6_linkage_has_phi_and_psi(self):
-        atoms = pl.DataFrame(
-            {
-                "name": ["C5", "C6", "O6", "O6", "C2", "C1"],
-                "element": ["C", "C", "O", "O", "C", "C"],
-                "res_id": [2, 2, 2, 3, 3, 3],
-                "res_name": ["6LB", "6LB", "6LB", "0SA", "0SA", "0SA"],
-            }
-        )
-        bonds = pl.DataFrame(
-            {
-                "a": [0, 1, 2, 3, 4],
-                "b": [1, 2, 4, 4, 5],
-            }
-        )
-        torsions = get_glycan_torsions_enhanced(atoms, bonds)
-        self.assertIn((3, 4, 2, 1), torsions)
-        self.assertIn((4, 2, 1, 0), torsions)
-
-        metadata = build_torsion_metadata(torsions, atoms, bonds_df=bonds)
-        neu5 = {
-            entry["subtype"]: entry["canonical_name"]
-            for entry in metadata
-            if entry["family"] == "glycosidic"
-        }
-        self.assertEqual(neu5["phi"], "3_2_phi")
-        self.assertEqual(neu5["psi"], "3_2_psi")
+        found, *_ = linkage_torsions("neu5ac_a2_6_gal")
+        self.assertEqual(found["4_3_phi"], ("glycosidic", ["O6_4", "C2_4", "O6_3", "C6_3"]))
+        self.assertEqual(found["4_3_psi"], ("glycosidic", ["C2_4", "O6_3", "C6_3", "C5_3"]))
 
     def test_distribution_plot_never_falls_back_to_local_torsions(self):
         with tempfile.TemporaryDirectory() as temp_dir:

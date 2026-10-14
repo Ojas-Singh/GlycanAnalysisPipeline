@@ -34,35 +34,111 @@ except Exception as _exc:  # pragma: no cover - handled lazily
 
 Torsion = Tuple[int, int, int, int]
 
-#: How the stored glycosidic torsions are defined (degrees, -180 to 180).  It is
-#: written into the torsion block of ``info.json`` (``torsions.conventions``).
-#: The stored omega is C4-C5-C6-O6, not the O5-C5-C6-O6 of the IUPAC
-#: recommendation: in a D-hexopyranose C4 lies about 120 degrees from O5 about
-#: the C5-C6 bond, so the stored value is the IUPAC omega plus about 120
-#: degrees, and the rotamers gg, gt, tg (-60, +60, 180 for O5-C5-C6-O6) are
-#: near +60, 180 and -60 on the stored scale.  The values are kept as they are
-#: because the website and other tools read them.
-TORSION_CONVENTIONS: Dict[str, str] = {
-	"phi": (
-		"ring oxygen - anomeric carbon - glycosidic oxygen - acceptor carbon: O5-C1-O-Cx for a pyranose donor, "
-		"O4-C1-O-Cx for an aldofuranose, O5-C2-O-Cx for a ketofuranose, O6-C2-O-Cx for a sialic acid"
+#: Version of the torsion definitions below.  1: psi with C(x-1) or C(x+1) as
+#: the bond table had it, omega C4-C5-C6-O6, the omega of 6-O-sulfates and the
+#: like listed as glycosidic.  2: the IUPAC definitions for every linkage.
+TORSION_DEFINITIONS_VERSION = 2
+
+#: How the stored torsions are defined.  It is written into the torsion block
+#: of ``info.json`` (``torsions.conventions``); the four atoms of each stored
+#: torsion are in its metadata (``atom_names``, ``residue_ids``).
+#:
+#: These are the definitions of the IUPAC-IUB recommendations (Joint
+#: Commission on Biochemical Nomenclature, "Symbols for specifying the
+#: conformation of polysaccharide chains", 1981; Eur. J. Biochem. 131, 5-7,
+#: 1983) with heavy atoms only: phi O5'-C1'-Ox-Cx, psi C1'-Ox-Cx-C(x-1), and for
+#: a 1-6 linkage omega O5-C5-C6-O6 (the same angle as O6-C6-C5-O5).  They are
+#: extended in the same way to the linkages the recommendations do not spell
+#: out: the ring oxygen and anomeric carbon of furanose and 2-ketose donors in
+#: phi, a ring oxygen or C(x+1) for psi where there is no C(x-1), and an omega
+#: for every acceptor carbon outside the ring (C5 of a pentofuranose, C6 of a
+#: hexofuranose, C8 and C9 of a sialic acid, C1 of a 2-ketose).
+TORSION_CONVENTIONS: Dict[str, Any] = {
+	"version": TORSION_DEFINITIONS_VERSION,
+	"reference": (
+		"IUPAC-IUB JCBN, Symbols for specifying the conformation of polysaccharide chains (1981), "
+		"Eur. J. Biochem. 131, 5-7 (1983); heavy atoms only"
 	),
-	"psi": (
-		"anomeric carbon - glycosidic oxygen - acceptor carbon - a neighbour of the acceptor carbon: C1-O-Cx-A "
-		"(C2-O-Cx-A for C2 donors), A being the ring oxygen when Cx is an anomeric carbon, otherwise C(x-1) or "
-		"C(x+1), whichever the bond table lists first (sialic acid donors: C3-C4, C4-C5, C6-C5, C8-C7, C9-C8); "
-		"the fourth atom of each psi is in its atom_names"
+	"units": "degrees, -180 to 180",
+	"naming": (
+		"<donor residue>_<acceptor residue>_<phi|psi|omega>, with the residue numbers of the topology. "
+		"Primed atoms belong to the donor, x is the acceptor position. The four atoms of every torsion "
+		"of the entry are in its metadata (atom_names, residue_ids)"
 	),
-	"omega": (
-		"C4-C5-C6-O6 of the acceptor of a 1-6 linkage (C6-C7-C8-O8 of a sialic acid in a 2-8 linkage). "
-		"Not the IUPAC O5-C5-C6-O6: the stored value is that omega plus about 120 degrees, so the rotamers "
-		"gg, gt and tg (-60, +60 and 180 with O5-C5-C6-O6) are near +60, 180 and -60 here"
+	"phi": {
+		"definition": "ring oxygen' - anomeric carbon' - Ox - Cx",
+		"atoms": {
+			"aldopyranose donor": ["O5'", "C1'", "Ox", "Cx"],
+			"aldofuranose donor (Araf, Galf, Ribf)": ["O4'", "C1'", "Ox", "Cx"],
+			"2-ketopyranose donor (Neu5Ac, Neu5Gc, Kdn, Kdo, Tagp, Sorp)": ["O6'", "C2'", "Ox", "Cx"],
+			"2-ketofuranose donor (Fruf, Psif)": ["O5'", "C2'", "Ox", "Cx"],
+		},
+	},
+	"psi": {
+		"definition": (
+			"anomeric carbon' - Ox - Cx - C(x-1); where the acceptor has no C(x-1): its ring oxygen when Cx "
+			"is the anomeric C1 of an aldose (1-1), otherwise C(x+1) (2-1 to the C1 of a ketose)"
+		),
+		"atoms": {
+			"aldose donor, x > 1": ["C1'", "Ox", "Cx", "C(x-1)"],
+			"2-ketose donor, x > 1": ["C2'", "Ox", "Cx", "C(x-1)"],
+			"1-1 to an aldose": ["C1'", "O1", "C1", "O5"],
+			"2-1 to a 2-ketose": ["C2'", "O1", "C1", "C2"],
+		},
+		"examples": {
+			"1-4": ["C1'", "O4", "C4", "C3"],
+			"1-6": ["C1'", "O6", "C6", "C5"],
+			"2-3 (sialic acid)": ["C2'", "O3", "C3", "C2"],
+			"2-6 (sialic acid)": ["C2'", "O6", "C6", "C5"],
+			"2-8 (sialic acid)": ["C2'", "O8", "C8", "C7"],
+		},
+	},
+	"omega": {
+		"definition": (
+			"for an acceptor carbon Cx outside the ring: O - C(x-1) - Cx - Ox, the oxygen being the ring oxygen "
+			"when C(x-1) is a ring atom and the hydroxyl oxygen of C(x-1) otherwise (C(x+1) and its ring "
+			"oxygen for 2-1). For a 1-6 linkage this is the IUPAC omega O5-C5-C6-O6, the same angle as "
+			"O6-C6-C5-O5"
+		),
+		"atoms": {
+			"1-6 to a hexopyranose": ["O5", "C5", "C6", "O6"],
+			"1-6 to a hexofuranose (Galf)": ["O5", "C5", "C6", "O6"],
+			"1-5 to a pentofuranose (Araf)": ["O4", "C4", "C5", "O5"],
+			"2-8 to a sialic acid": ["O7", "C7", "C8", "O8"],
+			"2-9 to a sialic acid": ["O8", "C8", "C9", "O9"],
+			"2-1 to a 2-ketofuranose (Fruf)": ["O5", "C2", "C1", "O1"],
+		},
+		"rotamers": {
+			"1-6 to a D-hexopyranose": {"gg": -60, "gt": 60, "tg": 180},
+		},
+	},
+	"substituent": {
+		"definition": (
+			"the omega of an exocyclic carbon whose oxygen carries a group that is not a sugar (sulfate, "
+			"phosphate, methyl, acetyl ...), with the atoms of a glycosidic omega. Listed in "
+			"torsions.substituent, not among the glycosidic torsions, and named "
+			"<substituent residue>_<sugar residue>_omega"
+		),
+		"atoms": {
+			"6-O-substituted hexopyranose": ["O5", "C5", "C6", "O6"],
+			"8-O-substituted sialic acid": ["O7", "C7", "C8", "O8"],
+			"9-O-substituted sialic acid": ["O8", "C8", "C9", "O9"],
+		},
+	},
+	"other": (
+		"every other rotatable bond, in one residue or between residues, with an oxygen at each end where "
+		"there is one, named after its four atoms"
 	),
 }
 
 __all__ = [
 	"Torsion",
 	"TORSION_CONVENTIONS",
+	"TORSION_DEFINITIONS_VERSION",
+	"LINKAGE_FAMILIES",
+	"Linkage",
+	"find_linkages",
+	"linkage_roles",
 	"get_movable_torsions",
 	"get_torsion_values",
 	"get_torsion_values_batch",
@@ -554,29 +630,44 @@ def _build_non_glycosidic_canonical_name(
 	return f"{center_left}__{center_right}__{flank_left}__{flank_right}"
 
 
+#: Families of torsions that belong to a linkage: a glycosidic linkage, or a
+#: substituent (sulfate, methyl ...) on an exocyclic oxygen.
+LINKAGE_FAMILIES = ("glycosidic", "substituent")
+
+
 def annotate_torsion(
 	torsion: Torsion,
 	atoms_df,
 	index: int,
 	original_name: Optional[str] = None,
-	glycosidic_omega_residues: Optional[Tuple[int, int]] = None,
+	linkage_role: Optional[Tuple[str, str, str]] = None,
+	classify_by_name: bool = True,
 ) -> Dict[str, Any]:
-	"""Build stable metadata for a torsion definition."""
+	"""Build stable metadata for a torsion definition.
+
+	``linkage_role`` is ``(family, canonical name, subtype)`` when the torsion
+	belongs to a linkage found in the structure (``find_linkages``).  Without
+	it, ``classify_by_name`` decides whether the atom names alone may make the
+	torsion glycosidic (only when the structure is not at hand).
+	"""
 	atom_indices, atom_names, residue_ids, residue_names = _torsion_atom_metadata(torsion, atoms_df)
 	original_name = original_name or _make_original_torsion_name(atom_names, residue_ids)
 
-	if glycosidic_omega_residues is not None:
-		donor_residue, acceptor_residue = glycosidic_omega_residues
-		glycosidic_name = f"{donor_residue}_{acceptor_residue}_omega"
-	else:
-		glycosidic_name = classify_glycosidic_from_name(original_name)
-	if glycosidic_name and not glycosidic_name.startswith("other_"):
-		subtype = glycosidic_name.rsplit("_", 1)[-1]
-		return {
+	family: Optional[str] = None
+	canonical: Optional[str] = None
+	if linkage_role is not None:
+		family, canonical, _ = linkage_role
+	elif classify_by_name:
+		by_name = classify_glycosidic_from_name(original_name)
+		if by_name and not by_name.startswith("other_"):
+			family, canonical = "glycosidic", by_name
+	if family in LINKAGE_FAMILIES and canonical:
+		subtype = canonical.rsplit("_", 1)[-1]
+		entry = {
 			"index": int(index),
 			"original_name": original_name,
-			"canonical_name": glycosidic_name,
-			"family": "glycosidic",
+			"canonical_name": canonical,
+			"family": family,
 			"subtype": subtype,
 			"common_name": subtype,
 			"atom_indices": atom_indices,
@@ -585,8 +676,12 @@ def annotate_torsion(
 			"residue_names": residue_names,
 			"central_bond_atoms": [atom_names[1], atom_names[2]],
 			"central_bond_residues": [residue_ids[1], residue_ids[2]],
-			"glycosidic_name": glycosidic_name,
 		}
+		if family == "glycosidic":
+			entry["glycosidic_name"] = canonical
+		else:
+			entry["substituent_name"] = canonical
+		return entry
 
 	family, subtype, common_name = _infer_non_glycosidic_identity(atom_names, residue_ids, residue_names)
 	canonical_name = _build_non_glycosidic_canonical_name(atom_names, residue_ids, residue_names)
@@ -606,53 +701,36 @@ def annotate_torsion(
 	}
 
 
+def linkage_roles(atoms_df, bonds_df) -> Dict[Torsion, Tuple[str, str, str]]:
+	"""{torsion (either direction, as the smaller tuple): (family, canonical name, subtype)} of a structure."""
+	roles: Dict[Torsion, Tuple[str, str, str]] = {}
+	for linkage in find_linkages(atoms_df, bonds_df):
+		for subtype, torsion in linkage.torsions():
+			roles.setdefault(
+				_normalised_torsion(torsion),
+				(linkage.kind, f"{linkage.donor}_{linkage.acceptor}_{subtype}", subtype),
+			)
+	return roles
+
+
 def build_torsion_metadata(
 	torsion_list: Sequence[Torsion],
 	atoms_df,
 	original_names: Optional[Sequence[str]] = None,
 	bonds_df=None,
 ) -> List[Dict[str, Any]]:
-	# An omega torsion is residue-local geometrically, so its atom labels alone
-	# cannot distinguish a free side chain from one participating in a
-	# glycosidic linkage.  Associate the supported exocyclic side-chain
-	# patterns with their linkage oxygen and only promote them to glycosidic
-	# omega when that oxygen is bonded to a different residue.
-	omega_patterns = {
-		("C4", "C5", "C6", "O6"): "O6",
-		("C6", "C7", "C8", "O8"): "O8",
-	}
-	linked_omega_by_index: Dict[int, Tuple[int, int]] = {}
-	if bonds_df is not None and len(torsion_list):
-		atom_names = [str(value) for value in atoms_df["name"].to_list()]
-		residue_ids = [int(value) for value in atoms_df["res_id"].to_list()]
-		adjacency: Dict[int, set[int]] = {index: set() for index in range(len(atom_names))}
-		for a, b in bonds_df.iter_rows():
-			a_idx, b_idx = int(a), int(b)
-			if 0 <= a_idx < len(atom_names) and 0 <= b_idx < len(atom_names):
-				adjacency[a_idx].add(b_idx)
-				adjacency[b_idx].add(a_idx)
+	"""Metadata of every torsion: family (glycosidic, substituent, residue_local, inter_residue), names, atoms.
 
-		for index, torsion in enumerate(torsion_list):
-			try:
-				torsion_names = [atom_names[int(atom)] for atom in torsion]
-				torsion_residues = [residue_ids[int(atom)] for atom in torsion]
-			except (IndexError, TypeError, ValueError):
-				continue
-			forward_names = tuple(torsion_names)
-			reverse_names = tuple(reversed(torsion_names))
-			pattern = forward_names if forward_names in omega_patterns else reverse_names
-			if pattern in omega_patterns and len(set(torsion_residues)) == 1:
-				linkage_oxygen = omega_patterns[pattern]
-				oxygen_position = torsion_names.index(linkage_oxygen)
-				oxygen_index = int(torsion[oxygen_position])
-				acceptor_residue = torsion_residues[oxygen_position]
-				donor_residues = sorted({
-					residue_ids[neighbor]
-					for neighbor in adjacency.get(oxygen_index, set())
-					if residue_ids[neighbor] != acceptor_residue
-				})
-				if donor_residues:
-					linked_omega_by_index[index] = (donor_residues[0], acceptor_residue)
+	With the bond table the linkages are found in the structure
+	(``find_linkages``) and a torsion is glycosidic or substituent exactly when
+	it is one of their phi, psi or omega; this is what tells the omega of a
+	1-6 linkage (O6 bonded to the anomeric carbon of another sugar) from the
+	omega of a 6-O-sulfate and from a free C6 hydroxyl.  Without the bond table
+	the atom names decide (``classify_glycosidic_from_name``).
+	"""
+	roles: Optional[Dict[Torsion, Tuple[str, str, str]]] = None
+	if bonds_df is not None and len(torsion_list):
+		roles = linkage_roles(atoms_df, bonds_df)
 
 	metadata: List[Dict[str, Any]] = []
 	for index, torsion in enumerate(torsion_list):
@@ -662,7 +740,8 @@ def build_torsion_metadata(
 			atoms_df=atoms_df,
 			index=index,
 			original_name=original_name,
-			glycosidic_omega_residues=linked_omega_by_index.get(index),
+			linkage_role=roles.get(_normalised_torsion(torsion)) if roles is not None else None,
+			classify_by_name=roles is None,
 		))
 	return metadata
 
@@ -683,7 +762,8 @@ def summarize_torsion_metadata(metadata: Sequence[Dict[str, Any]]) -> Dict[str, 
 	return {
 		"total": len(metadata),
 		"glycosidic": sum(1 for entry in metadata if entry.get("family") == "glycosidic"),
-		"non_glycosidic": sum(1 for entry in metadata if entry.get("family") != "glycosidic"),
+		"substituent": sum(1 for entry in metadata if entry.get("family") == "substituent"),
+		"non_glycosidic": sum(1 for entry in metadata if entry.get("family") not in LINKAGE_FAMILIES),
 		"by_family": dict(sorted(by_family.items())),
 		"by_subtype": dict(sorted(by_subtype.items())),
 		"by_common_name": dict(sorted(by_common_name.items())),
@@ -715,215 +795,267 @@ def circular_stats(deg_values: np.ndarray) -> dict:
 
 
 
-def get_glycan_torsions_enhanced(atoms_df, bonds_df) -> List[Torsion]:
-	"""Enhanced glycan torsion detection using domain knowledge.
-	
-	This method implements the correct phi, psi, and omega definitions:
-	- phi: O5-C1-O-Cx' (glycosidic linkage angle)
-	- psi: C1-O-Cx'-Cx+1' (continuation angle; the fourth atom is the first
-	  neighbour of Cx' in the bond table, C(x-1)' or C(x+1)')
-	- Neu5 phi: O6-C2-O-Cx' (C2 is the anomeric carbon)
-	- Neu5 psi: C2-O-Cx'-Cnext'
-	- omega: C4-C5-C6-O6 (side chain angle).  This is not the IUPAC omega
-	  O5-C5-C6-O6: it is that angle plus about 120 degrees, so gg, gt and tg
-	  are near +60, 180 and -60 on the stored scale (see TORSION_CONVENTIONS).
-	Donors without an O5-C1 ring bond (furanoses, ketoses) get their phi and
-	psi from the rotatable-bond pass below; the names classify them.
+_CARBON_LOCANT = re.compile(r"C(\d+)")
+
+
+def _carbon_locant(name: object) -> Optional[int]:
+	"""x of an atom named Cx (C1, C12), else None."""
+	match = _CARBON_LOCANT.fullmatch(str(name).strip())
+	return int(match.group(1)) if match else None
+
+
+def _normalised_torsion(torsion: Sequence[int]) -> Torsion:
+	forward = tuple(int(atom) for atom in torsion)
+	return min(forward, forward[::-1])  # type: ignore[return-value]
+
+
+class Linkage:
+	"""The torsions of one linkage: a glycosidic linkage, or a substituent on an exocyclic oxygen.
+
+	``kind`` is ``"glycosidic"`` (``donor`` is the sugar whose anomeric carbon
+	makes the bond) or ``"substituent"`` (``donor`` is the residue of the group
+	that is not a sugar, SO3, MEX, ACX ...; only ``omega`` is set).  The
+	torsions are 4-tuples of atom indices in the order of
+	``TORSION_CONVENTIONS``.
 	"""
-	_require_rdkit()
-	
-	try:
-		import networkx as nx
-	except ImportError:
+
+	__slots__ = ("kind", "donor", "acceptor", "phi", "psi", "omega", "acceptor_carbon")
+
+	def __init__(self, kind, donor, acceptor, phi=None, psi=None, omega=None, acceptor_carbon=None):
+		self.kind = kind
+		self.donor = donor
+		self.acceptor = acceptor
+		self.phi = phi
+		self.psi = psi
+		self.omega = omega
+		self.acceptor_carbon = acceptor_carbon
+
+	@property
+	def name(self) -> str:
+		return f"{self.donor}_{self.acceptor}"
+
+	def torsions(self) -> List[Tuple[str, Torsion]]:
+		return [
+			(subtype, getattr(self, subtype))
+			for subtype in ("phi", "psi", "omega")
+			if getattr(self, subtype) is not None
+		]
+
+	def __repr__(self) -> str:  # pragma: no cover - debugging aid
+		return f"Linkage({self.kind}, {self.name}, phi={self.phi}, psi={self.psi}, omega={self.omega})"
+
+
+def _heavy_atom_graph(atoms_df, bonds_df):
+	"""Bond graph without hydrogens, with the atom names, residue ids and elements (upper case)."""
+	if nx is None:
 		raise ImportError("NetworkX is required for graph-based torsion detection.")
-	
-	# Build graph - handle both 0-based and 1-based indexing
-	G = nx.Graph()
 	atom_count = len(atoms_df)
-	
-	# Create index mapping (bonds might use 1-based, arrays use 0-based)
+	graph = nx.Graph()
+	# Bonds might be 1-based; arrays are 0-based.
 	for a, b in bonds_df.iter_rows():
 		a_idx = int(a) if int(a) < atom_count else int(a) - 1
 		b_idx = int(b) if int(b) < atom_count else int(b) - 1
 		if 0 <= a_idx < atom_count and 0 <= b_idx < atom_count:
-			G.add_edge(a_idx, b_idx)
-	
-	# Remove hydrogens
-	elements = atoms_df["element"].to_list()
-	hydrogen_nodes = [i for i, element in enumerate(elements) if element == "H"]
-	G.remove_nodes_from(hydrogen_nodes)
-	
-	# Get atom information
-	atom_names = atoms_df["name"].to_list() if "name" in atoms_df.columns else [f"X{i}" for i in range(len(atoms_df))]
-	res_ids = atoms_df["res_id"].to_list() if "res_id" in atoms_df.columns else [1] * len(atoms_df)
-	
-	torsions = []
-	
-	# Method 1: Find glycosidic linkage torsions (phi and psi)
-	for node in G.nodes():
-		if node >= len(atom_names):
-			continue
-			
-		atom_name = atom_names[node]
-		
-		# Look for C1 atoms (anomeric carbons) - these are key for glycosidic linkages
-		if atom_name == "C1":
-			neighbors = list(G.neighbors(node))
-			
-			# Find O5 (ring oxygen) and glycosidic oxygen
-			o5_node = None
-			glycosidic_oxygens = []
-			
-			for n in neighbors:
-				if n < len(atom_names):
-					if atom_names[n] == "O5":
-						o5_node = n
-					elif elements[n] == "O" and atom_names[n] != "O5":
-						# Check if this connects to different residue
-						if n < len(res_ids) and res_ids[n] != res_ids[node]:
-							glycosidic_oxygens.append(n)
-						else:
-							# Check neighbors of oxygen for different residue
-							for on in G.neighbors(n):
-								if on < len(res_ids) and res_ids[on] != res_ids[node]:
-									glycosidic_oxygens.append(n)
-									break
-			
-			# Build phi and psi torsions for each glycosidic oxygen
-			for glyc_o in glycosidic_oxygens:
-				# Find the carbon on the other side of glycosidic oxygen
-				other_carbons = [n for n in G.neighbors(glyc_o) 
-				               if n != node and elements[n] == "C"]
-				
-				if other_carbons and o5_node is not None:
-					other_c = other_carbons[0]  # Cx'
-					
-					# PHI torsion: O5-C1-O-Cx'
-					phi_torsion = (o5_node, node, glyc_o, other_c)
-					torsions.append(phi_torsion)
-					
-					# Find next carbon for PSI torsion (Cx+1')
-					next_carbons = [n for n in G.neighbors(other_c) 
-					              if n != glyc_o and elements[n] == "C"]
-					
-					# Prefer oxygen over carbon for fourth atom if available
-					next_atoms = [n for n in G.neighbors(other_c) 
-					            if n != glyc_o and elements[n] == "O"]
-					if not next_atoms:
-						next_atoms = next_carbons
-					
-					if next_atoms:
-						next_atom = next_atoms[0]  # Cx+1' or Ox'
-						# PSI torsion: C1-O-Cx'-Cx+1' (or C1-O-Cx'-Ox')
-						psi_torsion = (node, glyc_o, other_c, next_atom)
-						torsions.append(psi_torsion)
+			graph.add_edge(a_idx, b_idx)
+	if "name" in atoms_df.columns:
+		names = [str(value) for value in atoms_df["name"].to_list()]
+	else:
+		names = [f"X{i}" for i in range(atom_count)]
+	if "element" in atoms_df.columns:
+		elements = [str(value).strip().upper() for value in atoms_df["element"].to_list()]
+	else:  # the first letter of the atom name (C1, O5, H1 ...)
+		elements = [next((ch for ch in name if ch.isalpha()), "X").upper() for name in names]
+	graph.remove_nodes_from([i for i, element in enumerate(elements) if element == "H"])
+	res_ids = atoms_df["res_id"].to_list() if "res_id" in atoms_df.columns else [1] * atom_count
+	return graph, names, res_ids, elements
 
-	# Method 1b: Neu5 glycosidic linkage torsions.  Neu5 has its anomeric
-	# center at C2 and its ring oxygen at O6, so the ordinary C1 detector
-	# above cannot represent its phi/psi angles.
-	neu5_psi_continuation = {
-		"C3": "C4",
-		"C4": "C5",
-		"C6": "C5",
-		"C8": "C7",
-		"C9": "C8",
-	}
-	for node in G.nodes():
-		if node >= len(atom_names) or atom_names[node] != "C2":
-			continue
 
-		ring_o6_candidates = [
-			neighbor for neighbor in G.neighbors(node)
-			if neighbor < len(atom_names)
-			and atom_names[neighbor] == "O6"
-			and res_ids[neighbor] == res_ids[node]
-		]
-		same_residue_c1 = any(
-			neighbor < len(atom_names)
-			and atom_names[neighbor] == "C1"
-			and res_ids[neighbor] == res_ids[node]
-			for neighbor in G.neighbors(node)
-		)
-		if not ring_o6_candidates or not same_residue_c1:
-			continue
+def _residue_rings(graph, res_ids) -> Dict[Any, set]:
+	"""The ring atoms of every residue (rings within one residue)."""
+	by_residue: Dict[Any, List[int]] = {}
+	for node in graph.nodes():
+		by_residue.setdefault(res_ids[node], []).append(node)
+	rings: Dict[Any, set] = {}
+	for residue, nodes in by_residue.items():
+		ring_atoms: set = set()
+		for cycle in nx.cycle_basis(graph.subgraph(nodes)):
+			ring_atoms.update(cycle)
+		if ring_atoms:
+			rings[residue] = ring_atoms
+	return rings
 
-		glycosidic_oxygens = [
-			neighbor for neighbor in G.neighbors(node)
-			if neighbor < len(atom_names)
-			and elements[neighbor] == "O"
-			and res_ids[neighbor] != res_ids[node]
-		]
-		for glyc_o in glycosidic_oxygens:
-			acceptor_carbons = [
-				neighbor for neighbor in G.neighbors(glyc_o)
-				if neighbor != node
-				and neighbor < len(atom_names)
-				and elements[neighbor] == "C"
-				and res_ids[neighbor] == res_ids[glyc_o]
-			]
-			for acceptor_c in acceptor_carbons:
-				torsions.append((ring_o6_candidates[0], node, glyc_o, acceptor_c))
 
-				next_name = neu5_psi_continuation.get(str(atom_names[acceptor_c]))
-				if next_name is None:
-					continue
-				next_candidates = [
-					neighbor for neighbor in G.neighbors(acceptor_c)
-					if neighbor != glyc_o
-					and neighbor < len(atom_names)
-					and atom_names[neighbor] == next_name
-					and res_ids[neighbor] == res_ids[acceptor_c]
-				]
-				if next_candidates:
-					torsions.append((node, glyc_o, acceptor_c, next_candidates[0]))
-	
-	# Method 2: Find omega torsions for actual exocyclic glycosidic
-	# linkages.  These same torsions exist as residue-local side-chain
-	# rotations when the terminal oxygen is free, so only include them when
-	# that oxygen bonds to a different residue.
-	#
-	# Hexose 1→6: C4-C5-C6-O6
-	# Neu5   2→8: C6-C7-C8-O8
-	omega_chains = (
-		("C4", "C5", "C6", "O6"),
-		("C6", "C7", "C8", "O8"),
-	)
-	for node in G.nodes():
-		if node >= len(atom_names):
-			continue
+def _anomeric_carbons(graph, names, res_ids, elements, rings) -> Dict[int, int]:
+	"""{anomeric carbon: ring oxygen} of every residue with a ring.
 
-		for outer_name, inner_name, carbon_name, oxygen_name in omega_chains:
-			if atom_names[node] != carbon_name:
+	The anomeric carbon is the ring carbon bonded both to the ring oxygen and
+	to an oxygen outside the ring: C1 of an aldose, C2 of a 2-ketose (the other
+	ring carbon next to the ring oxygen carries a carbon, C5 or C6).
+	"""
+	result: Dict[int, int] = {}
+	for residue, ring in rings.items():
+		candidates = []
+		for atom in ring:
+			if elements[atom] != "C":
 				continue
+			ring_oxygens = [n for n in graph.neighbors(atom) if n in ring and elements[n] == "O"]
+			outside_oxygens = [n for n in graph.neighbors(atom) if n not in ring and elements[n] == "O"]
+			if ring_oxygens and outside_oxygens:
+				locant = _carbon_locant(names[atom])
+				candidates.append((locant if locant is not None else 10**6, atom, min(ring_oxygens)))
+		if candidates:
+			_, atom, ring_oxygen = min(candidates)
+			result[atom] = ring_oxygen
+	return result
 
-			inner_candidates = [
-				neighbor for neighbor in G.neighbors(node)
-				if neighbor < len(atom_names)
-				and atom_names[neighbor] == inner_name
-				and res_ids[neighbor] == res_ids[node]
-			]
-			oxygen_candidates = [
-				neighbor for neighbor in G.neighbors(node)
-				if neighbor < len(atom_names)
-				and atom_names[neighbor] == oxygen_name
-				and res_ids[neighbor] == res_ids[node]
-			]
-			for inner_node in inner_candidates:
-				outer_candidates = [
-					neighbor for neighbor in G.neighbors(inner_node)
-					if neighbor < len(atom_names)
-					and atom_names[neighbor] == outer_name
-					and res_ids[neighbor] == res_ids[node]
-				]
-				for oxygen_node in oxygen_candidates:
-					is_linked_oxygen = any(
-						neighbor < len(res_ids)
-						and res_ids[neighbor] != res_ids[oxygen_node]
-						for neighbor in G.neighbors(oxygen_node)
-					)
-					if is_linked_oxygen and outer_candidates:
-						torsions.append((outer_candidates[0], inner_node, node, oxygen_node))
-	
+
+def _psi_reference(graph, names, res_ids, elements, rings, carbon: int, oxygen: int) -> Optional[int]:
+	"""The fourth atom of psi: C(x-1); the ring oxygen of an anomeric C1; C(x+1); else a neighbour."""
+	residue = res_ids[carbon]
+	neighbours = [n for n in graph.neighbors(carbon) if n != oxygen and res_ids[n] == residue]
+	by_name = {names[n]: n for n in neighbours}
+	x = _carbon_locant(names[carbon])
+	if x is not None:
+		if f"C{x - 1}" in by_name:
+			return by_name[f"C{x - 1}"]
+		ring = rings.get(residue, set())
+		if carbon in ring:
+			ring_oxygens = [n for n in neighbours if n in ring and elements[n] == "O"]
+			if ring_oxygens:
+				return ring_oxygens[0]
+		if f"C{x + 1}" in by_name:
+			return by_name[f"C{x + 1}"]
+	carbons = [n for n in neighbours if elements[n] == "C"]
+	if carbons:
+		return carbons[0]
+	return neighbours[0] if neighbours else None
+
+
+def _omega(graph, names, res_ids, elements, rings, carbon: int, oxygen: int, reference: Optional[int]) -> Optional[Torsion]:
+	"""O-C(x-1)-Cx-Ox when Cx lies outside the ring of a sugar residue, else None.
+
+	The first oxygen is the ring oxygen when C(x-1) is a ring atom (O5 of a
+	hexopyranose, O4 of Araf, O5 of Fruf), otherwise the hydroxyl oxygen of
+	C(x-1) (O7 and O8 of a sialic acid).
+	"""
+	residue = res_ids[carbon]
+	ring = rings.get(residue)
+	if not ring or carbon in ring or reference is None or elements[reference] != "C":
+		return None
+	oxygens = [
+		n for n in graph.neighbors(reference)
+		if n != carbon and res_ids[n] == residue and elements[n] == "O"
+	]
+	if not oxygens:
+		return None
+	ring_oxygens = [n for n in oxygens if n in ring]
+	if ring_oxygens:
+		outer = ring_oxygens[0]
+	else:
+		locant = _carbon_locant(names[reference])
+		named = [n for n in oxygens if locant is not None and names[n] == f"O{locant}"]
+		outer = named[0] if named else oxygens[0]
+	return (outer, reference, carbon, oxygen)
+
+
+def _find_linkages_in_graph(graph, names, res_ids, elements) -> List[Linkage]:
+	rings = _residue_rings(graph, res_ids)
+	anomeric = _anomeric_carbons(graph, names, res_ids, elements, rings)
+	node_order = {node: position for position, node in enumerate(graph.nodes())}
+	# C1 donors first, then the 2-ketoses, each in the order of the graph.
+	donors = sorted(anomeric, key=lambda atom: (names[atom] != "C1", node_order[atom]))
+
+	linkages: List[Linkage] = []
+	glycosidic_bonds: set = set()
+	for anomeric_carbon in donors:
+		donor = res_ids[anomeric_carbon]
+		ring_oxygen = anomeric[anomeric_carbon]
+		for oxygen in graph.neighbors(anomeric_carbon):
+			if elements[oxygen] != "O" or oxygen in rings.get(donor, set()):
+				continue
+			for carbon in graph.neighbors(oxygen):
+				if carbon == anomeric_carbon or elements[carbon] != "C" or res_ids[carbon] == donor:
+					continue
+				reference = _psi_reference(graph, names, res_ids, elements, rings, carbon, oxygen)
+				linkages.append(Linkage(
+					"glycosidic",
+					donor,
+					res_ids[carbon],
+					phi=(ring_oxygen, anomeric_carbon, oxygen, carbon),
+					psi=(anomeric_carbon, oxygen, carbon, reference) if reference is not None else None,
+					omega=_omega(graph, names, res_ids, elements, rings, carbon, oxygen, reference),
+					acceptor_carbon=carbon,
+				))
+				glycosidic_bonds.add((oxygen, carbon))
+
+	# A group that is not a sugar (sulfate, phosphate, methyl, acetyl ...) on
+	# the oxygen of a carbon outside the ring of a sugar: the omega of that
+	# carbon, listed apart from the glycosidic torsions.
+	for residue, ring in rings.items():
+		carbons = sorted((n for n in graph.nodes() if res_ids[n] == residue), key=node_order.get)
+		for carbon in carbons:
+			if elements[carbon] != "C" or carbon in ring:
+				continue
+			for oxygen in graph.neighbors(carbon):
+				if elements[oxygen] != "O" or (oxygen, carbon) in glycosidic_bonds:
+					continue
+				group = {
+					res_ids[n] for n in graph.neighbors(oxygen)
+					if n != carbon and res_ids[n] != residue
+				}
+				if res_ids[oxygen] != residue:
+					group.add(res_ids[oxygen])
+				if not group:
+					continue
+				reference = _psi_reference(graph, names, res_ids, elements, rings, carbon, oxygen)
+				omega = _omega(graph, names, res_ids, elements, rings, carbon, oxygen, reference)
+				if omega is not None:
+					linkages.append(Linkage(
+						"substituent", min(group), residue, omega=omega, acceptor_carbon=carbon,
+					))
+	return linkages
+
+
+def find_linkages(atoms_df, bonds_df) -> List[Linkage]:
+	"""Glycosidic linkages and substituents of a structure, with their torsions (``TORSION_CONVENTIONS``)."""
+	graph, names, res_ids, elements = _heavy_atom_graph(atoms_df, bonds_df)
+	return _find_linkages_in_graph(graph, names, res_ids, elements)
+
+
+def get_glycan_torsions_enhanced(atoms_df, bonds_df) -> List[Torsion]:
+	"""The torsions of a glycan: those of its linkages, then every other rotatable bond.
+
+	First phi and psi of every glycosidic linkage, then the omegas (of the
+	linkages whose acceptor carbon lies outside the ring, and of substituents
+	on such a carbon), all as ``TORSION_CONVENTIONS`` defines them (IUPAC):
+
+	- phi: O5'-C1'-Ox-Cx (O4'-C1' for an aldofuranose, O6'-C2' for sialic
+	  acids and other 2-ketopyranoses, O5'-C2' for 2-ketofuranoses)
+	- psi: C1'-Ox-Cx-C(x-1) (C2' for 2-ketose donors; O5 for a 1-1 linkage,
+	  C2 for a 2-1 linkage to the C1 of a ketose)
+	- omega: O5-C5-C6-O6 for 1-6, and O-C(x-1)-Cx-Ox for any acceptor carbon
+	  outside the ring (O4-C4-C5-O5 for 1-5 to Araf, O7-C7-C8-O8 for 2-8,
+	  O8-C8-C9-O9 for 2-9, O5-C2-C1-O1 for 2-1 to Fruf)
+
+	Then every other single bond outside a ring between two non-terminal heavy
+	atoms, with an oxygen at each end where there is one.
+	"""
+	_require_rdkit()
+	G, atom_names, res_ids, elements = _heavy_atom_graph(atoms_df, bonds_df)
+	atom_count = len(atoms_df)
+	linkages = _find_linkages_in_graph(G, atom_names, res_ids, elements)
+	node_order = {node: position for position, node in enumerate(G.nodes())}
+
+	torsions: List[Torsion] = []
+	for linkage in linkages:
+		if linkage.kind == "glycosidic":
+			torsions.extend(t for t in (linkage.phi, linkage.psi) if t is not None)
+	with_omega = sorted(
+		(linkage for linkage in linkages if linkage.omega is not None),
+		key=lambda linkage: node_order.get(linkage.acceptor_carbon, 0),
+	)
+	torsions.extend(linkage.omega for linkage in with_omega)
+
 	# Method 3: Additional rotatable bonds (for completeness)
 	# Look for other single bonds that might be rotatable
 	try:

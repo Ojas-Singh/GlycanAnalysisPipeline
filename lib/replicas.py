@@ -34,9 +34,14 @@ Definitions (all on the retained frames of a replica, i.e. the rows of
                       replica against the second half of another ("across"): the same amount of data
 * floor               the same between-replica measure after the frames of the entry were dealt at random
                       to its replicas: what uncorrelated frames of one distribution give for this many frames
-* rotamer             a third of the circle, [0, 120), [120, 240) or [240, 360) degrees.  For omega =
-                      C4-C5-C6-O6 as GAP tabulates it these are gg, gt and tg (O5-C5-C6-O6 near -60, 60
-                      and 180 degrees)
+* rotamer             a third of the circle of the stored angle, [0, 120), [120, 240) or [240, 360) degrees,
+                      centred on +60, 180 and -60.  Which rotamer of omega a third is depends on the torsion
+                      definitions of the entry (``torsions.conventions.version`` of ``info.json``,
+                      :func:`conventions_version`): version 2 stores the IUPAC omega O5-C5-C6-O6 (O7-C7-C8-O8
+                      for 2-8), so the thirds are gt, tg and gg; version 1 (entries analysed before October
+                      2026) stored C4-C5-C6-O6 (C6-C7-C8-O8), about 120 degrees more, so they are gg, gt and
+                      tg.  Every omega carries ``rotamer_centres``, the centre of each third on the IUPAC
+                      scale, so that the occupancies of the two versions can be set side by side
 * transitions         changes of rotamer along a replica, counted between the cores of the rotamers
                       (within 40 degrees of 60, 180 and -60 degrees), so that fluctuation across a border
                       does not count
@@ -152,6 +157,11 @@ _SUGAR = {"A": "Ara", "D": "Lyx", "R": "Rib", "X": "Xyl", "N": "All", "E": "Alt"
           "H": "Rha", "O": "GalA", "Z": "GlcA", "U": "IdoA", "V": "GalNAc", "Y": "GlcNAc", "W": "ManNAc"}
 _SPECIAL = {"SA": "Neu5Ac", "GL": "Neu5Gc", "KN": "Kdn", "YS": "GlcNS"}
 _SIALIC = ("SA", "GL", "KN")
+#: Names of the omega rotamers of a 1-6 (or sialic acid 2-6) linkage by their IUPAC angle O5-C5-C6-O6.
+IUPAC_OMEGA_ROTAMERS = {-60.0: "gg", 60.0: "gt", 180.0: "tg"}
+#: Centres of the three rotamer thirds of a stored angle ([0, 120), [120, 240), [240, 360)).
+STORED_CENTRES = (60.0, 180.0, -60.0)
+#: The omega rotamers of the thirds in a version 1 entry (omega C4-C5-C6-O6); kept for older readers.
 OMEGA_ROTAMERS = ("gg", "gt", "tg")
 
 
@@ -242,6 +252,9 @@ class FrameTables:
     torsions: np.ndarray
     torsion_names: List[str]
     torsion_metadata: List[Dict[str, Any]] = field(default_factory=list)
+    #: ``torsions.conventions.version`` of the entry (:func:`conventions_version`): 1 before October 2026
+    #: (psi with C(x-1) or C(x+1), omega C4-C5-C6-O6), 2 the IUPAC definitions.
+    conventions_version: int = 1
 
     def __post_init__(self) -> None:
         self.source_frame = np.asarray(self.source_frame, dtype=np.int64)
@@ -262,6 +275,41 @@ class FrameTables:
 
 
 _NON_TORSION_COLUMNS = ("frame", "source_frame", "cluster", "center")
+
+
+def conventions_version(info: Mapping[str, Any]) -> int:
+    """The version of the torsion definitions of an entry: ``torsions.conventions.version`` of ``info.json``.
+
+    Entries analysed before the version was written (no ``conventions``, or the text conventions of
+    early October 2026) are version 1: omega C4-C5-C6-O6 and C6-C7-C8-O8.
+    """
+    torsions = info.get("torsions") if isinstance(info, Mapping) else None
+    conventions = torsions.get("conventions") if isinstance(torsions, Mapping) else None
+    version = conventions.get("version") if isinstance(conventions, Mapping) else None
+    return int(version) if isinstance(version, int) and not isinstance(version, bool) and version >= 1 else 1
+
+
+def _wrap_centre(angle: float) -> float:
+    angle = float(angle) % 360.0
+    return angle - 360.0 if angle > 180.0 else angle
+
+
+def omega_rotamer_centres(atom_names: Sequence[str], version: int) -> Tuple[float, float, float]:
+    """The IUPAC angle (O5-C5-C6-O6, O7-C7-C8-O8 ...) at the centre of each third of a stored omega.
+
+    Version 2 stores the IUPAC omega: +60, 180, -60.  Version 1 stored the angle with the carbon two
+    bonds in (C4-C5-C6-O6, C6-C7-C8-O8), about 120 degrees more: -60, +60, 180.  The atoms of the
+    torsion, when known, must agree with the version (an oxygen first in version 2, a carbon in 1).
+    """
+    iupac = int(version) >= 2
+    first = str(atom_names[0]) if atom_names else ""
+    if first[:1] in ("O", "C") and (first[:1] == "O") != iupac:
+        raise ReplicaError(
+            f"an omega with the atoms {'-'.join(map(str, atom_names))} in an entry of torsion definitions "
+            f"version {version}: the metadata and the conventions of info.json disagree"
+        )
+    shift = 0.0 if iupac else -120.0
+    return tuple(_wrap_centre(centre + shift) for centre in STORED_CENTRES)  # type: ignore[return-value]
 
 
 def _tables(pca, tor, info: Dict[str, Any]) -> FrameTables:
@@ -290,6 +338,7 @@ def _tables(pca, tor, info: Dict[str, Any]) -> FrameTables:
         torsions=values,
         torsion_names=names,
         torsion_metadata=meta,
+        conventions_version=conventions_version(info),
     )
 
 
@@ -560,14 +609,18 @@ def _anomer(code: str) -> str:
     return {"A": "α", "B": "β", "D": "α", "U": "β"}.get(code[2], "")
 
 
-def linkages_of(metadata: Sequence[Mapping[str, Any]], names: Sequence[str]) -> List[Dict[str, Any]]:
+def linkages_of(metadata: Sequence[Mapping[str, Any]], names: Sequence[str],
+                conventions_version: int = 1) -> List[Dict[str, Any]]:
     """Glycosidic linkages from the torsion metadata of ``info.json`` (``robustness_data.py``, ``linkages_of``).
 
     A linkage is the pair (donor, acceptor) of the canonical names ``d_a_phi``, ``d_a_psi`` and
     ``d_a_omega``.  Its class is ``sia`` (the donor is a sialic acid; subclass ``sia 2-3``, ``sia 2-6``,
-    ``sia 2-8``, ``sia 2-9``), ``1-6`` (another sugar on O6: the linkage has omega, C4-C5-C6-O6), ``other``,
-    or ``substituent`` (an omega alone, of a residue whose O6 carries a group that is not a sugar: not a
-    linkage, and left out of the statistics of linkages).
+    ``sia 2-8``, ``sia 2-9``), ``1-6`` (another sugar on O6: the linkage has omega), ``other``, or
+    ``substituent`` (an omega alone, of a residue whose O6 carries a group that is not a sugar: not a
+    linkage, and left out of the statistics of linkages; version 1 entries list it among the glycosidic
+    torsions, version 2 entries apart).  A linkage with omega gets ``omega_rotamer_centres`` (the IUPAC
+    angle of each rotamer third, :func:`omega_rotamer_centres`) and, for a 1-6 or sialic acid 2-6
+    linkage, ``omega_rotamer_names`` (gg, gt, tg in the order of the thirds).
     """
     by = {m["canonical_name"]: m for m in metadata if "canonical_name" in m}
     links: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -595,6 +648,8 @@ def linkages_of(metadata: Sequence[Mapping[str, Any]], names: Sequence[str]) -> 
         elif atom_names:
             link.setdefault("position", "".join(ch for ch in atom_names[-1] if ch.isdigit()))
             link.setdefault("acceptor_code", codes.get(a, "?"))
+        if kind == "omega":
+            link["omega_rotamer_centres"] = omega_rotamer_centres(atom_names, conventions_version)
     out = []
     for link in links.values():
         donor, acceptor = link.get("donor_code", "?"), link.get("acceptor_code", "?")
@@ -614,6 +669,8 @@ def linkages_of(metadata: Sequence[Mapping[str, Any]], names: Sequence[str]) -> 
         link["donor_code"], link["acceptor_code"] = donor, acceptor
         link["label"] = (f"{_residue_label(donor)} {_anomer(donor)}{carbon}–{position} {_residue_label(acceptor)}" if sugar
                          else f"{_residue_label(acceptor)} O{position} substituent")
+        if "omega_rotamer_centres" in link and link["positions"].endswith("-6") and cls in ("1-6", "sia"):
+            link["omega_rotamer_names"] = [IUPAC_OMEGA_ROTAMERS[c] for c in link["omega_rotamer_centres"]]
         out.append(link)
     return out
 
@@ -717,8 +774,9 @@ def measure(tables: FrameTables, boundaries: Boundaries, parameters: Optional[Pa
         "full_length_by": "simulated time" if by_time else "frames", "clusters": K,
         "unassigned_rows": int((cluster_all < 0).sum()),
     }
-    links = linkages_of(tables.torsion_metadata, tables.torsion_names)
+    links = linkages_of(tables.torsion_metadata, tables.torsion_names, tables.conventions_version)
     out["linkages"] = links
+    out["conventions_version"] = int(tables.conventions_version)
 
     # every replica on all its rows
     ok = cluster_all >= 0
@@ -839,6 +897,9 @@ def linkage_rows(m: Dict[str, Any], parameters: Optional[Parameters] = None) -> 
                           "rotamer_absdiff": float(b["rotamer_absdiff_max"][j])})
             torsions[kind] = t
         row = {k: link[k] for k in ("donor", "acceptor", "label", "class", "subclass", "positions")}
+        for key in ("omega_rotamer_centres", "omega_rotamer_names"):
+            if key in link:
+                row[key] = list(link[key])
         row["torsions"] = torsions
         if b is not None and torsions:
             kmax = max(torsions, key=lambda k: torsions[k]["jsd"])
@@ -956,9 +1017,15 @@ def verdict(m: Dict[str, Any], boundaries: Boundaries, parameters: Optional[Para
             count = m["replica_transitions"][j][i]
             if count < p.omega_min_transitions:
                 occupancy = m["replica_rotamers"][i, j]
+                third = int(np.argmax(occupancy))
+                if link.get("omega_rotamer_names"):
+                    rotamer = link["omega_rotamer_names"][third]
+                elif link.get("omega_rotamer_centres"):
+                    rotamer = f"{link['omega_rotamer_centres'][third]:+.0f}°"
+                else:
+                    rotamer = OMEGA_ROTAMERS[third]
                 stuck.append({"linkage": link["label"], "replica": names[i], "transitions": int(count),
-                              "rotamer": OMEGA_ROTAMERS[int(np.argmax(occupancy))],
-                              "occupancy": round(float(occupancy.max()), 4)})
+                              "rotamer": rotamer, "occupancy": round(float(occupancy.max()), 4)})
     criteria["omega_never_changes"] = bool(stuck)
     if stuck:
         reasons.append({"code": "omega_never_changes", "replicas": stuck,
@@ -1110,6 +1177,8 @@ def diagnose(tables: FrameTables, boundaries: Boundaries, *, glycam_name: Option
         "glycam_name": glycam_name, "glycoshape_id": glycoshape_id,
         "generator": "GlycanAnalysisPipeline lib/replicas.py",
         "parameters": p.describe(),
+        # the torsion definitions of the entry: which rotamer each third of omega is
+        "torsion_conventions_version": int(tables.conventions_version),
         "frames": {"trajectory": boundaries.frames, "retained": m["rows"], "unassigned": m["unassigned_rows"]},
         "boundaries": {"basis": boundaries.basis, "recorded_by": boundaries.recorded_by,
                        "replicas": len(boundaries.replicas), "full_length_replicas": m["full_replicas"],
@@ -1162,8 +1231,10 @@ def diagnose(tables: FrameTables, boundaries: Boundaries, *, glycam_name: Option
                     entry[key] = _r(t[key], digits)
             entry["rotamers"] = [_r(m["replica_rotamers"][i, j]) for i in range(len(boundaries.replicas))]
             entry["transitions"] = [int(x) for x in m["replica_transitions"][j]]
-            if kind == "omega" and link["positions"].endswith("-6") and link["class"] in ("1-6", "sia"):
-                entry["rotamer_names"] = list(OMEGA_ROTAMERS)
+            if kind == "omega" and "omega_rotamer_centres" in link:
+                entry["rotamer_centres"] = [float(c) for c in link["omega_rotamer_centres"]]
+                if "omega_rotamer_names" in link:
+                    entry["rotamer_names"] = list(link["omega_rotamer_names"])
             torsions[kind] = entry
         item["torsions"] = torsions
         out_links.append(item)

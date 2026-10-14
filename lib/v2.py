@@ -22,6 +22,7 @@ Usage: run this script directly. Example:
 
 from pathlib import Path
 import argparse
+import copy
 import io
 import os
 import sys
@@ -64,6 +65,7 @@ from lib.embedding import (
 )
 from lib import glypdbio
 from lib.torsion import (
+    LINKAGE_FAMILIES,
     TORSION_CONVENTIONS,
     build_torsion_metadata,
     classify_glycosidic_from_name,
@@ -266,21 +268,11 @@ def _fallback_torsion_metadata_from_labels(labels: List[str]) -> List[Dict]:
     return metadata
 
 
-def _persist_torsion_annotation_files(
-    frame_data_dir: str,
+def _write_torsion_annotation_files(
     embedding_dir: str,
+    metadata: List[Dict],
     torsion_list: List[Tuple[int, int, int, int]],
-    labels: List[str],
-) -> List[Dict]:
-    atoms_df = glypdbio.load_atoms(frame_data_dir)
-    bonds_df = glypdbio.load_bonds(frame_data_dir)
-    metadata = build_torsion_metadata(
-        torsion_list,
-        atoms_df=atoms_df,
-        original_names=labels,
-        bonds_df=bonds_df,
-    )
-
+) -> None:
     metadata_path = os.path.join(embedding_dir, "torsion_metadata.json")
     _write_json(metadata_path, metadata)
 
@@ -305,7 +297,68 @@ def _persist_torsion_annotation_files(
             })
     glycosidic_path = os.path.join(embedding_dir, "glycosidic_info.json")
     _write_json(glycosidic_path, glycosidic_torsions)
+
+
+def _persist_torsion_annotation_files(
+    frame_data_dir: str,
+    embedding_dir: str,
+    torsion_list: List[Tuple[int, int, int, int]],
+    labels: List[str],
+) -> List[Dict]:
+    atoms_df = glypdbio.load_atoms(frame_data_dir)
+    bonds_df = glypdbio.load_bonds(frame_data_dir)
+    metadata = build_torsion_metadata(
+        torsion_list,
+        atoms_df=atoms_df,
+        original_names=labels,
+        bonds_df=bonds_df,
+    )
+    _write_torsion_annotation_files(embedding_dir, metadata, torsion_list)
     return metadata
+
+
+def _torsion_labels(torsion_list: List[Tuple[int, int, int, int]], atoms_df: pl.DataFrame) -> List[str]:
+    """Column names of a torsion table: the four atoms as <atom name>_<residue id>, made unique."""
+    elements = atoms_df["element"].to_list()
+    atom_names = atoms_df["name"].to_list() if "name" in atoms_df.columns else [f"{elements[i]}{i}" for i in range(len(elements))]
+    res_ids = atoms_df["res_id"].to_list() if "res_id" in atoms_df.columns else [1] * len(elements)
+    return _unique_column_names([
+        "-".join(f"{atom_names[i]}_{res_ids[i]}" for i in torsion)
+        for torsion in torsion_list
+    ])
+
+
+def _stored_torsion_labels(embedding_dir: str) -> Optional[List[str]]:
+    """The torsion columns of the stored table (without ``frame``), or None when there is none."""
+    source = _torsions_source_path(embedding_dir)
+    if source is None:
+        return None
+    header = _read_parquet_header(source) if source.endswith(".parquet") else _read_csv_header(source)
+    if not header:
+        return None
+    return [column for column in header if column != "frame"]
+
+
+def torsion_table_is_current(frame_data_dir: str, embedding_dir: str) -> bool:
+    """Whether the stored torsion table has the columns the current definitions give.
+
+    A table computed with earlier torsion definitions (``TORSION_CONVENTIONS``
+    version) has other atoms in some columns (psi with C(x+1), omega
+    C4-C5-C6-O6); it must be computed again, and what is derived from it
+    with it.  When the structure cannot be read the table is taken as current.
+    """
+    stored = _stored_torsion_labels(embedding_dir)
+    if stored is None:
+        return False
+    try:
+        atoms_df = glypdbio.load_atoms(frame_data_dir)
+        bonds_df = glypdbio.load_bonds(frame_data_dir)
+        if bonds_df.is_empty():
+            return True
+        current = _torsion_labels(get_glycan_torsions_enhanced(atoms_df, bonds_df), atoms_df)
+    except Exception:
+        return True
+    return list(stored) == list(current)
 
 
 def _load_or_build_torsion_metadata(
@@ -314,39 +367,43 @@ def _load_or_build_torsion_metadata(
     torsion_labels: List[str],
     torsion_list: Optional[List[Tuple[int, int, int, int]]] = None,
 ) -> List[Dict]:
-    metadata_path = os.path.join(embedding_dir, "torsion_metadata.json")
-    metadata = _load_json_if_exists(metadata_path, [])
-    if isinstance(metadata, list) and len(metadata) == len(torsion_labels):
-        # Revalidate cached metadata against current classification rules.
-        # Residue-local C4-C5-C6-O6 torsions must not be promoted to omega
-        # without structural evidence of an inter-residue O6 linkage.
-        metadata_matches = True
-        for label, entry in zip(torsion_labels, metadata):
-            expected = classify_glycosidic_from_name(label)
-            expected_glycosidic = not expected.startswith("other_")
-            actual_glycosidic = entry.get("family") == "glycosidic"
-            if expected_glycosidic != actual_glycosidic:
-                metadata_matches = False
-                break
-            if expected_glycosidic and entry.get("canonical_name") != expected:
-                metadata_matches = False
-                break
-        if metadata_matches:
-            return metadata
-        logger.info("Torsion metadata classification is stale; rebuilding")
+    """Metadata of the columns of the stored torsion table, from the structure.
 
+    The columns must be those the current definitions give: metadata of the
+    current torsions over values measured on other atoms would be wrong, so a
+    table computed with earlier definitions raises (``torsion_table_is_current``
+    is what the analysis checks first).  Without the structure (atoms, bonds,
+    RDKit) the labels are classified by name.
+    """
+    metadata_path = os.path.join(embedding_dir, "torsion_metadata.json")
     try:
+        atoms_df = glypdbio.load_atoms(frame_data_dir)
+        bonds_df = glypdbio.load_bonds(frame_data_dir)
+        if bonds_df.is_empty():
+            raise ValueError("no bonds stored")
         if torsion_list is None:
-            atoms_df = glypdbio.load_atoms(frame_data_dir)
-            bonds_df = glypdbio.load_bonds(frame_data_dir)
             torsion_list = get_glycan_torsions_enhanced(atoms_df, bonds_df)
-        if torsion_list and len(torsion_list) == len(torsion_labels):
-            return _persist_torsion_annotation_files(frame_data_dir, embedding_dir, torsion_list, torsion_labels)
+        current_labels = _torsion_labels(torsion_list, atoms_df)
     except Exception as exc:
         logger.warning(f"Could not rebuild torsion metadata from structure; using label fallback ({exc})")
+        metadata = _fallback_torsion_metadata_from_labels(torsion_labels)
+        _write_json(metadata_path, metadata)
+        return metadata
 
-    metadata = _fallback_torsion_metadata_from_labels(torsion_labels)
-    _write_json(metadata_path, metadata)
+    if list(current_labels) != list(torsion_labels):
+        raise ValueError(
+            f"The torsion table in {embedding_dir} has other columns than the torsion definitions "
+            f"(version {TORSION_CONVENTIONS['version']}) give: it was computed with earlier definitions. "
+            "Compute the torsions again (--update)."
+        )
+    metadata = build_torsion_metadata(
+        torsion_list,
+        atoms_df=atoms_df,
+        original_names=list(torsion_labels),
+        bonds_df=bonds_df,
+    )
+    if _load_json_if_exists(metadata_path, None) != metadata:
+        _write_torsion_annotation_files(embedding_dir, metadata, torsion_list)
     return metadata
 
 
@@ -377,14 +434,17 @@ def _align_torsion_metadata_to_labels(torsion_labels: List[str], torsion_metadat
 def _level_summary_from_metadata(metadata: List[Dict]) -> Dict:
     family_summary = summarize_torsion_metadata(metadata)
     glycosidic = [entry for entry in metadata if entry.get("family") == "glycosidic"]
-    non_glycosidic = [entry for entry in metadata if entry.get("family") != "glycosidic"]
+    # The omega of a sulfate, phosphate, methyl or acetyl group on an
+    # exocyclic oxygen (6-O-sulfate ...): a block of its own, not glycosidic.
+    substituent = [entry for entry in metadata if entry.get("family") == "substituent"]
+    non_glycosidic = [entry for entry in metadata if entry.get("family") not in LINKAGE_FAMILIES]
     return {
         "metadata": metadata,
-        # The definitions of phi, psi and omega (omega is C4-C5-C6-O6, the IUPAC
-        # O5-C5-C6-O6 plus about 120 degrees).
-        "conventions": dict(TORSION_CONVENTIONS),
+        # The definitions of phi, psi and omega (IUPAC; the atoms of every case).
+        "conventions": copy.deepcopy(TORSION_CONVENTIONS),
         "name_mapping": {entry["original_name"]: entry["canonical_name"] for entry in metadata},
         "glycosidic": glycosidic,
+        "substituent": substituent,
         "non_glycosidic": non_glycosidic,
         "family_summary": family_summary,
         # Compatibility aliases for older consumers.
@@ -392,6 +452,7 @@ def _level_summary_from_metadata(metadata: List[Dict]) -> Dict:
         "glycosidic_summary": {
             "total_torsions": len(metadata),
             "glycosidic_torsions": len(glycosidic),
+            "substituent_torsions": len(substituent),
             "other_torsions": len(non_glycosidic),
             "phi_count": sum(1 for entry in glycosidic if entry.get("subtype") == "phi"),
             "psi_count": sum(1 for entry in glycosidic if entry.get("subtype") == "psi"),
@@ -1087,6 +1148,12 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     
     torsion_existing = _first_existing_path(torsion_parquet, torsion_csv)
     if torsion_existing and storage.exists(torparts_path) and not force:
+        if not torsion_table_is_current(frame_data_dir, embedding_dir):
+            logger.info(
+                "Torsion step: the stored table was computed with earlier torsion definitions "
+                f"(now version {TORSION_CONVENTIONS['version']}); computing it again"
+            )
+            return step_torsions(frame_data_dir, embedding_dir, force=True)
         logger.info("Torsion step: torsion table and torparts.npz exist; skipping (use --update to force)")
         # Attempt to recover labels by reading header
         try:
@@ -1114,12 +1181,8 @@ def step_torsions(frame_data_dir: str, embedding_dir: str, force: bool = False) 
     atom_names = atoms_df["name"].to_list() if "name" in atoms_df.columns else [f"{elements[i]}{i}" for i in range(len(elements))]
     res_ids = atoms_df["res_id"].to_list() if "res_id" in atoms_df.columns else [1] * len(elements)
     
-    labels = []
-    for torsion in torsion_list:
-        # Use atom_name_residue_number format (e.g., C1_2, O2_3, C3_3, C4_2)
-        torsion_name = "-".join(f"{atom_names[i]}_{res_ids[i]}" for i in torsion)
-        labels.append(torsion_name)
-    labels = _unique_column_names(labels)
+    # atom_name_residue_number format (e.g., C1_2, O2_3, C3_3, C4_2)
+    labels = _torsion_labels(torsion_list, atoms_df)
     
     if not torsion_list:
         logger.info("No rotatable torsions detected; writing frame-only torsions.parquet")
@@ -2505,6 +2568,11 @@ class GlycanAnalysisPipeline:
             try:
                 self.logger.info("Step 3: Torsion analysis")
                 step_started_at = time.perf_counter()
+                # A torsion table from earlier torsion definitions is computed
+                # again, and with it what is derived from it (steps 5, 6, 8, 9).
+                torsions_stale = not downstream_force and not torsion_table_is_current(
+                    paths['frame_data_dir'], paths['embedding_dir']
+                )
                 torsion_list, torsion_labels = step_torsions(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
@@ -2542,6 +2610,7 @@ class GlycanAnalysisPipeline:
             # added to existing outputs) invalidates what is indexed by its
             # clusters: statistics, info.json, structures, plots, exports.
             cluster_force = bool(downstream_force or clustering_context.get('computed'))
+            torsion_force = bool(cluster_force or torsions_stale)
 
             # Step 5: Cluster torsion statistics
             try:
@@ -2550,7 +2619,7 @@ class GlycanAnalysisPipeline:
                 step_cluster_torsion_stats(
                     paths['frame_data_dir'], 
                     paths['embedding_dir'], 
-                    force=cluster_force,
+                    force=torsion_force,
                     cr=clustering_context.get('cr'),
                     pca_df=clustering_context.get('pca_df'),
                 )
@@ -2570,7 +2639,7 @@ class GlycanAnalysisPipeline:
                 step_create_info_json(
                     paths['embedding_dir'], 
                     entropy, 
-                    force=cluster_force
+                    force=torsion_force
                 )
                 results['step_durations_sec']['create_info'] = round(time.perf_counter() - step_started_at, 3)
                 self.logger.info(f"Step 6 completed in {results['step_durations_sec']['create_info']:.3f}s")
@@ -2609,7 +2678,7 @@ class GlycanAnalysisPipeline:
                 step_plot_torsion_distributions(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
-                    force=cluster_force,
+                    force=torsion_force,
                     cr=clustering_context.get('cr'),
                 )
                 results['step_durations_sec']['plots'] = round(time.perf_counter() - step_started_at, 3)
@@ -2628,7 +2697,7 @@ class GlycanAnalysisPipeline:
                 step_export_analysis_data(
                     paths['embedding_dir'], 
                     paths['out_dir'], 
-                    force=cluster_force,
+                    force=torsion_force,
                     frame_data_dir=paths['frame_data_dir'],
                     cr=clustering_context.get('cr'),
                     pca_df=clustering_context.get('pca_df'),
@@ -2695,6 +2764,8 @@ class GlycanAnalysisPipeline:
         status['steps_status']['torsions'] = bool(
             _torsions_source_path(paths['embedding_dir'])
             and storage.exists(os.path.join(paths['embedding_dir'], 'torparts.npz'))
+            # computed with the current torsion definitions
+            and torsion_table_is_current(paths['frame_data_dir'], paths['embedding_dir'])
         )
         status['steps_status']['clustering'] = _has_complete_clustering_outputs(paths['embedding_dir'])
         status['steps_status']['cluster_stats'] = _has_complete_torsion_stats(paths['embedding_dir'])

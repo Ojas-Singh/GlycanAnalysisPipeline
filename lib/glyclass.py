@@ -342,8 +342,37 @@ def n_glycan(t: Tree) -> Optional[Dict]:
                 "antennae": n_ant,
                 "core_fuc6": bool(t.kids(t.root, "Fuc", "a1-6")),
                 "core_fuc3": bool(t.kids(t.root, "Fuc", "a1-3")),
+                "paucimannose": kind == "core" and _is_paucimannose(t, g2, bman),
             }
     return None
+
+
+def _is_paucimannose(t: Tree, g2: int, bman: int) -> bool:
+    """Man1-3GlcNAc2 with or without core fucose (and the beta-Man Xyl of plants): nothing else.
+
+    Of the thesis class "core and paucimannose" (nothing on the alpha-Man
+    arms), the glycans made only of the chitobiose, the beta-Man, up to two
+    alpha-Man arms, Fuc(a1-6) and Fuc(a1-3) on the root GlcNAc and Xyl(b1-2)
+    on the beta-Man, none of them substituted.  A bisecting GlcNAc, a Gal on
+    the core, a capped fucose or a methylated mannose make a core that is not
+    paucimannose.
+    """
+    plain = lambda i, name: t.r[i].name == name and not t.r[i].children   # noqa: E731
+    root = t.r[t.root]
+    for c in root.children:
+        if c != g2 and not (plain(c, "Fuc") and t.link(c) in ("a1-6", "a1-3")):
+            return False
+    if t.r[g2].name != "GlcNAc" or root.name != "GlcNAc" or t.r[g2].children != [bman]:
+        return False
+    if t.r[bman].name != "Man":
+        return False
+    for c in t.r[bman].children:
+        if plain(c, "Man") and t.r[c].anomer == "a":
+            continue
+        if plain(c, "Xyl") and t.link(c) == "b1-2":
+            continue
+        return False
+    return True
 
 
 GAG_BONDS = {
@@ -459,7 +488,7 @@ def residue_tree(wurcs: Optional[str] = None, iupac: Optional[str] = None) -> Tu
 
 
 CLASS_KEYWORDS = (
-    "N-Glycan", "Fucosylated N-Glycan", "Oligomannose", "Complex N-Glycan", "Hybrid N-Glycan",
+    "N-Glycan", "Fucosylated N-Glycan", "Oligomannose", "Paucimannose", "Complex N-Glycan", "Hybrid N-Glycan",
     "Biantennary N-Glycan", "Triantennary N-Glycan", "Tetraantennary N-Glycan", "O-Glycan", "GAG",
 )
 ANTENNAE_KEYWORD = {2: "Biantennary N-Glycan", 3: "Triantennary N-Glycan", 4: "Tetraantennary N-Glycan"}
@@ -484,6 +513,8 @@ def keywords_of_class(hit: Optional[Tuple[str, Dict]]) -> List[str]:
         keywords.add("Fucosylated N-Glycan")
     if detail["kind"] == "oligomannose":
         keywords.add("Oligomannose")
+    elif detail["kind"] == "core" and detail.get("paucimannose"):
+        keywords.add("Paucimannose")
     elif detail["kind"] == "hybrid":
         keywords.add("Hybrid N-Glycan")
     elif detail["kind"] == "complex":
