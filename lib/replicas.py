@@ -350,9 +350,15 @@ def tables_from_static(folder: PathLike) -> FrameTables:
     import polars as pl
 
     output = Path(folder) / "output"
-    pca = pl.read_csv(output / "pca.csv")
+    # Files are opened here and handed over: polars expands brackets in a path
+    # as a glob, and GLYCAM names of branched glycans have them.
+    with open(output / "pca.csv", "rb") as handle:
+        pca = pl.read_csv(handle)
     path = output / "torsion_glycosidic.csv"
-    tor = pl.read_csv(path, infer_schema_length=2000) if path.is_file() else None
+    tor = None
+    if path.is_file():
+        with open(path, "rb") as handle:
+            tor = pl.read_csv(handle, infer_schema_length=2000)
     info = json.loads((output / "info.json").read_text(encoding="utf-8"))
     return _tables(pca, tor, info)
 
@@ -363,9 +369,15 @@ def tables_from_process(process_dir: PathLike) -> FrameTables:
 
     process_dir = Path(process_dir)
     exports = process_dir / "embedding" / "exports"
-    pca = pl.read_parquet(exports / "pca.parquet")
+    # Opened here and handed over: a process folder is named by the GLYCAM
+    # name, and polars expands its brackets as a glob.
+    with open(exports / "pca.parquet", "rb") as handle:
+        pca = pl.read_parquet(handle)
     path = exports / "torsion_glycosidic.parquet"
-    tor = pl.read_parquet(path) if path.is_file() else None
+    tor = None
+    if path.is_file():
+        with open(path, "rb") as handle:
+            tor = pl.read_parquet(handle)
     info = json.loads((process_dir / "output" / "info.json").read_text(encoding="utf-8"))
     return _tables(pca, tor, info)
 

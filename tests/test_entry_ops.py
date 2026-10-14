@@ -443,6 +443,19 @@ def test_the_command_line_of_the_operations(world, monkeypatch, tmp_path, capsys
     assert json.loads(report.read_text())["refused"]
 
 
+def test_the_command_line_prints_and_reports_an_operation_that_moves_the_raw_entry(world, monkeypatch, tmp_path,
+                                                                                   capsys):
+    # Declaring the simulated anomer renames the entry, so its raw entry moves (report["raw"] describes the move).
+    report = tmp_path / "report.json"
+    status = _cli(world, monkeypatch, ["reanalyse", "--id", GS, "--simulated-anomer", "beta", "--note", "simulated as beta",
+                                       "--work-dir", str(tmp_path / "w"), "--dry-run", "--report", str(report)])
+    assert status == 0
+    written = json.loads(report.read_text())
+    assert written["raw"]["relation"] == "move" and written["glycam_name"] == BETA_NAME
+    out = capsys.readouterr().out
+    assert f"raw {written['raw']['from_key_prefix']} -> {written['raw']['to_key_prefix']}: move" in out
+
+
 # ---------------------------------------------------------------------------
 # On a real S3-compatible server (MinIO, moto; skipped without one)
 # ---------------------------------------------------------------------------

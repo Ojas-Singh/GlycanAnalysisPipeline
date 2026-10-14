@@ -223,7 +223,14 @@ def _print_plan(report: dict) -> None:
         database = report["database"]
         _say(f"database: {database['glycans']} glycans, global_hash {database['global_hash'][:16]}...")
     raw = report.get("raw")
-    if raw:
+    if raw and "to_key_prefix" in raw:
+        # The raw entry moves with a new name (entry_ops.describe_raw_move).
+        _say(f"raw {raw['from_key_prefix']} -> {raw['to_key_prefix']}: {raw['relation']}; "
+             f"copy {len(raw['copy'])} file(s) ({_megabytes(raw['copy_bytes'])}) inside the storage, "
+             f"upload {raw['upload'] or 'nothing'} ({_megabytes(raw['upload_bytes'])}); "
+             f"delete {len(raw['delete'])} old object(s) afterwards; index {raw['index']}; "
+             f"kept in history: {len(raw['history'])} object(s)")
+    elif raw:
         _say(f"raw {raw['key_prefix']}: {raw['relation']}; upload {raw['upload'] or 'nothing'} "
              f"({_megabytes(raw['upload_bytes'])}); index {raw['index']}"
              + (f"; kept in history: {len(raw['history'])} object(s)" if raw["history"] else ""))
