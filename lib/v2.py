@@ -414,7 +414,7 @@ def step_store(
     if (
         atoms_p.exists()
         and not force
-        and quality_manifest_is_current(out_p, threshold)
+        and quality_manifest_is_current(out_p, threshold, excluded=config.excluded_source_frames)
     ):
         manifest = _load_json_if_exists(str(out_p / "frame_filter.json"), {})
         logger.info(
@@ -455,6 +455,7 @@ def step_store(
             max_bond_distance=threshold,
             block_frames=config.frame_quality_block_frames,
             frame_chunk=config.store_frame_chunk,
+            excluded=config.excluded_source_frames,
         )
 
         if backup.exists():
