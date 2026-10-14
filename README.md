@@ -259,22 +259,39 @@ The torsions of an entry are in `output/torsion_all.csv` (every frame),
 `torsion_glycosidic.csv` and `torsion_level_*_reps.csv`, in degrees from -180
 to 180; `info.json` describes every column (`torsions.metadata`: the four
 atoms, their residues, the family and subtype) and states the definitions
-below (`torsions.conventions`). A glycosidic torsion is named
-`<donor residue>_<acceptor residue>_<phi|psi|omega>`.
+below with the four atoms of every case (`torsions.conventions`, version 2). A
+glycosidic torsion is named `<donor residue>_<acceptor residue>_<phi|psi|omega>`.
+
+The definitions are those of the IUPAC-IUB recommendations (1981; Eur. J.
+Biochem. 131, 5–7, 1983), with heavy atoms only, for every linkage; primed
+atoms belong to the donor, x is the acceptor position:
 
 | Torsion | Atoms |
 |---|---|
-| φ | ring oxygen, anomeric carbon, glycosidic oxygen, acceptor carbon: O5–C1–O–Cx (pyranose donor), O4–C1–O–Cx (aldofuranose), O5–C2–O–Cx (ketofuranose), O6–C2–O–Cx (sialic acid) |
-| ψ | C1–O–Cx–A (C2–O–Cx–A for C2 donors): A is the ring oxygen when Cx is an anomeric carbon, otherwise C(x−1) or C(x+1), whichever the bond table lists first, so check the atoms in the metadata before comparing the ψ of two linkages |
-| ω | **C4–C5–C6–O6** of the acceptor of a 1–6 linkage (C6–C7–C8–O8 of a sialic acid in a 2–8 linkage) |
+| φ | O5′–C1′–Ox–Cx; O4′–C1′ for an aldofuranose donor (Araf, Galf), O6′–C2′ for a 2-ketopyranose (sialic acids, Kdn, Kdo), O5′–C2′ for a 2-ketofuranose (Fruf) |
+| ψ | C1′–Ox–Cx–**C(x−1)** (C2′ for 2-ketose donors): C1′–O4–C4–C3 for 1–4, C2′–O3–C3–C2 for Neu5Ac α2–3. Where the acceptor has no C(x−1): its ring oxygen for a 1–1 linkage to an aldose, C2 for a 2–1 linkage to the C1 of a ketose |
+| ω | **O5–C5–C6–O6** for a 1–6 linkage (the same angle as O6–C6–C5–O5); generally O–C(x−1)–Cx–Ox for an acceptor carbon outside the ring, with the ring oxygen when C(x−1) is in the ring: O4–C4–C5–O5 for 1–5 to Araf, O7–C7–C8–O8 for 2–8 and O8–C8–C9–O9 for 2–9 to a sialic acid, O5–C2–C1–O1 for 2–1 to Fruf |
 
-The stored ω is not the O5–C5–C6–O6 of the IUPAC recommendation. In a
-D-hexopyranose C4 lies about 120° from O5 about the C5–C6 bond, so the stored
-value is the IUPAC ω plus about 120°: the rotamers gg, gt and tg (−60°, +60°
-and 180° with O5–C5–C6–O6) are near **+60°, 180° and −60°** on the stored
-scale. The values are kept on this scale because the website and other tools
-read them. A free C6 hydroxyl (no glycosidic linkage) is a residue-local
-torsion, stored as O5–C5–C6–O6.
+On this scale the rotamers of a 1–6 linkage to a D-hexopyranose are gg −60°,
+gt +60° and tg 180°, and a free C6 hydroxyl (a residue-local torsion, also
+O5–C5–C6–O6) is on the same scale.
+
+The omega of a group that is not a sugar on such an exocyclic carbon (a
+6-O-sulfate, phosphocholine, a 9-O-acetyl or 9-O-methyl sialic acid) has the
+atoms of a glycosidic ω but is a **substituent** torsion: family
+`substituent`, listed in `torsions.substituent` (not in `torsions.glycosidic`,
+`torsion_glycosidic.csv` or the distribution plots), named
+`<substituent residue>_<sugar residue>_omega`, and still a column of
+`torsion_all.csv`.
+
+**Definitions version 1** (entries analysed before October 2026): ψ took
+C(x−1) or C(x+1), whichever the bond table listed first (C(x+1) for 2,716 ψ of
+C1 donors and 264 of C2 donors), ω was C4–C5–C6–O6 (C6–C7–C8–O8 for 2–8),
+which is the IUPAC ω plus about 120° (gg, gt, tg near +60°, 180°, −60°), and
+the ω of 6-O-sulfates was listed as glycosidic. A process folder whose torsion
+table has other columns than the current definitions give is taken as
+unfinished, and its torsions and what is derived from them are computed again
+(`v2.torsion_table_is_current`).
 
 ## Staged Oracle/Slurm workflow
 
