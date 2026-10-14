@@ -21,6 +21,11 @@ REFERENCE = json.loads((Path(__file__).parent / "fixtures" / "glycan_classes_ref
 ENTRIES = {e["id"]: e for e in REFERENCE["entries"]}
 # IUPAC fields of the inventory that are not IUPAC-condensed names (problem list, section 1)
 BROKEN_IUPAC = {"GS00430", "GS00728", "GS00954"}
+# Of the thesis class "core and paucimannose" (31 entries), those made of Man1-3GlcNAc2 with or without
+# core Fuc (and the beta-Man Xyl of plants) and nothing else, checked by hand. The others carry a
+# bisecting GlcNAc, a Gal on the core or on the fucose, a methylated Man, or Fuc on the second GlcNAc.
+PAUCIMANNOSE = {"GS00085", "GS00090", "GS00190", "GS00220", "GS00268", "GS00387", "GS00388", "GS00410",
+                "GS00698", "GS00727", "GS00892"}
 
 
 def expected_keywords(entry: dict) -> list:
@@ -35,6 +40,8 @@ def expected_keywords(entry: dict) -> list:
     if entry["core_fucose"]:
         out.add("Fucosylated N-Glycan")
     out |= {"oligomannose": {"Oligomannose"}, "hybrid": {"Hybrid N-Glycan"}}.get(entry["subclass"], set())
+    if entry["subclass"] == "core and paucimannose" and entry["id"] in PAUCIMANNOSE:
+        out.add("Paucimannose")
     if entry["subclass"] == "complex":
         out.add("Complex N-Glycan")
         out |= {2: {"Biantennary N-Glycan"}, 3: {"Triantennary N-Glycan"}, 4: {"Tetraantennary N-Glycan"}}.get(
@@ -98,10 +105,27 @@ def test_antennae_are_counted_on_both_arms(processor):
     assert processor.get_glycan_keywords(iupac) == ["Complex N-Glycan", "N-Glycan", "Triantennary N-Glycan"]
 
 
-def test_trimannosyl_core_is_not_oligomannose(processor):
-    assert processor.get_glycan_keywords("Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc") == ["N-Glycan"]
+def test_trimannosyl_core_is_paucimannose_not_oligomannose(processor):
+    assert processor.get_glycan_keywords("Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc") == [
+        "N-Glycan", "Paucimannose"]
     assert processor.get_glycan_keywords(
         "Man(a1-2)Man(a1-3)[Man(a1-3)[Man(a1-6)]Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc") == ["N-Glycan", "Oligomannose"]
+
+
+@pytest.mark.parametrize("iupac,keywords", [
+    ("Man(b1-4)GlcNAc(b1-4)GlcNAc", ["N-Glycan", "Paucimannose"]),                                  # Man1 (GS00085)
+    ("Man(a1-6)Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc", ["Fucosylated N-Glycan", "N-Glycan", "Paucimannose"]),
+    ("Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc",                                  # M3F (GS00268)
+     ["Fucosylated N-Glycan", "N-Glycan", "Paucimannose"]),
+    ("Xyl(b1-2)[Man(a1-3)][Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Fuc(a1-3)]GlcNAc",                        # MMXF3 (GS00190)
+     ["Fucosylated N-Glycan", "N-Glycan", "Paucimannose"]),
+    ("Man(a1-3)[GlcNAc(b1-4)][Man(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc", ["N-Glycan"]),               # bisected (GS00965)
+    ("Man3Me(a1-3)[Man3Me(a1-6)]Man(b1-4)GlcNAc(b1-4)GlcNAc", ["N-Glycan"]),                       # methylated (GS00212)
+    ("Man(a1-3)[Man(a1-6)]Man(b1-4)GlcNAc(b1-4)[Gal(b1-4)Fuc(a1-6)]GlcNAc",                         # Gal on Fuc (GS00926)
+     ["Fucosylated N-Glycan", "N-Glycan"]),
+])
+def test_paucimannose(processor, iupac, keywords):
+    assert processor.get_glycan_keywords(iupac) == keywords
 
 
 @pytest.mark.parametrize("iupac,keywords", [
@@ -157,6 +181,7 @@ def test_class_counts_of_the_collection():
     for entry in REFERENCE["entries"]:
         counts.update(glyclass.class_keywords(wurcs=entry["wurcs"], iupac=entry["iupac"])[0])
     assert (counts["N-Glycan"], counts["O-Glycan"], counts["GAG"]) == (324, 99, 79)
+    assert (counts["Paucimannose"], counts["Oligomannose"]) == (11, 36)
     # the counts of the string patterns these rules replace
     published = Counter(k for e in REFERENCE["entries"] for k in e["published_keywords"])
     assert (published["N-Glycan"], published["O-Glycan"], published["GAG"]) == (290, 66, 85)
