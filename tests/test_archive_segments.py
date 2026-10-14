@@ -827,3 +827,81 @@ def test_a_merge_is_refused_when_the_atoms_or_bonds_differ_and_says_what_differs
     with pytest.raises(archive.VerificationError, match="the absorbed entry does not verify"):
         segs.merge_entries(kept, other, tmp_path / "merged")
     assert files_of(kept) == before and not (tmp_path / "merged").exists()
+
+
+# ---------------------------------------------------------------------------
+# Pruning runs of a stored entry
+# ---------------------------------------------------------------------------
+def runs_of_entry(entry):
+    from dataclasses import asdict
+
+    from lib import replicas
+
+    return [asdict(run) for run in replicas.replica_boundaries(archive.load_manifest(entry)).replicas]
+
+
+def test_a_pruned_entry_keeps_the_frames_of_the_other_runs_under_their_names(tmp_path):
+    coords = random_coords(30, ATOMS, seed=50)
+    entry = stored_entry(tmp_path / "stored", KEPT, coords, header=CELLS[2], model=runs_by_model_numbers(10))
+    before = files_of(entry)
+    runs = runs_of_entry(entry)
+    assert [(run["name"], run["first_frame"], run["frames"], run["basis"]) for run in runs] == [
+        ("run_1", 0, 10, "recorded"), ("run_2", 10, 10, "recorded"), ("run_3", 20, 10, "recorded")]
+    record = {"glycoshape_id": "GS00276", "note": "run 2 has an inverted stereocentre", "author": "curator",
+              "pruned_at": "2026-10-14T00:00:00Z"}
+    result = segs.prune_entry(entry, tmp_path / "pruned", runs, ["run_2"], record=record)
+    pruned, manifest = Path(result["entry"]), result["manifest"]
+    assert result["status"] == "pruned" and pruned.name == KEPT and files_of(entry) == before   # only read
+
+    # the frames of run_1 and run_3, step and time renumbered, nothing else changed
+    assert manifest["frames"] == 20
+    frames = archive.ArchiveEntry(pruned).read_frames(unit="milliangstrom")
+    assert np.array_equal(frames, np.concatenate([coords[:10], coords[20:]]))
+    back = archive._read_back(pruned, ATOMS)
+    assert back["frames"] == 20 and back["index_ok"]
+    report = archive.verify_entry(pruned)
+    assert report["ok"] and report["segments_checked"] == 2
+    for name in ("topology.pdb", "structure.mol2", "info.json"):
+        assert (pruned / name).read_bytes() == before[name]
+
+    # every kept run is a segment of its name: the replica diagnostics name the runs as before
+    assert [(s["name"], s["first_frame"], s["frames"]) for s in manifest["segments"]] == [("run_1", 0, 10), ("run_3", 10, 10)]
+    assert [run["name"] for run in runs_of_entry(pruned)] == ["run_1", "run_3"]
+    sha256 = hashlib.sha256(before["manifest.json"]).hexdigest()
+    third = manifest["segments"][1]
+    assert third["pruned_from"]["manifest_sha256"] == sha256 and third["pruned_from"]["first_frame"] == 20
+    assert third["coordinates_sha256"] == hashlib.sha256(coords[20:].astype("<i4").tobytes()).hexdigest()
+    assert manifest["box"]["kind"] == "constant"
+    record_in = manifest["pruned"]
+    assert (record_in["manifest_sha256"], record_in["frames_before"], record_in["note"]) == (sha256, 30, record["note"])
+    assert record_in["removed"] == [{"name": "run_2", "first_frame": 10, "frames": 10, "basis": "recorded"}]
+    assert [(row["name"], row["first_frame"], row["first_frame_after"]) for row in record_in["kept"]] == [
+        ("run_1", 0, 0), ("run_3", 20, 10)]
+    assert "extends" not in manifest and manifest["source"]["sha256"] == archive.load_manifest(entry)["source"]["sha256"]
+
+    # once more: the same prune is there; refusals
+    assert segs.prune_entry(entry, tmp_path / "pruned", runs, ["run_2"], record=record)["status"] == "skipped"
+    with pytest.raises(archive.SourceError, match="no run named 'run_9'; the runs of the entry are run_1, run_2, run_3"):
+        segs.prune_entry(entry, tmp_path / "other", runs, ["run_9"])
+    with pytest.raises(archive.SourceError, match="every run of the entry would be removed"):
+        segs.prune_entry(entry, tmp_path / "other", runs, ["run_1", "run_2", "run_3"])
+    with pytest.raises(archive.SourceError, match="the archive directory must be outside"):
+        segs.prune_entry(entry, entry / "inside", runs, ["run_2"])
+    assert not (tmp_path / "other").exists()
+
+
+def test_pruning_an_entry_of_segments_keeps_the_records_of_the_whole_segments(tmp_path):
+    coords = random_coords(60, ATOMS, seed=51)
+    entry = Path(segs.convert_segments(run_of(tmp_path / "run", coords, [0, 25, 40, 60]), tmp_path / "archive",
+                                       NAME)["entry"])
+    old = archive.load_manifest(entry)["segments"]
+    manifest = segs.prune_entry(entry, tmp_path / "pruned", runs_of_entry(entry), ["replica_1"])["manifest"]
+    assert [(s["name"], s["first_frame"], s["frames"]) for s in manifest["segments"]] == [("replica_2", 0, 15),
+                                                                                         ("replica_3", 15, 20)]
+    for segment, before in zip(manifest["segments"], old[1:]):
+        assert {key: value for key, value in segment.items() if key not in ("index", "first_frame", "trajectory_offset")} \
+            == {key: value for key, value in before.items() if key not in ("index", "first_frame", "trajectory_offset")}
+    assert [cell["first_frame"] for cell in manifest["box"]["cells"]] == [0, 15]
+    entry_after = tmp_path / "pruned" / NAME
+    assert archive.verify_entry(entry_after)["ok"]
+    assert np.array_equal(archive.ArchiveEntry(entry_after).read_frames(unit="milliangstrom"), coords[25:])

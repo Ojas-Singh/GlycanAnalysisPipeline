@@ -225,3 +225,14 @@ have the same). Aldoses are flipped exactly as before.
   copy: every pair has one archetype WURCS and accession, beta kept and alpha dropped, both raw entries; the reports
   will list other salt for GS00355, GS00358 and GS00359 (150 and 200 mM) and for GS00455/GS00578 also the package
   (AMBER and GROMACS) and the time per frame.
+* Runs with an inverted stereocentre (audit issues `run-topology-mismatch`, `stereo-differs-between-runs`):
+  `publish_entry.py prune-runs --id GS00276 --run run_2 --run run_3 --note "..." --work-dir ... --dry-run`, then with
+  `--expect-hash`; GS00180 and GS00250 with `--run run_3`. Their raw entries are one `simulation.pdb` of 30,003
+  frames whose runs are the class test's division (run_2 = frames 10001-20001, run_3 = 20002-30002): the trajectory is
+  cut, the kept runs keep their names, the entry before goes to `raw-history/`, and the rest is analysed and published
+  (length 0.5 or 1.0 us). Checked on a copy of GS00276: 30,003 -> 10,001 frames, `run_1`, verified.
+* Personal data in a raw entry (audit issue `personal-data-in-raw`, GS00954): `publish_entry.py scrub-raw --id GS00954
+  --field email --field username --note "..." --work-dir ... --dry-run`, then `--expect-hash <scrub.plan_hash>`. Read
+  `scrub.remains` before approving: on a copy of GS00954 the only occurrences left are the username as the first name
+  in the citation REMARK of the published PDB files (not personal data of the submitter). Delete the local copies
+  (`~/gap-work/archive`, Iridis `data/`) and check the bucket's versioning yourself: the code reaches neither.

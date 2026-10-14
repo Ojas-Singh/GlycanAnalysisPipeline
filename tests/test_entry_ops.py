@@ -944,6 +944,232 @@ def test_the_command_line_of_a_drop(anomers, monkeypatch, tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# prune-runs
+# ---------------------------------------------------------------------------
+def prune(world, runs, **options):
+    options.setdefault("log", quiet)
+    options.setdefault("workers", 2)
+    options.setdefault("note", "run 2 has an inverted stereocentre")
+    return entry_ops.prune_runs(GS, runs, world.target, world.tmp / options.pop("work", "work"), **options)
+
+
+def test_a_dry_run_of_a_prune_reports_the_cut_and_writes_nothing(world, made_bundle):
+    names = segment_names(made_bundle)
+    before = stored_tree(world.backend, "")
+    report = prune(world, [names[1]], dry_run=True, author="curator")
+    assert report["ok"], report["refused"]
+    assert world.writes() == [] and stored_tree(world.backend, "") == before
+    assert report["operation"] == "prune-runs" and report["status"] == "planned"
+    prune_block = report["prune"]
+    assert prune_block["removed"] == [{"name": names[1], "first_frame": 200, "frames": 130, "basis": "recorded"}]
+    assert [(row["name"], row["first_frame"], row["first_frame_after"]) for row in prune_block["kept"]] == [
+        (names[0], 0, 0), (names[2], 330, 200)]
+    assert prune_block["frames"] == {"before": 480, "removed": 130, "after": 350}
+    assert prune_block["names_after"] == [names[0], names[2]] and prune_block["names_unchanged"]
+    assert prune_block["length_us"]["after"] == round(2.5 * 350 / 480, 9)
+    assert report["memory"]["frames"] == 350 and len(report["entry"]["hash"]) == 64
+    assert report["diff"]["simulation"]["length"]["after"] == round(2.5 * 350 / 480, 9)
+    # the raw entry is replaced, every file of the entry before kept in the history
+    old_sha256 = hashlib.sha256(world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json")).hexdigest()
+    assert report["raw"]["relation"] == "overwrite" and "trajectory.xtc" in report["raw"]["upload"]
+    assert sorted(report["raw"]["history"]) == sorted(f"raw-history/raw/{GLYCAM_NAME}/{old_sha256}/{key.rsplit('/', 1)[1]}"
+                                                      for key in world.keys(f"raw/{GLYCAM_NAME}/"))
+    assert prune_block["history_prefix"] == f"raw-history/raw/{GLYCAM_NAME}/{old_sha256}/"
+
+
+def test_a_prune_cuts_the_runs_out_of_the_raw_entry_and_publishes_the_rest(world, made_bundle):
+    names = segment_names(made_bundle)
+    old_manifest = world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json")
+    old_sha256 = hashlib.sha256(old_manifest).hexdigest()
+    old_raw = {key: world.backend.read_binary(key) for key in world.keys(f"raw/{GLYCAM_NAME}/")}
+    dry = prune(world, [names[1]], dry_run=True, author="curator")
+    report = prune(world, [names[1]], expect_hash=dry["entry"]["hash"], author="curator")
+    assert report["status"] == "published" and report["entry"]["hash"] == dry["entry"]["hash"]
+
+    # the raw entry without the run, its runs named as before; the entry before in the history
+    manifest = json.loads(world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))
+    assert manifest["frames"] == 350 and [s["name"] for s in manifest["segments"]] == [names[0], names[2]]
+    assert manifest["pruned"]["manifest_sha256"] == old_sha256 and manifest["pruned"]["author"] == "curator"
+    assert manifest["pruned"]["note"] == "run 2 has an inverted stereocentre"
+    for key, content in old_raw.items():
+        assert world.backend.read_binary(f"raw-history/raw/{GLYCAM_NAME}/{old_sha256}/{key.rsplit('/', 1)[1]}") == content
+    record = json.loads(world.backend.read_binary(f"raw-history/raw/{GLYCAM_NAME}/{old_sha256}/pruned.json"))
+    assert (record["schema"], record["runs"], record["glycoshape_id"]) == ("glycoshape-raw-prune", [names[1]], GS)
+    assert record["removed"][0]["first_frame"] == 200 and record["manifest_sha256_after"] == hashlib.sha256(
+        world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json")).hexdigest()
+    index = {item["glycam_name"]: item for item in json.loads(world.backend.read_binary("raw/index.json"))["records"]}
+    assert index[GLYCAM_NAME]["frames"] == 350
+    from lib import archive_transfer
+
+    archive_transfer.download_entry(world.backend, "raw", GLYCAM_NAME, world.tmp / "check")
+    entry = world.tmp / "check" / GLYCAM_NAME
+    assert archive.verify_entry(entry)["ok"]
+    # the published version is the analysis of the frames that are left
+    assert world.reader.try_sync() is None
+    assert world.data()["archetype"]["length"] == round(2.5 * 350 / 480, 9)
+    pca = (world.reader.folder / GS / "output" / "pca.csv").read_text().splitlines()
+    assert max(int(line.split(",")[4]) for line in pca[1:]) < 350
+    version = versions(world)[-1]
+    assert version["operation"] == "prune-runs" and version["prune"]["runs"] == [names[1]]
+    assert version["raw_manifest_sha256"] == record["manifest_sha256_after"]
+
+    # again: nothing left
+    world.client.calls.clear()
+    again = prune(world, [names[1]], expect_hash=dry["entry"]["hash"])
+    assert again["status"] == "already-pruned"
+    assert {call[2] for call in world.writes()} <= {f"{STATE}/lock.json"} | {
+        call[2] for call in world.writes() if call[2].startswith(f"{STATE}/probe-")}
+
+
+def test_an_interrupted_prune_is_continued_and_bad_prunes_are_refused(world, made_bundle):
+    names = segment_names(made_bundle)
+    report = prune(world, ["run_9"], dry_run=True)
+    assert report["refused"] == [f"the runs of {GS} cannot be pruned: no run named 'run_9'; the runs of the entry "
+                                 f"are {', '.join(names)}"]
+    report = prune(world, names, work="w2", dry_run=True)
+    assert "every run of the entry would be removed" in report["refused"][0]
+    assert entry_ops.prune_runs("GS09999", ["run_1"], world.target, world.tmp / "w3", dry_run=True,
+                                log=quiet)["refused"] == ["GS09999 is not published"]
+    assert world.writes() == []
+
+    stops = {"raw:manifest": 1}
+
+    def checkpoint(name):
+        if stops.get(name):
+            stops[name] -= 1
+            raise RuntimeError(f"stopped at {name}")
+
+    with pytest.raises(entry_publish.PublishEntryError):        # the raw entry is replaced, the folder is not yet
+        prune(world, [names[2]], work="w4", checkpoint=checkpoint)
+    assert json.loads(world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))["frames"] == 330
+    assert [item["action"] for item in versions(world)] == ["publish"]
+    report = prune(world, [names[2]], work="w5")                # another work folder: the stored entry is taken
+    assert report["status"] == "published" and report["raw"]["relation"] == "same"
+    assert [item["action"] for item in versions(world)] == ["publish", "prune-runs"]
+    assert world.reader.try_sync() is None and world.data()["archetype"]["length"] == round(2.5 * 330 / 480, 9)
+
+
+# ---------------------------------------------------------------------------
+# scrub-raw
+# ---------------------------------------------------------------------------
+EMAIL, USERNAME = "someone.submitter@example.org", "jdoe-submitter"
+
+
+def with_personal_data(world):
+    """The raw entry of GS01067 with email and username in info.json, a copy in its history and in a document."""
+    key = f"raw/{GLYCAM_NAME}/info.json"
+    info = json.loads(world.backend.read_binary(key))
+    info.update(email=EMAIL, username=USERNAME, comments=f"submitted by {USERNAME}", contact=EMAIL)
+    payload = (json.dumps(info, indent=4) + "\n").encode()
+    world.backend.write_binary(key, payload)
+    manifest = json.loads(world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))
+    manifest["files"]["info.json"] = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+    world.backend.write_binary(f"raw/{GLYCAM_NAME}/manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
+    world.backend.write_binary(f"raw-history/raw/{GLYCAM_NAME}/{'0' * 64}/info.json", payload)
+    history = world.keys(f"{STATE}/history/{GS}/")[0]
+    document = json.loads(world.backend.read_binary(history))
+    document["submitter"] = {"email": EMAIL, "username": USERNAME}
+    world.backend.write_binary(history, (json.dumps(document, indent=2) + "\n").encode())
+    return history
+
+
+def scrub(world, **options):
+    options.setdefault("log", quiet)
+    options.setdefault("note", "personal data in the raw entry")
+    return entry_ops.scrub_raw(GS, ["email", "username"], world.target, world.tmp / options.pop("work", "work"), **options)
+
+
+def objects_holding(world, value):
+    return sorted(key for key in world.keys() if value.encode() in world.backend.read_binary(key))
+
+
+def test_a_scrub_removes_the_fields_from_the_raw_entry_its_history_and_the_documents(world):
+    history = with_personal_data(world)
+    world.client.calls.clear()
+    dry = scrub(world, dry_run=True, author="curator")
+    assert dry["ok"], dry["refused"]
+    assert world.writes() == [] and dry["status"] == "planned"
+    scrub_block = dry["scrub"]
+    assert [(row["key"], row["removed"], row["replaced"]) for row in scrub_block["raw"]] == [
+        (f"raw/{GLYCAM_NAME}/info.json", ["email", "username"], ["contact"])]
+    assert [row["key"] for row in scrub_block["history"]] == [f"raw-history/raw/{GLYCAM_NAME}/{'0' * 64}/info.json"]
+    assert [(row["key"], row["removed"]) for row in scrub_block["state"]] == [
+        (history, ["submitter.email", "submitter.username"])]
+    assert scrub_block["values_found"] == {"email": 1, "username": 1} and scrub_block["static"]["certain"] == []
+    assert scrub_block["static"]["files_scanned"] > 20
+    # what remains: what the code cannot reach, and the username inside a text, shown masked
+    assert scrub_block["remains"][:3] == list(entry_ops.SCRUB_REMAINS)
+    assert any("username occurs 1 time(s) as text in raw/" in line and "(\"comments\": \"submitted by <username>\"" in line
+               for line in scrub_block["remains"])
+    # the values are nowhere in the report or in the work folder
+    assert EMAIL not in json.dumps(dry) and USERNAME not in json.dumps(dry)
+    assert not [path for path in (world.tmp / "work").rglob("*") if path.is_file()
+                and (EMAIL.encode() in path.read_bytes() or USERNAME.encode() in path.read_bytes())]
+
+    report = scrub(world, expect_hash=scrub_block["plan_hash"], author="curator")
+    assert report["status"] == "scrubbed"
+    assert objects_holding(world, EMAIL) == []
+    assert objects_holding(world, USERNAME) == [                                     # inside the comment, reported
+        f"raw-history/raw/{GLYCAM_NAME}/{'0' * 64}/info.json", f"raw/{GLYCAM_NAME}/info.json"]
+    assert all("<username>" in line for line in report["scrub"]["remains"] if "username occurs" in line)
+    info = json.loads(world.backend.read_binary(f"raw/{GLYCAM_NAME}/info.json"))
+    assert "email" not in info and "username" not in info and info["contact"] == "[removed]"
+    manifest = json.loads(world.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))
+    record = manifest["scrubbed"][-1]
+    assert record["fields"] == ["email", "username"] and record["author"] == "curator"
+    from lib import archive_transfer
+
+    archive_transfer.download_entry(world.backend, "raw", GLYCAM_NAME, world.tmp / "check")
+    assert archive.verify_entry(world.tmp / "check" / GLYCAM_NAME)["ok"]
+    old = f"raw-history/raw/{GLYCAM_NAME}/{record['manifest_sha256_before']}/"
+    assert json.loads(world.backend.read_binary(old + "scrubbed.json"))["fields"] == ["email", "username"]
+    assert world.backend.head(old + "manifest.json") is not None
+    index = {item["glycam_name"]: item for item in json.loads(world.backend.read_binary("raw/index.json"))["records"]}
+    assert index[GLYCAM_NAME]["files"]["info.json"]["sha256"] == manifest["files"]["info.json"]["sha256"]
+
+    world.client.calls.clear()
+    again = scrub(world)
+    assert again["status"] == "already-scrubbed"
+    assert {call[2] for call in world.writes()} <= {f"{STATE}/lock.json"} | {
+        call[2] for call in world.writes() if call[2].startswith(f"{STATE}/probe-")}
+
+
+def test_a_scrub_is_refused_when_the_published_folder_holds_a_value(world):
+    with_personal_data(world)
+    world.update(changes_record(curated={"common_names": [EMAIL]}))
+    report = scrub(world, dry_run=True)
+    assert not report["ok"] and sorted(reason.split(" (")[0] for reason in report["refused"]) == [
+        f"the published folder holds email, username in static/{GS}/{GS}.zip:data.json",
+        f"the published folder holds email, username in static/{GS}/data.json"]
+    assert EMAIL not in json.dumps(report)
+    with pytest.raises(Refused):
+        scrub(world, work="w2")
+    assert world.keys(f"raw-history/raw/{GLYCAM_NAME}/") == [f"raw-history/raw/{GLYCAM_NAME}/{'0' * 64}/info.json"]
+
+
+def test_the_command_lines_of_prune_and_scrub(world, made_bundle, monkeypatch, tmp_path, capsys):
+    names = segment_names(made_bundle)
+    report = tmp_path / "r.json"
+    common = ["prune-runs", "--id", GS, "--run", names[1], "--note", "stereo", "--analysis-workers", "2",
+              "--work-dir", str(tmp_path / "w"), "--report", str(report)]
+    assert _cli(world, monkeypatch, common + ["--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert f"prune: remove {names[1]} (frames 200-329); 480 -> 350 frames; runs after: {names[0]}, {names[2]}" in out
+    assert _cli(world, monkeypatch, common + ["--expect-hash", json.loads(report.read_text())["entry"]["hash"]]) == 0
+    assert f"prune-runs: published {GS}" in capsys.readouterr().out
+    with_personal_data(world)
+    common = ["scrub-raw", "--id", GS, "--field", "email", "--field", "username", "--note", "personal data",
+              "--work-dir", str(tmp_path / "s"), "--report", str(report)]
+    assert _cli(world, monkeypatch, common + ["--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert f"scrub email, username of {GS}: values found" in out and "  remains: " in out and EMAIL not in out
+    plan = json.loads(report.read_text())["scrub"]["plan_hash"]
+    assert _cli(world, monkeypatch, common + ["--expect-hash", "0" * 64]) == 2
+    assert _cli(world, monkeypatch, common + ["--expect-hash", plan]) == 0
+    assert f"scrub-raw: scrubbed {GS}" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # The command line
 # ---------------------------------------------------------------------------
 def _cli(world, monkeypatch, argv):
@@ -1041,4 +1267,40 @@ def test_a_merge_on_a_real_server(s3_bucket, made_bundle, tmp_path, monkeypatch)
     assert reader.try_sync() is None and OTHER_GS not in reader.glycans()
     assert json.loads((reader.folder / GS / "data.json").read_text())["archetype"]["length"] == 5.0
     assert entry_ops.merge(GS, OTHER_GS, target, tmp_path / "w3", workers=2, log=quiet)["status"] == "already-merged"
+    assert [item["key"] for item in backend.list_objects("publish-state/static/lock")] == []
+
+
+def test_prune_and_scrub_on_a_real_server(s3_bucket, made_bundle, tmp_path, monkeypatch):
+    backend, client, bucket = s3_bucket
+    fake_services.install(monkeypatch)
+    publish_world.build(tmp_path / "published", backend, raw_source=publish_world.other_archive(tmp_path / "stored"))
+    target = Target(static=backend, raw=backend, workers=4)
+    assert entry_publish.publish_entry("publish", made_bundle, submission_record(GS, GLYCAM_NAME), target,
+                                       work_dir=tmp_path / "w1", log=quiet)["status"] == "published"
+    names = segment_names(made_bundle)
+    old = backend.head(f"raw/{GLYCAM_NAME}/trajectory.xtc")
+    old_sha256 = hashlib.sha256(backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json")).hexdigest()
+    options = dict(note="stereo", workers=2, log=quiet)
+    dry = entry_ops.prune_runs(GS, [names[2]], target, tmp_path / "w2", dry_run=True, **options)
+    report = entry_ops.prune_runs(GS, [names[2]], target, tmp_path / "w2", expect_hash=dry["entry"]["hash"], **options)
+    assert report["status"] == "published"
+    kept = backend.head(f"raw-history/raw/{GLYCAM_NAME}/{old_sha256}/trajectory.xtc")
+    assert (kept["size"], kept["sha256"]) == (old["size"], old["sha256"])          # copied inside the storage
+    assert json.loads(backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))["frames"] == 330
+    reader = Reader(backend, tmp_path / "website")
+    assert reader.try_sync() is None
+
+    world = type("World", (), {})()                             # with_personal_data needs backend and keys
+    world.backend = backend
+    world.keys = lambda prefix="": sorted(item["key"] for item in backend.list_objects(prefix))
+    with_personal_data(world)
+    dry = entry_ops.scrub_raw(GS, ["email", "username"], target, tmp_path / "w3", note="data", dry_run=True, log=quiet)
+    report = entry_ops.scrub_raw(GS, ["email", "username"], target, tmp_path / "w3", note="data",
+                                 expect_hash=dry["scrub"]["plan_hash"], log=quiet)
+    assert report["status"] == "scrubbed"
+    assert not [key for key in world.keys() if EMAIL.encode() in backend.read_binary(key)]
+    from lib import archive_transfer
+
+    archive_transfer.download_entry(backend, "raw", GLYCAM_NAME, tmp_path / "check")
+    assert archive.verify_entry(tmp_path / "check" / GLYCAM_NAME)["ok"]
     assert [item["key"] for item in backend.list_objects("publish-state/static/lock")] == []
