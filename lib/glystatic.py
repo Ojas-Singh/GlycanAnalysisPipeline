@@ -217,6 +217,30 @@ def _simulation_length_us(metadata: dict, glycam_name: str, storage) -> float | 
     return metadata.get("length")
 
 
+def _inventory_cell(value):
+    """A cell of the inventory CSV: None when it is empty (NaN as pandas reads it), a string stripped."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
+
+
+def _inventory_glytoucan(value) -> str:
+    """The GlyTouCan accession of an inventory row; "" when the cell gives none (empty, or TODO)."""
+    value = _inventory_cell(value)
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.upper() in ("TODO", "NAN", "NONE", "NULL") else text
+
+
 def _get_metadata_from_csv(glycam_name: str) -> dict:
     """Get glycan metadata from the inventory CSV file (fallback).
 
@@ -267,22 +291,27 @@ def _get_metadata_from_csv(glycam_name: str) -> dict:
         
         # Get the first matching row
         row = matching_rows.iloc[0]
-        
-        # Extract metadata
+
+        # Extract metadata.  An empty cell is None (pandas reads it as NaN,
+        # which became the accession "NaN"); the e-mail column is no longer
+        # in the published inventory and is read only where a file has it.
+        def cell(column):
+            return _inventory_cell(row.get(column))
+
         metadata = {
-            "ID": row['ID'],
-            "timestamp": row['Timestamp'],
-            "email": row['Email address'],
+            "ID": cell('ID'),
+            "timestamp": cell('Timestamp'),
+            "email": cell('Email address'),
             "glycam_name": row[glycam_col],
-            "transfer_method": row['How will the data be transferred?'],
-            "length": row['What is the aggregated length of the simulations?'],
-            "package": row['What MD package was used for the simulations?'],
-            "forcefield": row['What force field was used for the simulations?'],
-            "temperature": row['What temperature target was used for the simulations? '],
-            "pressure": row['What pressure target was used for the simulations?'],
-            "salt": row['What NaCl concentration was used for the simulations?'],
-            "comments": row['Any comments that should be noted with the submission?'],
-            "glytoucan_id": row['What is the GlyTouCan ID of the glycan?']
+            "transfer_method": cell('How will the data be transferred?'),
+            "length": cell('What is the aggregated length of the simulations?'),
+            "package": cell('What MD package was used for the simulations?'),
+            "forcefield": cell('What force field was used for the simulations?'),
+            "temperature": cell('What temperature target was used for the simulations? '),
+            "pressure": cell('What pressure target was used for the simulations?'),
+            "salt": cell('What NaCl concentration was used for the simulations?'),
+            "comments": cell('Any comments that should be noted with the submission?'),
+            "glytoucan_id": _inventory_glytoucan(row.get('What is the GlyTouCan ID of the glycan?')),
         }
         
         logger.info(f"Found metadata for {glycam_name}: ID={metadata['ID']}")
