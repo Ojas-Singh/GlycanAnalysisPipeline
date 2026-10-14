@@ -118,19 +118,23 @@ def normalize_anomeric_residue_name(residue_name: str, target_anomer: str) -> st
     """Return a GLYCAM residue code with the requested alpha/beta suffix.
 
     GLYCAM reducing-residue codes normally encode the anomer in their final
-    letter (for example ``4YA``/``4YB``).  A few source structures contain the
-    opposite code even though the sequence/name says otherwise.  Only an
-    explicit final ``A``/``B`` is changed; modified or unsupported codes such
-    as ``4YS`` and ``0PD`` are preserved because their anomeric counterpart
-    cannot be inferred safely from the code alone.
+    letter (``4YA``/``4YB`` alpha/beta pyranose, ``1CD``/``1CU`` alpha/beta
+    furanose; ``lib.residue_templates``).  A few source structures contain
+    the opposite code even though the sequence/name says otherwise.  Only an
+    explicit final ``A``/``B`` (or, for a three-character code, ``D``/``U``)
+    is changed; the ulosonic acids whose two-letter code ends in another
+    letter (``GL``, ``KN``, ``KO``) and modified codes such as ``4YS`` are
+    preserved because their anomeric counterpart cannot be inferred safely
+    from the code alone.
     """
     name = str(residue_name)
     target = str(target_anomer).strip().lower()
     if target not in {"alpha", "beta"} or not name:
         return name
-    suffix = "A" if target == "alpha" else "B"
     if name[-1] in {"A", "B"}:
-        return name[:-1] + suffix
+        return name[:-1] + ("A" if target == "alpha" else "B")
+    if len(name) == 3 and name[-1] in {"D", "U"} and name[1:] not in {"GL", "KN", "KO"}:
+        return name[:-1] + ("D" if target == "alpha" else "U")
     return name
 
 
@@ -182,8 +186,8 @@ def flip_anomeric_residue_names(
     if not root_indices:
         return names
     root_name = str(names[root_indices[0]])
-    if root_name and root_name[-1] in {"A", "B"}:
-        target = "beta" if root_name[-1] == "A" else "alpha"
+    if root_name and normalize_anomeric_residue_name(root_name, "alpha") != normalize_anomeric_residue_name(root_name, "beta"):
+        target = "beta" if root_name[-1] in {"A", "D"} else "alpha"
         return normalize_anomeric_residue_names(
             names,
             residue_ids,
