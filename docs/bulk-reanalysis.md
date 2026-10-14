@@ -179,9 +179,11 @@ from R2 for 23.6 GB on 2026-10-11).
 ## Measured on the Spark (2026-10-14, read-only, main 4a9a775 plus this branch)
 
 Three real entries through every stage, the other 998 kept as published: GS00020 (45,000 frames) 110 s and 5.6 GB
-peak with 4 workers on a loaded 20-core machine, GS00002 30 s, GS00276 56 s (it does not fail with this code; the
-failure is expected with the torsion and MOL2 fixes); `complete --offline` 7 s for the three; `finalize` of the
-whole tree 100 s and 1 GB; `compare` 16 s. The re-analysis reproduced the published Level 1 populations and
+peak with 4 workers on a loaded 20-core machine, GS00002 30 s, GS00276 56 s; `complete --offline` 7 s for the
+three; `finalize` of the whole tree 100 s and 1 GB; `compare` 16 s. With the topology recovery of PR #9 (main
+06d031a) GS00276 fails in the store step after 4 s ("Topology recovery failed: WYB 4 O3 (index 68) and 0LB 5 C1
+(index 69) are at covalent distance (median 1.53 A) but ... already has all its bonds"): `status.json` records it,
+the other entries go on, and `finalize` keeps its published folder with that reason. The re-analysis reproduced the published Level 1 populations and
 representative frames of all three exactly; 21 of 25 files per folder changed; GS00020 gained the class keywords
 `Complex N-Glycan` and `Tetraantennary N-Glycan`; offline, the alpha/beta accessions were missing (expected).
 
