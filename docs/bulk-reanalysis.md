@@ -187,6 +187,18 @@ the other entries go on, and `finalize` keeps its published folder with that rea
 representative frames of all three exactly; 21 of 25 files per folder changed; GS00020 gained the class keywords
 `Complex N-Glycan` and `Tetraantennary N-Glycan`; offline, the alpha/beta accessions were missing (expected).
 
+## What the re-analysis fixes on its own
+
+Besides the fixes of the analysis itself (torsion definitions, keywords, the topology recovery), the generated
+"other anomer" structures of the 18 entries with a 2-ketose at the reducing end (Neu5Ac, Neu5Gc, Kdn, Kdo, Fru,
+Psi, Tag, Sor; audit issue `level1-file-anomer`, for example GS00101, GS00502, GS00898) are made right:
+`lib/v2.py` `_flip_anomer_model` exchanged only C1/H1 of an aldose, so for a ketose the "other anomer" file held
+the simulated anomer. It now exchanges the two exocyclic groups at C2 (the aglycone and the C1 branch with
+whatever is linked to it) and names a furanose's other anomer (`D`/`U`). Checked on the analysis of DKDOpa2-OH,
+DFrufb2-1DFrufb2-1DFrufa2-OH and DGalpa1-OH from `~/gap-work/archive`: the configuration at the anomeric carbon of
+the alpha and the beta Level 1 files is opposite in every model (in the published GS00502 and GS00898 both files
+have the same). Aldoses are flipped exactly as before.
+
 ## After the bulk publication
 
 * Entries whose files exchange alpha and beta (problem list, section 1; for example GS00020, GS00021, GS00028):
