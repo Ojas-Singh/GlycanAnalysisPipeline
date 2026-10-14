@@ -208,3 +208,31 @@ have the same). Aldoses are flipped exactly as before.
   `reanalyse --exclude-replica run_3`.
 * The two entries estimated over 32 GB are refused by a worker limited to 32 GB (`--memory-limit-gb`); a later
   single-entry `reanalyse` of them runs on the Spark (128 GB, where the R2 keys are) with the same command.
+* One glycan published under two IDs (audit issue `duplicate-entry`, action `merge-ids`; for example GS00303 and
+  GS00453, G30648VY with its branches written in another order): `publish_entry.py merge --id GS00303 --from GS00453
+  --accept-salt-difference --note "..." --work-dir ... --dry-run`, then the same with `--expect-hash`. GS00303 keeps
+  the frames of both (60,006) and the sum of the lengths, GS00453 is withdrawn with `merged_into` and its raw entry
+  goes to `raw-history/`; the ID GS00453 is free again (the next new glycan may take it). Their salt differs (200 and 150 mM; the glycan is neutral): without
+  `--accept-salt-difference` the merge is refused, and with it every run keeps its own salt (`archetype.salt`
+  `"150–200"`, `archetype.salt_by_run`).
+* The same glycan simulated once as each reducing-end anomer, published under two IDs (keep the beta entry, the
+  linkage that occurs in nature): `publish_entry.py merge --id KEEP --from DROP --drop-runs --note "..." --work-dir
+  ... --dry-run`, then with `--expect-hash`. The runs are not pooled and the kept folder does not change; DROP is
+  withdrawn (`merged_into`, `runs_pooled: false`), its ID is free again (the next new glycan may take it), and its
+  raw entry goes to `raw-history/`. The nine pairs (keep,
+  drop): GS00037/GS00013, GS00355/GS00679, GS00358/GS00680, GS00359/GS00671, GS00455/GS00578, GS00797/GS00814,
+  GS00800/GS00816, GS00803/GS00856, GS00804/GS00832. Checked read-only against the published folders and the archive
+  copy: every pair has one archetype WURCS and accession, beta kept and alpha dropped, both raw entries; the reports
+  will list other salt for GS00355, GS00358 and GS00359 (150 and 200 mM) and for GS00455/GS00578 also the package
+  (AMBER and GROMACS) and the time per frame.
+* Runs with an inverted stereocentre (audit issues `run-topology-mismatch`, `stereo-differs-between-runs`):
+  `publish_entry.py prune-runs --id GS00276 --run run_2 --run run_3 --note "..." --work-dir ... --dry-run`, then with
+  `--expect-hash`; GS00180 and GS00250 with `--run run_3`. Their raw entries are one `simulation.pdb` of 30,003
+  frames whose runs are the class test's division (run_2 = frames 10001-20001, run_3 = 20002-30002): the trajectory is
+  cut, the kept runs keep their names, the entry before goes to `raw-history/`, and the rest is analysed and published
+  (length 0.5 or 1.0 us). Checked on a copy of GS00276: 30,003 -> 10,001 frames, `run_1`, verified.
+* Personal data in a raw entry (audit issue `personal-data-in-raw`, GS00954): `publish_entry.py scrub-raw --id GS00954
+  --field email --field username --note "..." --work-dir ... --dry-run`, then `--expect-hash <scrub.plan_hash>`. Read
+  `scrub.remains` before approving: on a copy of GS00954 the only occurrences left are the username as the first name
+  in the citation REMARK of the published PDB files (not personal data of the submitter). Delete the local copies
+  (`~/gap-work/archive`, Iridis `data/`) and check the bucket's versioning yourself: the code reaches neither.

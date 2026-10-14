@@ -79,7 +79,10 @@ must not run while an entry is published.
 
 Withdrawing publishes a manifest without the entry first and deletes
 ``static/GSxxxxx/`` afterwards; the raw entry stays, and the ID is recorded
-as withdrawn so that it is never given to another glycan.
+as withdrawn so that it is never given to another glycan.  An ID withdrawn
+by ``lib.entry_ops.merge`` (its entry of ``withdrawn.json`` has
+``merged_into``) is free again: its glycan is published under another ID,
+and the next new glycan may take it (:func:`id_is_free`).
 """
 from __future__ import annotations
 
@@ -531,6 +534,19 @@ def read_pending(target: Target, store: Store) -> Optional[Dict[str, Any]]:
 def read_withdrawn(target: Target, store: Store) -> Dict[str, Any]:
     document = _load_json(store.read_optional(target.withdrawn_key), WITHDRAWN_SCHEMA, "list of withdrawn IDs")
     return document["withdrawn"] if document else {}
+
+
+def id_is_free(tombstone: Optional[Dict[str, Any]]) -> bool:
+    """Whether the entry of ``withdrawn.json`` leaves its ID free for another glycan.
+
+    A plain withdrawal binds the ID and the GLYCAM name to each other: the
+    glycan comes back under its ID, and no other glycan gets it.  An ID that
+    a merge took the glycan away from (``merged_into``; its runs pooled or
+    not) is bookkeeping only: the ID is free again, the next new glycan may
+    take it, and its old name is not bound to it.  ``merged_into`` stays the
+    record of where its glycan went until a glycan is published under the ID.
+    """
+    return bool(tombstone) and bool(tombstone.get("merged_into"))
 
 
 # ---------------------------------------------------------------------------
@@ -1283,8 +1299,9 @@ def publish_entry(
     Checked before anything is written: the bundle (its hashes, levels,
     pipeline; ``policy``), the entry (complete), the ID (new for
     ``publish``, published for this glycan for ``replace``, never one of
-    another glycan or of a withdrawn one), the name (not published under
-    another ID), the raw entry (extended by the bundle, or the same; another
+    another glycan or of a withdrawn one, unless a merge left it free:
+    :func:`id_is_free`), the name (not published under another ID, nor
+    withdrawn under one that is not free), the raw entry (extended by the bundle, or the same; another
     one only with ``policy.overwrite_raw``) and the stored database (its
     root files are those of its manifest).  A failed check raises
     :class:`Refused` with every reason; a dry run returns the report
@@ -1377,12 +1394,16 @@ def publish_entry(
         if in_database and names.get(glycan_id) != name:
             refused.append(f"{glycan_id} is the ID of another glycan: {names.get(glycan_id, '')[:80]}")
         tombstone = database.withdrawn.get(glycan_id)
-        if tombstone is not None and tombstone.get("glycam_name") != name:
+        if tombstone is not None and tombstone.get("glycam_name") != name and not id_is_free(tombstone):
             refused.append(f"{glycan_id} was the ID of a withdrawn glycan ({str(tombstone.get('glycam_name'))[:60]}): "
                            "an ID is never given to another glycan")
         for other, item in sorted(database.withdrawn.items()):
-            if other != glycan_id and item.get("glycam_name") == name:
+            if other != glycan_id and item.get("glycam_name") == name and not id_is_free(item):
                 refused.append(f"this glycan was published as {other} and withdrawn: publish it under that ID")
+        if id_is_free(tombstone) and tombstone.get("glycam_name") != name:
+            report["warnings"].append(
+                f"{glycan_id} was free again (its glycan {str(tombstone.get('glycam_name'))[:60]} was merged into "
+                f"{tombstone['merged_into']}): this glycan takes it, and its entry in withdrawn.json is removed")
         already = False
         if in_database and names.get(glycan_id) == name:
             stored_entry = database.manifest["glycans"].get(glycan_id) or {}
@@ -1450,6 +1471,9 @@ def publish_entry(
         kept = keep_replicas(target, static_store, bundle, glycan_id, dry_run, log)
         if kept is not None:
             report["replicas"] = kept
+        elif id_is_free(tombstone) and tombstone.get("glycam_name") != name and not dry_run \
+                and static_store.head(target.replicas_key(glycan_id)) is not None:
+            static_store.delete(target.replicas_key(glycan_id))  # the diagnostics of the glycan that had the ID
     report["seconds"] = round(time.perf_counter() - started, 3)
     journal.data["status"] = "dry-run" if dry_run else report["status"]
     journal.data["transfers"] = stats
@@ -1553,6 +1577,10 @@ def withdraw_entry(
     owner: Optional[str] = None,
     log: Log = print,
     checkpoint: Checkpoint = _noop,
+    merged: Optional[Dict[str, Any]] = None,
+    held_lock: Optional[Dict[str, Any]] = None,
+    database: Optional[Database] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Take a published glycan out of the database.
 
@@ -1562,20 +1590,31 @@ def withdraw_entry(
     glycan: it can come back for that glycan (``publish``), and is refused
     for any other.  ``glycam_name``, when given, has to be the name the ID
     is published for.  Returns a report; raises as :func:`publish_entry`.
+
+    For ``lib.entry_ops.merge``: ``merged`` (``merged_into``, the ID its
+    glycan is published under now; ``runs_pooled``, whether that ID took
+    the frames of this one; ``raw_manifest_sha256`` of the raw entry of this
+    one) is kept in the record, the history and the entry of
+    ``withdrawn.json``, and leaves the ID free again: the next new glycan
+    may take it (:func:`id_is_free`); ``held_lock`` is the lock of the caller,
+    which this run then neither takes nor releases (nor completes a pending
+    publication: the caller did); ``database`` is the database to derive
+    from instead of the stored one (a dry run that follows another change);
+    ``stats`` counts the requests into the caller's report.
     """
     if not id_registry.is_id(glycan_id):
         raise PublishEntryError(f"not a GlycoShape ID: {glycan_id!r}")
     owner = owner or new_owner()
     started = time.perf_counter()
-    stats = new_stats()
+    stats = stats if stats is not None else new_stats()
     store = Store(target.static, stats, dry_run)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     report: Dict[str, Any] = {"action": WITHDRAW, "glycoshape_id": glycan_id, "dry_run": dry_run, "ok": True,
                               "owner": owner, "work_dir": str(work), "refused": [], "warnings": [], "transfers": stats}
     with contextlib.ExitStack() as stack:
-        lock: Optional[Dict[str, Any]] = None
-        if not dry_run:
+        lock: Optional[Dict[str, Any]] = held_lock
+        if not dry_run and held_lock is None:
             stack.enter_context(_in_process(target))
             lock = acquire_lock(target, store, owner, WITHDRAW, glycan_id, lock_ttl, break_lock, log)
             stack.callback(lambda: _release_quietly(target, store, lock, log))
@@ -1584,19 +1623,20 @@ def withdraw_entry(
             if pending is not None:
                 log(f"completing the interrupted {pending['action']} of {pending['glycoshape_id']} (by {pending['owner']})")
                 roll_forward(target, store, pending, log, checkpoint)
-        else:
+        elif dry_run:
             pending = read_pending(target, store)
             if pending is not None:
                 _refusal(report, [f"an interrupted {pending['action']} of {pending['glycoshape_id']} is pending"])
                 return report
 
-        try:
-            database = read_database(target, store, work, cache_dir)
-        except Refused as exc:
-            failure = _refusal(report, [str(exc)])
-            if dry_run:
-                return report
-            raise failure from exc
+        if database is None:
+            try:
+                database = read_database(target, store, work, cache_dir)
+            except Refused as exc:
+                failure = _refusal(report, [str(exc)])
+                if dry_run:
+                    return report
+                raise failure from exc
         refused: List[str] = []
         raw_index_bytes = Store(target.raw, stats, dry_run).read_optional(f"{target.raw_prefix}/{archive.INDEX_FILE}")
         try:
@@ -1647,14 +1687,17 @@ def withdraw_entry(
                 "owner": owner, "reason": reason, "global_hash_before": database.global_hash,
                 "global_hash": derived["global_hash"],
             }
+            tombstone = {"glycam_name": name, "withdrawn_at": record["withdrawn_at"], "reason": reason,
+                         "global_hash_before": database.global_hash}
+            for key, value in (merged or {}).items():
+                record[key] = tombstone[key] = value
             history = {"key": target.history_key(glycan_id, derived["global_hash"], WITHDRAW),
                        "document": {**record, "kind": "version",
                                     "folder_hash_before": (database.manifest["glycans"].get(glycan_id) or {}).get("hash")}}
             done = publish_static(
                 target, store, plan,
                 {"glycam_name": name, "record": record, "history": history, "delete_prefix": target.key(f"{glycan_id}/"),
-                 "withdrawn": {"glycam_name": name, "withdrawn_at": record["withdrawn_at"], "reason": reason,
-                               "global_hash_before": database.global_hash}},
+                 "withdrawn": tombstone},
                 owner, lock, lock_ttl, log, checkpoint)
             report["history"] = {"key": history["key"]}
             journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
@@ -1727,6 +1770,7 @@ def status(target: Target, glycan_id: Optional[str] = None, glycam_name: Optiona
         stored_keys = store.list(target.key(f"{glycan_id}/"))
         entry["state"] = "published" if listed is not None else "withdrawn" if glycan_id in withdrawn else "not published"
         entry["withdrawn"] = withdrawn.get(glycan_id)
+        entry["id_free"] = listed is None and (glycan_id not in withdrawn or id_is_free(withdrawn.get(glycan_id)))
         entry["stored_objects"] = len(stored_keys)
         record = store.read_optional(target.record_key(glycan_id))
         entry["record"] = None if record is None else json.loads(record)

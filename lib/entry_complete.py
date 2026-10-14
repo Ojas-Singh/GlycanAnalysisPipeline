@@ -736,6 +736,7 @@ def complete_folder(
     aliases: Iterable[str] = (),
     keywords: Optional[Dict[str, List[str]]] = None,
     public_note: str = "",
+    salt_by_run: Optional[Dict[str, float]] = None,
 ) -> Tuple[Path, Dict[str, Any], Dict[str, Any]]:
     """Write ``<output_dir>/<GlycoShape ID>/`` from a static-ready folder; returns ``(folder, data, lookups)``.
 
@@ -751,7 +752,12 @@ def complete_folder(
     ``{"replace": [...]}``, applied to the keywords that follow from the
     names and the submission, and ``public_note``, a note shown with the
     entry (``search_meta.curator_note``).  The water model of the
-    submission is written as ``archetype.water`` when it is given.  One
+    submission is written as ``archetype.water`` when it is given.
+    ``salt_by_run`` is the salt concentration (mM) of every run of an entry
+    whose runs were simulated at different ones (an entry merged from two,
+    ``lib.entry_ops.merge``): when its values differ, ``archetype.salt``
+    is their range as text (``"150–200"``) and ``archetype.salt_by_run``
+    follows it, ``{run name: mM}``; when they agree it changes nothing.  One
     completion at a time per process.
     """
     import lib.config as config
@@ -805,6 +811,12 @@ def complete_folder(
                 if submission.water_model:
                     data["archetype"] = _insert_after(data["archetype"], "salt", "water", submission.water_model)
                     edited = True
+                salts = sorted({float(value) for value in (salt_by_run or {}).values()})
+                if len(salts) > 1:
+                    data["archetype"]["salt"] = salt_range(salts)
+                    data["archetype"] = _insert_after(data["archetype"], "salt", "salt_by_run",
+                                                      {name: float(value) for name, value in salt_by_run.items()})
+                    edited = True
                 if public_note:
                     data["search_meta"]["curator_note"] = public_note
                     edited = True
@@ -819,6 +831,12 @@ def complete_folder(
         finally:
             config.cluster_levels = previous_levels
     return folder, data, log.summary()
+
+
+def salt_range(values: Iterable[float]) -> str:
+    """``archetype.salt`` of an entry whose runs had different salt concentrations: ``"150–200"`` (mM, en dash)."""
+    values = sorted(float(value) for value in values)
+    return f"{values[0]:g}\u2013{values[-1]:g}"
 
 
 def _insert_after(mapping: Dict[str, Any], after: str, key: str, value: Any) -> Dict[str, Any]:

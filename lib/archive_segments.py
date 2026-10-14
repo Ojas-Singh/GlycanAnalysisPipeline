@@ -15,6 +15,11 @@ appended byte for byte, which is all an XTC needs (it has no header and its
 frames do not refer to each other).  An extended entry starts with the bytes
 of the trajectory it extends: those frames are not decoded and encoded again.
 
+:func:`merge_entries` writes one entry from two **stored entries** of the same
+glycan that were published under two GlycoShape IDs (and so under two
+GLYCAM names): the kept entry's frames as the bytes they are, then the
+absorbed entry's frames with only their step and time renumbered.
+
 The entry is read by everything that reads an entry.  Its manifest has every
 key a manifest has always had and, in addition::
 
@@ -38,12 +43,17 @@ key a manifest has always had and, in addition::
                    "negative_zero_coordinates", "frames_parsed_line_by_line"},
         "source_irregularities": {},  only for a damaged source that was archived with repair
         "verification": {...},        what the comparison with its text measured
-        "carried_from": {...}         only for frames taken over from the entry that was extended
+        "carried_from": {...},        only for frames taken over from the entry that was extended (or merged)
+        "merged_from": {...}          only for frames of the absorbed entry of a merge: its glycoshape_id,
+                                      glycam_name and manifest_sha256
       }, ...
     ],
-    "extends": {                      only when an existing entry was extended
+    "extends": {                      only when an existing entry was extended (or kept by a merge)
       "glycam_name", "manifest_sha256", "frames", "atoms", "trajectory": {"size", "sha256",
       "coordinates_sha256"}, "files", "source", "converter", "repaired", "previous"
+    },
+    "merged_from": {                  only for a merge: the absorbed entry, as "extends", and
+      "glycoshape_id", "kept_glycoshape_id", "first_frame", "atom_records", "merged_from"
     }
 
 ``source`` of such a manifest describes all sources together: ``folder`` is
@@ -77,6 +87,7 @@ import multiprocessing
 import os
 import platform
 import shutil
+import struct
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -598,6 +609,61 @@ def _run_matches(recorded: Any, wanted: Any) -> bool:
     return json.loads(json.dumps(recorded)) == json.loads(json.dumps(wanted))
 
 
+def _carried_segments(
+    manifest: Dict[str, Any], manifest_sha256: str, time_per_frame_ps: Optional[float]
+) -> List[Dict[str, Any]]:
+    """The segments of a stored entry whose frames are taken over, with ``carried_from``, counted from 0.
+
+    An entry with segments keeps their records; an entry of one
+    ``simulation.pdb`` becomes one segment named by its source folder, with
+    ``time_per_frame_ps`` as given (its manifest does not record one).
+    """
+    carried_from = {"glycam_name": manifest["glycam_name"], "manifest_sha256": manifest_sha256}
+    if archive.segments_of(manifest):
+        return [
+            dict(segment, index=index, carried_from=dict(carried_from, segment=index))
+            for index, segment in enumerate(archive.segments_of(manifest))
+        ]
+    segment = {
+        "index": 0,
+        "name": manifest["source"]["folder"],
+        "first_frame": 0,
+        "frames": int(manifest["frames"]),
+        "coordinates_sha256": manifest["trajectory"]["coordinates_sha256"],
+        "trajectory_offset": 0,
+        "trajectory_bytes": manifest["files"][archive.TRAJECTORY_FILE]["size"],
+        "time_per_frame_ps": time_per_frame_ps,
+        "box": manifest["box"],
+        "atom_records": "identical",
+        "source": dict(manifest["source"]),
+    }
+    if manifest.get("source_irregularities") is not None:
+        segment["source_irregularities"] = manifest["source_irregularities"]
+    segment["verification"] = manifest.get("verification")
+    segment["carried_from"] = dict(carried_from, segment=None)
+    return [segment]
+
+
+def _carried_entry(manifest: Dict[str, Any], manifest_sha256: str) -> Dict[str, Any]:
+    """What a manifest keeps about a stored entry whose frames it took over (``extends``, ``merged_from``)."""
+    return {
+        "glycam_name": manifest["glycam_name"],
+        "manifest_sha256": manifest_sha256,
+        "frames": int(manifest["frames"]),
+        "atoms": int(manifest["atoms"]),
+        "trajectory": {
+            "size": manifest["files"][archive.TRAJECTORY_FILE]["size"],
+            "sha256": manifest["files"][archive.TRAJECTORY_FILE]["sha256"],
+            "coordinates_sha256": manifest["trajectory"]["coordinates_sha256"],
+        },
+        "files": manifest["files"],
+        "source": {key: manifest["source"].get(key) for key in ("folder", "file", "size", "sha256")},
+        "converter": manifest.get("converter"),
+        "repaired": archive.repair_summary(manifest),
+        "previous": manifest.get("extends"),
+    }
+
+
 def _existing_is_current(
     final: Path,
     glycam_name: str,
@@ -853,29 +919,7 @@ def convert_segments(
                 if size != recorded["size"] or sha256 != recorded["sha256"]:
                     raise VerificationError("the trajectory of the entry to extend changed while it was copied")
                 offset = size
-                carried_from = {"glycam_name": extended["glycam_name"], "manifest_sha256": extended_sha256}
-                if archive.segments_of(extended):
-                    for index, segment in enumerate(archive.segments_of(extended)):
-                        segments.append(dict(segment, index=index, carried_from=dict(carried_from, segment=index)))
-                else:
-                    segment = {
-                        "index": 0,
-                        "name": extended["source"]["folder"],
-                        "first_frame": 0,
-                        "frames": frames_before,
-                        "coordinates_sha256": extended["trajectory"]["coordinates_sha256"],
-                        "trajectory_offset": 0,
-                        "trajectory_bytes": size,
-                        "time_per_frame_ps": extend_time_per_frame_ps,
-                        "box": extended["box"],
-                        "atom_records": "identical",
-                        "source": dict(extended["source"]),
-                    }
-                    if extended.get("source_irregularities") is not None:
-                        segment["source_irregularities"] = extended["source_irregularities"]
-                    segment["verification"] = extended.get("verification")
-                    segment["carried_from"] = dict(carried_from, segment=None)
-                    segments.append(segment)
+                segments.extend(_carried_segments(extended, extended_sha256, extend_time_per_frame_ps))
                 box_changes, total = _changes_of_summary(extended["box"])
                 changes.extend(box_changes)
                 not_listed = total - len(box_changes)
@@ -1067,22 +1111,7 @@ def convert_segments(
             "segments": segments,
         }
         if extended is not None:
-            manifest["extends"] = {
-                "glycam_name": extended["glycam_name"],
-                "manifest_sha256": extended_sha256,
-                "frames": frames_before,
-                "atoms": int(extended["atoms"]),
-                "trajectory": {
-                    "size": extended["files"][archive.TRAJECTORY_FILE]["size"],
-                    "sha256": extended["files"][archive.TRAJECTORY_FILE]["sha256"],
-                    "coordinates_sha256": extended["trajectory"]["coordinates_sha256"],
-                },
-                "files": extended["files"],
-                "source": {key: extended["source"].get(key) for key in ("folder", "file", "size", "sha256")},
-                "converter": extended.get("converter"),
-                "repaired": archive.repair_summary(extended),
-                "previous": extended.get("extends"),
-            }
+            manifest["extends"] = _carried_entry(extended, extended_sha256)
         manifest.update({
             "verification": verification,
             "converter": {
@@ -1119,4 +1148,740 @@ def convert_segments(
             "parse_and_write_cpu_seconds": sum(part["seconds"]["parse_and_write"] for part in parts),
             "verify_cpu_seconds": sum(part["seconds"]["verify"] for part in parts),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Merging two stored entries of one glycan
+# ---------------------------------------------------------------------------
+_XTC_MAGIC = 1995
+#: magic, atoms, step, time (16 bytes), the box (36), the atoms again (4)
+_XTC_HEAD_BYTES = 56
+#: after the head of a frame of more than nine atoms: precision, minint[3], maxint[3], smallidx, byte count
+_XTC_COMPRESSED_HEAD_BYTES = 36
+
+
+def _xtc_frames(source: PathLike, atoms: int) -> Iterator[Tuple[bytes, bytes]]:
+    """``(head, rest)`` of every frame of an XTC, as bytes, without decoding (see :func:`renumber_xtc`)."""
+    source = Path(source)
+    frames = 0
+    with open(source, "rb") as handle:
+        while True:
+            head = handle.read(_XTC_HEAD_BYTES)
+            if not head:
+                return
+            if len(head) < _XTC_HEAD_BYTES:
+                raise VerificationError(f"{source.name} ends inside the head of frame {frames}")
+            magic, count = struct.unpack_from(">ii", head)
+            (again,) = struct.unpack_from(">i", head, 52)
+            if magic != _XTC_MAGIC or count != atoms or again != atoms:
+                raise VerificationError(f"frame {frames} of {source.name} is not an XTC frame of {atoms} atoms")
+            if atoms <= 9:
+                expected = 12 * atoms
+                body = handle.read(expected)
+            else:
+                body = handle.read(_XTC_COMPRESSED_HEAD_BYTES)
+                expected = _XTC_COMPRESSED_HEAD_BYTES
+                if len(body) == expected:
+                    (precision,) = struct.unpack_from(">f", body)
+                    (count_bytes,) = struct.unpack_from(">i", body, 32)
+                    if precision != float(archive.XTC_PRECISION) or count_bytes < 0:
+                        raise VerificationError(
+                            f"frame {frames} of {source.name} has precision {precision} and {count_bytes} bytes")
+                    padded = (count_bytes + 3) // 4 * 4
+                    body += handle.read(padded)
+                    expected += padded
+            if len(body) != expected:
+                raise VerificationError(f"{source.name} ends inside frame {frames}")
+            yield head, body
+            frames += 1
+
+
+def _renumbered(head: bytes, index: int) -> bytes:
+    """The head of a frame with step and time ``index`` (int32 and float32, big-endian)."""
+    return head[:8] + struct.pack(">if", index, float(index)) + head[16:]
+
+
+def renumber_xtc(source: PathLike, target, first_index: int, atoms: int) -> Dict[str, Any]:
+    """Append the frames of the XTC ``source`` to the open file ``target``, numbered from ``first_index``.
+
+    Every frame keeps its bytes (coordinates, box, precision) except step
+    and time, which become its index in the trajectory it joins, as
+    ``archive._XtcWriter`` writes them: ``first_index`` for the first frame
+    and one more for each frame after it.  Nothing is decoded: a frame is
+    a head of 56 bytes (magic number 1995, atoms, step, time, box, atoms
+    again), then for more than nine atoms the precision, the bounds, the
+    byte count and the compressed bytes padded to four, for nine atoms or
+    fewer the coordinates as 3 x atoms floats.  Every frame has to be one
+    of ``atoms`` atoms, at the precision of the archive for compressed
+    frames.  Returns ``{"frames", "bytes", "sha256_read", "sha256_written"}``;
+    ``sha256_read`` is the SHA-256 of the whole file, to be compared with
+    the record of the entry it belongs to.
+    """
+    read, written = hashlib.sha256(), hashlib.sha256()
+    frames = size = 0
+    for head, body in _xtc_frames(source, atoms):
+        index = first_index + frames
+        renumbered = _renumbered(head, index)
+        read.update(head)
+        read.update(body)
+        written.update(renumbered)
+        written.update(body)
+        target.write(renumbered)
+        target.write(body)
+        size += len(head) + len(body)
+        frames += 1
+    return {"frames": frames, "bytes": size, "sha256_read": read.hexdigest(), "sha256_written": written.hexdigest()}
+
+
+def _merged_is_current(
+    final: Path, planned: List[Tuple[Any, ...]], kept_sha256: str, absorbed_sha256: str,
+    kept_id: Optional[str], absorbed_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Manifest of ``final`` when it verifies and is the merge of exactly these two entries, else None."""
+    if not (final / archive.MANIFEST_FILE).is_file() or not archive.verify_entry(final, deep=False)["ok"]:
+        return None
+    manifest = archive.load_manifest(final)
+    try:
+        merged = manifest.get("merged_from") or {}
+        if (manifest.get("extends") or {}).get("manifest_sha256") != kept_sha256 \
+                or merged.get("manifest_sha256") != absorbed_sha256 \
+                or (merged.get("glycoshape_id"), merged.get("kept_glycoshape_id")) != (absorbed_id, kept_id):
+            return None
+        if _segment_plan(archive.segments_of(manifest)) != planned:
+            return None
+    except (KeyError, TypeError):
+        return None
+    return manifest
+
+
+def _segment_plan(segments: Sequence[Dict[str, Any]]) -> List[Tuple[Any, ...]]:
+    return [(segment["name"], segment["first_frame"], segment["frames"], segment["coordinates_sha256"],
+             segment.get("time_per_frame_ps"), json.dumps(segment.get("run"), sort_keys=True))
+            for segment in segments]
+
+
+def merge_entries(
+    kept: PathLike,
+    absorbed: PathLike,
+    archive_dir: PathLike,
+    *,
+    kept_id: Optional[str] = None,
+    absorbed_id: Optional[str] = None,
+    kept_time_per_frame_ps: Optional[float] = None,
+    absorbed_time_per_frame_ps: Optional[float] = None,
+    kept_run: Optional[Dict[str, Any]] = None,
+    absorbed_run: Optional[Dict[str, Any]] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Write one entry with the frames of two stored entries of one glycan, under the name of ``kept``.
+
+    The glycan was simulated twice and published under two GlycoShape IDs
+    (``kept_id``, ``absorbed_id``) whose GLYCAM names differ, for example
+    only in the order the branches are written in.  The new entry is named
+    as ``kept`` and keeps its ``topology.pdb``, ``structure.mol2``,
+    ``info.json`` and ``name.json``.  Its trajectory is the trajectory of
+    ``kept``, byte for byte, followed by the frames of ``absorbed`` with the
+    bytes they had except their step and time, which become their index in
+    the whole (:func:`renumber_xtc`): no frame is decoded and encoded again.
+
+    The two entries are verified against their manifests first and have to
+    have the same atoms: the same number, and for every atom the same name,
+    residue name and residue number in the same order (``topology.pdb``;
+    an error names the first atom that differs; other columns are recorded
+    and give a warning), and in ``structure.mol2`` the same atom names and
+    bonds (other atom types or substructures give a warning).  Nothing else
+    is compared here: whether the simulations are of the same glycan under
+    the same conditions is for the caller to decide.
+
+    The segments of the new entry are those of ``kept`` (``carried_from``
+    its manifest), then those of ``absorbed`` (``carried_from`` its
+    manifest, and ``merged_from``: its GlycoShape ID, GLYCAM name and
+    manifest SHA-256), with ``first_frame`` and ``trajectory_offset`` in the
+    whole.  An entry of one ``simulation.pdb`` is one segment, named by its
+    source folder for ``kept`` and ``absorbed_id`` (or its GLYCAM name) for
+    ``absorbed``, with the time per frame given here.  ``kept_run`` and
+    ``absorbed_run`` (JSON values; for example ``{"salt_concentration_mm":
+    200.0}``, what the published entry says about its simulations) are
+    written into the ``run`` record of every segment of that entry, over
+    what the record had.  The segments of an
+    absorbed entry that has some are named ``<absorbed_id>/<their name>``
+    (``GS00453/replica_1``), so that every name is that of one segment.
+    The manifest has ``extends`` for ``kept`` (as an extension has: the
+    stored entry of that name is replaced by one that begins with its
+    frames) and ``merged_from`` for ``absorbed`` (the same record, with the
+    two GlycoShape IDs, ``first_frame`` and the ``atom_records`` of the
+    comparison).  Read back, the trajectory has to have step and time equal
+    to the frame index and every segment the coordinate digest of its record.
+
+    The entries are only read.  The new entry is written to a staging folder
+    and renamed when everything verified; an existing one that is the merge
+    of exactly these two entries is left alone (``status`` ``"skipped"``)
+    unless ``force``.  Returns ``{"status", "manifest", "entry", "timing"}``;
+    raises :class:`SegmentMismatchError` for other atoms and another
+    :class:`ArchiveError` for anything else.
+    """
+    started = time.perf_counter()
+    kept_dir, absorbed_dir = Path(kept).resolve(), Path(absorbed).resolve()
+    archive_dir = Path(archive_dir)
+    for what, folder in (("kept", kept_dir), ("absorbed", absorbed_dir)):
+        if not archive.is_archive_entry(folder):
+            raise SourceError(f"the {what} entry {folder} is not an archive entry (manifest.json and trajectory.xtc)")
+        checked = archive.verify_entry(folder, deep=False, check_folder=False)
+        if not checked["ok"]:
+            raise VerificationError(f"the {what} entry does not verify: {'; '.join(checked['errors'])}")
+    kept_manifest, absorbed_manifest = archive.load_manifest(kept_dir), archive.load_manifest(absorbed_dir)
+    kept_sha256 = archive._sha256_file(kept_dir / archive.MANIFEST_FILE)[1]
+    absorbed_sha256 = archive._sha256_file(absorbed_dir / archive.MANIFEST_FILE)[1]
+    glycam_name = kept_manifest["glycam_name"]
+    if absorbed_manifest["glycam_name"] == glycam_name:
+        raise SourceError(f"both entries are named {glycam_name[:120]}: an entry is merged with an entry of "
+                          "another name (new trajectories of the same name extend it)")
+    folder = archive.entry_folder_name(glycam_name)
+    final = archive_dir / folder
+    archive_real = archive_dir.resolve()
+    for folder_real in (kept_dir, absorbed_dir):
+        if archive_real == folder_real or folder_real in archive_real.parents:
+            raise SourceError(f"the archive directory must be outside {folder_real}")
+    if final.resolve() == kept_dir:
+        raise SourceError("the kept entry is the entry that would be written; give another archive directory")
+    if final.exists() and not (final / archive.MANIFEST_FILE).is_file():
+        raise ArchiveError(f"{final} exists and is not an archive entry; it is left untouched")
+    kept_label = kept_id or glycam_name
+    absorbed_label = absorbed_id or absorbed_manifest["glycam_name"]
+
+    # The same atoms, and the same bonds.
+    atoms = int(kept_manifest["atoms"])
+    identities = []
+    for label, entry_dir, manifest in ((kept_label, kept_dir, kept_manifest),
+                                       (absorbed_label, absorbed_dir, absorbed_manifest)):
+        identity = [atom_identity(line.encode("latin-1")) for line in archive.ArchiveEntry(entry_dir).atom_lines()]
+        if len(identity) != int(manifest["atoms"]):
+            raise VerificationError(f"{archive.TOPOLOGY_FILE} of {label} holds {len(identity)} atoms, its manifest "
+                                    f"says {manifest['atoms']}")
+        identities.append(identity)
+    atom_records = compare_atom_records(identities[0], identities[1], f"{archive.TOPOLOGY_FILE} of {kept_label}",
+                                        f"{archive.TOPOLOGY_FILE} of {absorbed_label}")
+    kept_structure, absorbed_structure = read_mol2(kept_dir / archive.MOL2_FILE), read_mol2(absorbed_dir / archive.MOL2_FILE)
+    kept_mol2, absorbed_mol2 = f"{archive.MOL2_FILE} of {kept_label}", f"{archive.MOL2_FILE} of {absorbed_label}"
+    if len(kept_structure["atoms"]) != atoms:
+        raise SegmentMismatchError(f"{kept_mol2} has {len(kept_structure['atoms'])} atoms, the trajectory has {atoms}")
+    warnings = compare_mol2(kept_structure, absorbed_structure, kept_mol2, absorbed_mol2, same_run=False)
+    if absorbed_structure["bonds"] != kept_structure["bonds"]:
+        only_absorbed = sorted(absorbed_structure["bonds"] - kept_structure["bonds"])
+        only_kept = sorted(kept_structure["bonds"] - absorbed_structure["bonds"])
+        example = (only_absorbed or only_kept)[0]
+        raise SegmentMismatchError(
+            f"{absorbed_mol2} does not have the bonds of {kept_mol2}: {len(only_absorbed)} bonds only in "
+            f"{absorbed_mol2}, {len(only_kept)} only in {kept_mol2} (for example atoms {example[0] + 1}-{example[1] + 1})")
+    if atom_records != "identical":
+        warnings.append(f"the atom records of {absorbed_label} differ from those of {kept_label} in "
+                        f"{', '.join(atom_records['differ_in'])}; names, residues and order are the same")
+
+    # The segments: those of the kept entry, then those of the absorbed one.
+    frames_before = int(kept_manifest["frames"])
+    bytes_before = int(kept_manifest["files"][archive.TRAJECTORY_FILE]["size"])
+    segments = [dict(segment, run={**(segment.get("run") or {}), **kept_run}) if kept_run else segment
+                for segment in _carried_segments(kept_manifest, kept_sha256, kept_time_per_frame_ps)]
+    named = bool(archive.segments_of(absorbed_manifest))
+    for segment in _carried_segments(absorbed_manifest, absorbed_sha256, absorbed_time_per_frame_ps):
+        segments.append(dict(
+            segment,
+            index=len(segments),
+            name=f"{absorbed_label}/{segment['name']}" if named else absorbed_label,
+            first_frame=frames_before + int(segment["first_frame"]),
+            trajectory_offset=bytes_before + int(segment["trajectory_offset"]),
+            merged_from={"glycoshape_id": absorbed_id, "glycam_name": absorbed_manifest["glycam_name"],
+                         "manifest_sha256": absorbed_sha256},
+            **({"run": {**(segment.get("run") or {}), **absorbed_run}} if absorbed_run else {}),
+        ))
+    names = [segment["name"] for segment in segments]
+    if len(set(names)) != len(names):
+        twice = sorted({name for name in names if names.count(name) > 1})
+        raise SourceError(f"{', '.join(twice)} would name two segments of the merged entry")
+    planned = _segment_plan(segments)
+    if not force:
+        manifest = _merged_is_current(final, planned, kept_sha256, absorbed_sha256, kept_id, absorbed_id)
+        if manifest is not None:
+            return {"status": "skipped", "manifest": manifest, "entry": str(final), "timing": {}}
+
+    staging = archive_dir / archive.STAGING_DIR / hashlib.sha256(glycam_name.encode("utf-8")).hexdigest()[:32]
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        # The trajectory: the bytes of the kept one, then the frames of the absorbed one, renumbered.
+        trajectory = staging / archive.TRAJECTORY_FILE
+        absorbed_frames = int(absorbed_manifest["frames"])
+        with open(trajectory, "wb") as target:
+            size, sha256 = _append_file(target, kept_dir / archive.TRAJECTORY_FILE)
+            recorded = kept_manifest["files"][archive.TRAJECTORY_FILE]
+            if size != recorded["size"] or sha256 != recorded["sha256"]:
+                raise VerificationError("the trajectory of the kept entry changed while it was copied")
+            renumbered = renumber_xtc(absorbed_dir / archive.TRAJECTORY_FILE, target, frames_before, atoms)
+            recorded = absorbed_manifest["files"][archive.TRAJECTORY_FILE]
+            if renumbered["bytes"] != recorded["size"] or renumbered["sha256_read"] != recorded["sha256"]:
+                raise VerificationError("the trajectory of the absorbed entry changed while it was copied")
+            if renumbered["frames"] != absorbed_frames:
+                raise VerificationError(f"the trajectory of {absorbed_label} holds {renumbered['frames']} frames, "
+                                        f"its manifest says {absorbed_frames}")
+            target.flush()
+            os.fsync(target.fileno())
+        copied = time.perf_counter()
+        frames = frames_before + absorbed_frames
+
+        # Read back as it will be read: frames, steps, and the coordinates of every segment against its record.
+        digests = archive._SegmentDigests([segment["frames"] for segment in segments])
+        back = archive._read_back(staging, atoms, on_frames=digests)
+        if back["frames"] != frames:
+            raise VerificationError(f"{archive.TRAJECTORY_FILE} holds {back['frames']} frames, {frames} were written")
+        if not back["index_ok"]:
+            raise VerificationError("step and time of the trajectory are not the frame index")
+        if back["precision"] not in (None, float(archive.XTC_PRECISION)):
+            raise VerificationError(f"{archive.TRAJECTORY_FILE} was written at precision {back['precision']}")
+        for segment, found in zip(segments, digests.hexdigests()):
+            if found != segment["coordinates_sha256"]:
+                raise VerificationError(
+                    f"the coordinates of segment {segment['index']} ({segment['name']}) are not those of its record "
+                    f"in the {'absorbed' if 'merged_from' in segment else 'kept'} entry")
+        verified = time.perf_counter()
+
+        # The other files are those of the kept entry.
+        files: Dict[str, Dict[str, Any]] = {}
+        size, sha256 = archive._sha256_file(trajectory)
+        files[archive.TRAJECTORY_FILE] = {"size": size, "sha256": sha256}
+        for name in (archive.TOPOLOGY_FILE, archive.MOL2_FILE, archive.INFO_FILE, archive.NAME_FILE):
+            if name in kept_manifest["files"]:
+                files[name] = archive._copy_unchanged(kept_dir / name, staging / name)
+                if files[name] != {key: kept_manifest["files"][name][key] for key in ("size", "sha256")}:
+                    raise VerificationError(f"{name} of the kept entry changed while it was copied")
+        if archive.NAME_FILE not in files:
+            payload = _name_json(glycam_name)
+            archive._write_bytes(staging / archive.NAME_FILE, payload)
+            files[archive.NAME_FILE] = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+        for segment in segments:
+            irregularities = segment.get("source_irregularities")
+            if irregularities is not None:
+                warnings.append(
+                    f"segment {segment['index']} ({segment['name']}) comes from an irregular source that was "
+                    f"archived with repair: {irregularities['frames_kept']} of its "
+                    f"{irregularities['frames_in_source']} frames are in the archive, "
+                    f"{irregularities['bytes_ignored']} of its bytes are not (source_irregularities of the segment)"
+                )
+
+        kept_changes, kept_cells = _changes_of_summary(kept_manifest["box"])
+        absorbed_changes, absorbed_cells = _changes_of_summary(absorbed_manifest["box"])
+        changes = kept_changes + [(frames_before + frame, cell) for frame, cell in absorbed_changes]
+        not_listed = kept_cells - len(kept_changes) + absorbed_cells - len(absorbed_changes)
+        hashes = [segment["source"].get("sha256") for segment in segments]
+
+        import mdtraj
+
+        manifest: Dict[str, Any] = {
+            "schema": archive.ARCHIVE_SCHEMA,
+            "schema_version": archive.SCHEMA_VERSION,
+            "glycam_name": glycam_name,
+            "folder": folder,
+            "object_key_prefix": archive.object_key_prefix(glycam_name),
+            "atoms": atoms,
+            "frames": frames,
+            "box": box_summary(changes, not_listed),
+            "trajectory": {
+                "file": archive.TRAJECTORY_FILE,
+                "format": "xtc",
+                "precision": archive.XTC_PRECISION,
+                "resolution_nm": 1.0 / archive.XTC_PRECISION,
+                "resolution_angstrom": 10.0 / archive.XTC_PRECISION,
+                "step_and_time": "frame index from 0; the source carries no times",
+                "coordinates_sha256": back["coordinates_sha256"],
+                "coordinates_sha256_of": "int32 little-endian [frames, atoms, 3] in units of 0.001 angstrom",
+            },
+            "files": files,
+            "source": {
+                "folder": kept_manifest["source"]["folder"],
+                "file": None,
+                "size": sum(int(segment["source"].get("size") or 0) for segment in segments),
+                "sha256": _hash_of_hashes(hashes) if all(isinstance(value, str) for value in hashes) else None,
+                "sha256_of": (
+                    "the SHA-256 values of the source files of the segments, in order, as hexadecimal text "
+                    "joined by line feeds"
+                ),
+                "glycam_name_from": kept_manifest["source"].get("glycam_name_from"),
+                "segments": len(segments),
+                "negative_zero_coordinates": sum(
+                    int(segment["source"].get("negative_zero_coordinates") or 0) for segment in segments),
+                "frames_parsed_line_by_line": sum(
+                    int(segment["source"].get("frames_parsed_line_by_line") or 0) for segment in segments),
+            },
+            "segments_version": archive.SEGMENTS_VERSION,
+            "segments": segments,
+            "extends": dict(_carried_entry(kept_manifest, kept_sha256), **(
+                {"merged_from": kept_manifest["merged_from"]} if kept_manifest.get("merged_from") else {})),
+            "merged_from": {
+                "glycoshape_id": absorbed_id,
+                "kept_glycoshape_id": kept_id,
+                **_carried_entry(absorbed_manifest, absorbed_sha256),
+                "first_frame": frames_before,
+                "atom_records": atom_records,
+                "merged_from": absorbed_manifest.get("merged_from"),
+            },
+            "verification": {
+                "passed": True,
+                "comparison": (
+                    "no frame is new: the first trajectory_bytes bytes of trajectory.xtc are the trajectory of the "
+                    "kept entry and the frames of the absorbed entry follow with the bytes they had, step and time "
+                    "set to their index in the whole (SHA-256 of both trajectories while they were read); read "
+                    "back, step and time are the frame index and the coordinates of every segment have the "
+                    "digest of its record"
+                ),
+                "frames_compared": 0,
+                "coordinates_compared": 0,
+                "mismatched_coordinates": 0,
+                "max_abs_difference_angstrom": back["max_abs_difference_angstrom"],
+                "max_abs_coordinate_angstrom": back["max_abs_coordinate_angstrom"],
+                "segments_checked": len(segments),
+                "frames_carried_over": frames_before,
+                "frames_merged": absorbed_frames,
+                "carried_over": {"trajectory_bytes": bytes_before,
+                                 "trajectory_sha256": kept_manifest["files"][archive.TRAJECTORY_FILE]["sha256"]},
+                "merged": {"trajectory_bytes": renumbered["bytes"], "trajectory_sha256": renumbered["sha256_read"],
+                           "trajectory_sha256_renumbered": renumbered["sha256_written"]},
+            },
+            "converter": {
+                "name": "lib/archive_segments.py",
+                "version": archive.CONVERTER_VERSION,
+                "date": archive._utc_now(),
+                "mdtraj": mdtraj.__version__,
+                "numpy": np.__version__,
+                "python": platform.python_version(),
+                "machine": platform.machine(),
+            },
+            "warnings": warnings,
+        }
+        archive._write_json_atomic(staging / archive.MANIFEST_FILE, manifest)
+        archive._fsync_path(staging)
+
+        if final.exists():
+            shutil.rmtree(final)
+        os.rename(staging, final)
+        archive._fsync_path(archive_dir)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    finished = time.perf_counter()
+    return {
+        "status": "merged",
+        "manifest": manifest,
+        "entry": str(final),
+        "timing": {"seconds": finished - started, "copy_seconds": copied - started,
+                   "read_back_seconds": verified - copied},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pruning runs of a stored entry
+# ---------------------------------------------------------------------------
+class _RangeDigests:
+    """SHA-256 of the coordinates of frame ranges of a trajectory (with gaps between them); a :func:`_read_back` callback."""
+
+    def __init__(self, ranges: Sequence[Tuple[int, int]]) -> None:
+        self._ranges = [(int(first), int(first) + int(frames)) for first, frames in ranges]
+        self._digests = [hashlib.sha256() for _ in self._ranges]
+
+    def __call__(self, first: int, values: np.ndarray) -> None:
+        last = first + len(values)
+        for (start, stop), digest in zip(self._ranges, self._digests):
+            low, high = max(start, first), min(stop, last)
+            if low < high:
+                digest.update(np.ascontiguousarray(values[low - first:high - first]))
+
+    def hexdigests(self) -> List[str]:
+        return [digest.hexdigest() for digest in self._digests]
+
+
+def _box_of_frames(summary: Dict[str, Any], first: int, frames: int) -> Tuple[List[Change], int]:
+    """The cell changes of frames ``first`` to ``first + frames`` of a ``box`` summary, counted from ``first``."""
+    changes, total = _changes_of_summary(summary)
+    inside: List[Change] = []
+    current: Optional[Tuple[float, ...]] = None
+    for frame, cell in sorted(changes, key=lambda item: item[0]):
+        if frame <= first:
+            current = cell
+        elif frame < first + frames:
+            inside.append((frame - first, cell))
+    return [(0, current)] + inside, max(0, total - len(changes))
+
+
+def _pruned_is_current(final: Path, sha256: str, removed: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """Manifest of ``final`` when it verifies and is the entry of ``sha256`` without exactly ``removed``, else None."""
+    if not (final / archive.MANIFEST_FILE).is_file() or not archive.verify_entry(final, deep=False)["ok"]:
+        return None
+    manifest = archive.load_manifest(final)
+    pruned = manifest.get("pruned") or {}
+    if pruned.get("manifest_sha256") != sha256 or sorted(row.get("name") for row in pruned.get("removed") or []) \
+            != sorted(removed):
+        return None
+    return manifest
+
+
+def prune_entry(
+    entry: PathLike,
+    archive_dir: PathLike,
+    runs: Sequence[Dict[str, Any]],
+    remove: Sequence[str],
+    *,
+    record: Optional[Dict[str, Any]] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Write the stored entry ``entry`` without the runs named in ``remove``, under the same name.
+
+    ``runs`` are all runs of the entry in frame order, as
+    ``lib.replicas.replica_boundaries`` gives them (``name``, ``first_frame``,
+    ``frames``, ``segment``, ``time_per_frame_ps``, ``basis``): the names
+    are those of ``replicas.json`` and ``--exclude-replica``.  The frames of
+    the other runs are copied with the bytes they have, step and time set to
+    their index in the new trajectory (as :func:`merge_entries` does); the
+    removed frames are not written.  Every run that is kept becomes a segment
+    named as the run, so the replica diagnostics name it as before: a run
+    that was a whole segment keeps its record; a run that was part of one
+    (or of an entry without segments, divided by its source records or by
+    the class test) gets a record of its own with ``pruned_from`` (where its
+    frames were), its box and the ``run`` record of what it was part of.
+    ``topology.pdb``, ``structure.mol2``, ``info.json`` and ``name.json`` are
+    kept; ``source`` is that of the entry (the frames still come from those
+    files); ``extends`` and ``merged_from`` of the entry are not kept (its
+    frames no longer begin with those of the entry it extended) and are
+    found in the manifest before, whose SHA-256 ``pruned`` records with the
+    removed and the kept runs (frame ranges before and after) and
+    ``record`` (who, why, when, the GlycoShape ID).
+
+    Verified as written: the coordinates of every kept run, decoded from the
+    new trajectory, have the digest of the same frames decoded from the
+    entry, and step and time are the frame index.  Refused
+    (:class:`SourceError`): a name that is not a run, nothing to remove,
+    every run removed, runs that do not cover the frames once.  An existing
+    entry that is this prune is left alone (``status`` ``"skipped"``) unless
+    ``force``.  Returns ``{"status", "manifest", "entry", "timing"}``.
+    """
+    started = time.perf_counter()
+    entry_dir = Path(entry).resolve()
+    archive_dir = Path(archive_dir)
+    if not archive.is_archive_entry(entry_dir):
+        raise SourceError(f"{entry_dir} is not an archive entry (manifest.json and trajectory.xtc)")
+    checked = archive.verify_entry(entry_dir, deep=False, check_folder=False)
+    if not checked["ok"]:
+        raise VerificationError(f"the entry to prune does not verify: {'; '.join(checked['errors'])}")
+    manifest = archive.load_manifest(entry_dir)
+    sha256 = archive._sha256_file(entry_dir / archive.MANIFEST_FILE)[1]
+    glycam_name = manifest["glycam_name"]
+    total, atoms = int(manifest["frames"]), int(manifest["atoms"])
+    runs = [dict(run) for run in runs]
+    position = 0
+    for run in runs:
+        if int(run["first_frame"]) != position or int(run["frames"]) < 1:
+            raise SourceError(f"the runs do not cover the {total} frames of the entry once (at {run.get('name')})")
+        position += int(run["frames"])
+    if position != total:
+        raise SourceError(f"the runs hold {position} frames, the entry has {total}")
+    names = [run["name"] for run in runs]
+    unknown = sorted(set(remove) - set(names))
+    if unknown:
+        raise SourceError(f"no run named {', '.join(map(repr, unknown))}; the runs of the entry are {', '.join(names)}")
+    removed = [run for run in runs if run["name"] in set(remove)]
+    kept = [run for run in runs if run["name"] not in set(remove)]
+    if not removed:
+        raise SourceError("no run to remove")
+    if not kept:
+        raise SourceError(f"every run of the entry would be removed ({', '.join(names)}): one has to stay")
+    final = archive_dir / archive.entry_folder_name(glycam_name)
+    archive_real = archive_dir.resolve()
+    if archive_real == entry_dir or entry_dir in archive_real.parents:
+        raise SourceError(f"the archive directory must be outside {entry_dir}")
+    if final.resolve() == entry_dir:
+        raise SourceError("the entry to prune is the entry that would be written; give another archive directory")
+    if final.exists() and not (final / archive.MANIFEST_FILE).is_file():
+        raise ArchiveError(f"{final} exists and is not an archive entry; it is left untouched")
+    if not force:
+        current = _pruned_is_current(final, sha256, [run["name"] for run in removed])
+        if current is not None:
+            return {"status": "skipped", "manifest": current, "entry": str(final), "timing": {}}
+
+    staging = archive_dir / archive.STAGING_DIR / hashlib.sha256(glycam_name.encode("utf-8")).hexdigest()[:32]
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        # The trajectory: the frames of the kept runs, renumbered; the bytes of each run counted.
+        owner = np.empty(total, dtype=np.int64)
+        for index, run in enumerate(runs):
+            owner[int(run["first_frame"]):int(run["first_frame"]) + int(run["frames"])] = index
+        keep = {index for index, run in enumerate(runs) if run["name"] not in set(remove)}
+        run_bytes = {index: 0 for index in keep}
+        read = hashlib.sha256()
+        written = 0
+        with open(staging / archive.TRAJECTORY_FILE, "wb") as target:
+            for frame, (head, body) in enumerate(_xtc_frames(entry_dir / archive.TRAJECTORY_FILE, atoms)):
+                read.update(head)
+                read.update(body)
+                if frame >= total:
+                    raise VerificationError(f"{archive.TRAJECTORY_FILE} holds more frames than its manifest says")
+                if int(owner[frame]) in keep:
+                    target.write(_renumbered(head, written))
+                    target.write(body)
+                    run_bytes[int(owner[frame])] += len(head) + len(body)
+                    written += 1
+            target.flush()
+            os.fsync(target.fileno())
+        if read.hexdigest() != manifest["files"][archive.TRAJECTORY_FILE]["sha256"]:
+            raise VerificationError("the trajectory of the entry changed while it was copied")
+        copied = time.perf_counter()
+
+        # What the kept frames are in the entry, and in the new trajectory.
+        reference = _RangeDigests([(run["first_frame"], run["frames"]) for run in kept])
+        archive._read_back(entry_dir, atoms, on_frames=reference)
+        digests = archive._SegmentDigests([int(run["frames"]) for run in kept])
+        back = archive._read_back(staging, atoms, on_frames=digests)
+        frames = sum(int(run["frames"]) for run in kept)
+        if back["frames"] != frames or written != frames:
+            raise VerificationError(f"{archive.TRAJECTORY_FILE} holds {back['frames']} frames, {frames} were kept")
+        if not back["index_ok"]:
+            raise VerificationError("step and time of the trajectory are not the frame index")
+        for run, before, after in zip(kept, reference.hexdigests(), digests.hexdigests()):
+            if before != after:
+                raise VerificationError(f"the coordinates of run {run['name']} are not those it had in the entry")
+        verified = time.perf_counter()
+
+        # The segments: one per kept run.
+        segments_before = archive.segments_of(manifest)
+        segments: List[Dict[str, Any]] = []
+        changes: List[Change] = []
+        not_listed = 0
+        position = offset = 0
+        for index, run in enumerate(runs):
+            if index not in keep:
+                continue
+            first, size = int(run["first_frame"]), int(run["frames"])
+            base = segments_before[run["segment"]] if run.get("segment") is not None and segments_before else None
+            if base is not None and int(base["first_frame"]) == first and int(base["frames"]) == size:
+                segment = dict(base, index=len(segments), first_frame=position, trajectory_offset=offset)
+                box_changes, extra = _changes_of_summary(base["box"])
+                extra -= len(box_changes)
+            else:
+                start = first - (int(base["first_frame"]) if base is not None else 0)
+                box_changes, extra = _box_of_frames((base or manifest)["box"], start, size)
+                source = dict((base or manifest).get("source") or {})
+                segment = {
+                    "index": len(segments), "name": run["name"], "first_frame": position, "frames": size,
+                    "coordinates_sha256": reference.hexdigests()[len(segments)],
+                    "trajectory_offset": offset, "trajectory_bytes": run_bytes[index],
+                    "time_per_frame_ps": run.get("time_per_frame_ps"),
+                }
+                if base is not None and base.get("run") is not None:
+                    segment["run"] = base["run"]
+                segment.update({
+                    "box": box_summary(box_changes, extra),
+                    "atom_records": (base or {}).get("atom_records", "identical"),
+                    "source": {key: source.get(key) for key in ("folder", "file", "size", "sha256")},
+                    "pruned_from": {
+                        "glycam_name": glycam_name, "manifest_sha256": sha256, "first_frame": first,
+                        "segment": run.get("segment"), "basis": run.get("basis"),
+                        "carried_from": (base or {}).get("carried_from"), "merged_from": (base or {}).get("merged_from"),
+                    },
+                })
+            segments.append(segment)
+            changes.extend((position + frame, cell) for frame, cell in box_changes)
+            not_listed += extra
+            position += size
+            offset += run_bytes[index]
+
+        files: Dict[str, Dict[str, Any]] = {}
+        size, digest = archive._sha256_file(staging / archive.TRAJECTORY_FILE)
+        files[archive.TRAJECTORY_FILE] = {"size": size, "sha256": digest}
+        for name in (archive.TOPOLOGY_FILE, archive.MOL2_FILE, archive.INFO_FILE, archive.NAME_FILE):
+            if name in manifest["files"]:
+                files[name] = archive._copy_unchanged(entry_dir / name, staging / name)
+                if files[name] != {key: manifest["files"][name][key] for key in ("size", "sha256")}:
+                    raise VerificationError(f"{name} of the entry changed while it was copied")
+        if archive.NAME_FILE not in files:
+            payload = _name_json(glycam_name)
+            archive._write_bytes(staging / archive.NAME_FILE, payload)
+            files[archive.NAME_FILE] = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+
+        def rows(selected: Sequence[Dict[str, Any]], after: bool) -> List[Dict[str, Any]]:
+            out, at = [], 0
+            for run in selected:
+                row = {"name": run["name"], "first_frame": int(run["first_frame"]), "frames": int(run["frames"]),
+                       "basis": run.get("basis")}
+                if after:
+                    row["first_frame_after"] = at
+                    at += int(run["frames"])
+                out.append(row)
+            return out
+
+        import mdtraj
+
+        new_manifest: Dict[str, Any] = {
+            "schema": archive.ARCHIVE_SCHEMA,
+            "schema_version": archive.SCHEMA_VERSION,
+            "glycam_name": glycam_name,
+            "folder": manifest["folder"],
+            "object_key_prefix": manifest["object_key_prefix"],
+            "atoms": atoms,
+            "frames": frames,
+            "box": box_summary(changes, not_listed),
+            "trajectory": dict(manifest["trajectory"], coordinates_sha256=back["coordinates_sha256"]),
+            "files": files,
+            "source": dict(manifest["source"], segments=len(segments)),
+            "segments_version": archive.SEGMENTS_VERSION,
+            "segments": segments,
+            "pruned": {
+                "glycam_name": glycam_name, "manifest_sha256": sha256, "frames_before": total,
+                "removed": rows(removed, False), "kept": rows(kept, True),
+                **(record or {}),
+                "previous": manifest.get("pruned"),
+            },
+            "verification": {
+                "passed": True,
+                "comparison": (
+                    "no frame is new: the frames of the kept runs follow with the bytes they had in the entry, step "
+                    "and time set to their index (SHA-256 of the trajectory of the entry while it was read); read "
+                    "back, step and time are the frame index and the coordinates of every kept run have the digest "
+                    "of the same frames decoded from the entry"
+                ),
+                "frames_compared": 0,
+                "coordinates_compared": 0,
+                "mismatched_coordinates": 0,
+                "max_abs_difference_angstrom": back["max_abs_difference_angstrom"],
+                "max_abs_coordinate_angstrom": back["max_abs_coordinate_angstrom"],
+                "segments_checked": len(segments),
+                "frames_kept": frames,
+                "frames_removed": total - frames,
+            },
+            "converter": {
+                "name": "lib/archive_segments.py",
+                "version": archive.CONVERTER_VERSION,
+                "date": archive._utc_now(),
+                "mdtraj": mdtraj.__version__,
+                "numpy": np.__version__,
+                "python": platform.python_version(),
+                "machine": platform.machine(),
+            },
+            "warnings": list(manifest.get("warnings") or []),
+        }
+        archive._write_json_atomic(staging / archive.MANIFEST_FILE, new_manifest)
+        archive._fsync_path(staging)
+        if final.exists():
+            shutil.rmtree(final)
+        os.rename(staging, final)
+        archive._fsync_path(archive_dir)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finished = time.perf_counter()
+    return {
+        "status": "pruned",
+        "manifest": new_manifest,
+        "entry": str(final),
+        "timing": {"seconds": finished - started, "copy_seconds": copied - started, "read_back_seconds": verified - copied},
     }

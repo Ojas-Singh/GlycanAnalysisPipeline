@@ -8,6 +8,11 @@
     recover   finish a publication that was interrupted while its files were being switched
     update-metadata   publish a published entry again with other curated metadata, no new analysis
     reanalyse         analyse the stored raw entry of a published glycan again and publish it in place
+    merge             one ID per simulated glycan: give the kept ID the frames of another ID of the same glycan,
+                      publish the union, withdraw the other ID and move its raw entry to the history
+                      (--drop-runs: withdraw the other ID without pooling its runs; the kept entry stays as it is)
+    prune-runs        remove runs (another stereoisomer) from the raw entry of a glycan and publish the rest
+    scrub-raw         remove personal data (fields of info.json) from a raw entry and its copies in the history
 
 ``publish`` and ``replace`` take an extracted bundle directory (bundle.json,
 archive/, static/, result.json, run.log) and a submission record::
@@ -37,6 +42,20 @@ lib/entry_ops.py); ``reanalyse`` the ID and what to do differently::
 
 Both are published like ``replace`` (same ID), keep a record of the version in
 publish-state/<static>/history/, and take --expect-hash like ``publish``.
+
+``merge`` keeps ``--id`` and withdraws ``--from`` (lib/entry_ops.py, ``merge``)::
+
+    publish_entry.py merge --id GS00303 --from GS00453 --accept-salt-difference --note "same glycan" \
+        --analysis-workers 12 --memory-limit-gb 30 --work-dir w/ --dry-run --report r.json
+    publish_entry.py merge --id GS00037 --from GS00013 --drop-runs --note "the beta anomer is kept" \
+        --work-dir w/ --dry-run --report r.json
+
+``prune-runs`` and ``scrub-raw`` change the raw archive (lib/entry_ops.py)::
+
+    publish_entry.py prune-runs --id GS00276 --run run_2 --run run_3 --note "inverted stereocentre" \
+        --work-dir w/ --dry-run --report r.json
+    publish_entry.py scrub-raw --id GS00954 --field email --field username --note "personal data" \
+        --work-dir w/ --dry-run --report r.json      # then --expect-hash <scrub.plan_hash>
 
 Exit status: 0 done (or a dry run that would be published), 1 stopped (run
 again), 2 refused by a check (nothing was written), 3 the database is locked
@@ -78,7 +97,8 @@ def _levels(text: str):
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("publish", "replace", "withdraw", "status", "recover", "update-metadata", "reanalyse"):
+    for name in ("publish", "replace", "withdraw", "status", "recover", "update-metadata", "reanalyse", "merge",
+                 "prune-runs", "scrub-raw"):
         command = commands.add_parser(name)
         command.add_argument("--static-bucket", help="Database bucket (default: GLYCOSHAPE_S3_STATIC_BUCKET).")
         command.add_argument("--raw-bucket", help="Archive bucket (default: GLYCOSHAPE_S3_RAW_BUCKET).")
@@ -88,12 +108,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                              help="Parallel requests (default 8); also how many copies of the switch are made at the "
                                   "same time, which is what its duration depends on.")
         command.add_argument("--report", type=Path, help="Write the report of the run to this JSON file.")
-        if name in ("publish", "replace", "withdraw", "recover", "update-metadata", "reanalyse"):
+        if name in ("publish", "replace", "withdraw", "recover", "update-metadata", "reanalyse", "merge", "prune-runs",
+                    "scrub-raw"):
             command.add_argument("--lock-ttl", type=float, default=3600.0,
                                  help="Seconds after which the lock of a run that died may be taken over (default 3600).")
             command.add_argument("--break-lock", action="store_true",
                                  help="Take the lock although another run holds it: only when that run is known to be gone.")
-        if name in ("publish", "replace", "withdraw", "update-metadata", "reanalyse"):
+        if name in ("publish", "replace", "withdraw", "update-metadata", "reanalyse", "merge", "prune-runs", "scrub-raw"):
             command.add_argument("--work-dir", type=Path,
                                  help="Work folder with the journal (default: <bundle>.publish; required for withdraw).")
             command.add_argument("--cache-dir", type=Path,
@@ -112,6 +133,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         if name == "update-metadata":
             command.add_argument("--changes", type=Path, required=True,
                                  help="Changes record (JSON, schema glycoshape-entry-changes; lib/entry_ops.py).")
+        if name == "merge":
+            command.add_argument("--id", required=True, help="GlycoShape ID that is kept and gets the frames of the other.")
+            command.add_argument("--from", dest="from_id", required=True, metavar="ID",
+                                 help="GlycoShape ID of the same glycan that is withdrawn into --id; the ID is free "
+                                      "again afterwards (the next new glycan may take it).")
+            command.add_argument("--accept-difference", action="append", default=[], metavar="FIELD",
+                                 help="Merge although the simulation conditions differ in FIELD (repeatable: package, "
+                                      "forcefield, water, temperature, pressure, salt, time_per_frame); the value of "
+                                      "--id stands (for salt every run keeps its own), and the difference is kept in "
+                                      "the history.")
+            command.add_argument("--accept-salt-difference", action="store_true",
+                                 help="The same as --accept-difference salt: the runs keep their own salt "
+                                      "concentrations (archetype.salt_by_run), for a glycan whose charge makes the salt "
+                                      "not matter.")
+            command.add_argument("--drop-runs", action="store_true",
+                                 help="Withdraw --from without pooling its runs (the same glycan simulated as the other "
+                                      "reducing-end anomer): no raw merge, no analysis, the folder of --id stays as it "
+                                      "is; the simulation conditions are reported, not compared.")
+            command.add_argument("--note", default="", help="Why; kept in the history.")
+            command.add_argument("--author", default="", help="Who asked; kept in the history.")
+            command.add_argument("--analysis-workers", type=int, default=8, help="Cores of the analysis (default 8).")
+            command.add_argument("--memory-limit-gb", type=float,
+                                 help="Refuse when the analysis is estimated to need more memory than this.")
         if name == "reanalyse":
             command.add_argument("--id", required=True, help="GlycoShape ID of the published entry.")
             command.add_argument("--exclude-replica", action="append", default=[], metavar="NAME",
@@ -127,7 +171,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             command.add_argument("--analysis-workers", type=int, default=8, help="Cores of the analysis (default 8).")
             command.add_argument("--memory-limit-gb", type=float,
                                  help="Refuse an entry whose analysis is estimated to need more memory than this.")
-        if name in ("publish", "replace", "update-metadata", "reanalyse"):
+        if name == "prune-runs":
+            command.add_argument("--id", required=True, help="GlycoShape ID of the published entry.")
+            command.add_argument("--run", action="append", required=True, metavar="NAME",
+                                 help="A run to remove (repeatable), named as replicas.json and --exclude-replica name "
+                                      "it (run_2, stored_run_1, a segment name).")
+            command.add_argument("--note", required=True, help="Why the runs go; kept in the manifest and the history.")
+            command.add_argument("--author", default="", help="Who asked; kept in the manifest and the history.")
+            command.add_argument("--analysis-workers", type=int, default=8, help="Cores of the analysis (default 8).")
+            command.add_argument("--memory-limit-gb", type=float,
+                                 help="Refuse when the analysis is estimated to need more memory than this.")
+        if name == "scrub-raw":
+            command.add_argument("--id", required=True, help="GlycoShape ID of the published entry.")
+            command.add_argument("--field", action="append", required=True, metavar="KEY",
+                                 help="A JSON key to remove wherever the raw entry and its history hold it (repeatable: "
+                                      "email, username, ...).")
+            command.add_argument("--note", required=True, help="Why; kept in the manifest and the history.")
+            command.add_argument("--author", default="", help="Who asked; kept in the manifest and the history.")
+            command.add_argument("--expect-hash", help="Write only when the plan has this hash (scrub.plan_hash of a dry run).")
+        if name in ("publish", "replace", "update-metadata", "reanalyse", "merge", "prune-runs"):
             command.add_argument("--expect-hash", help="Publish only when the completed folder has this hash (of a dry run).")
             command.add_argument("--refresh-metadata", action="store_true",
                                  help="Complete the folder again even when the work folder has it (new lookups).")
@@ -160,9 +222,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be at least 1")
-    if args.command in ("withdraw", "update-metadata", "reanalyse") and args.work_dir is None:
+    if args.command in ("withdraw", "update-metadata", "reanalyse", "merge", "prune-runs", "scrub-raw") \
+            and args.work_dir is None:
         parser.error(f"{args.command} needs --work-dir")
-    if args.command == "reanalyse" and args.analysis_workers < 1:
+    if args.command in ("reanalyse", "merge", "prune-runs") and args.analysis_workers < 1:
         parser.error("--analysis-workers must be at least 1")
     return args
 
@@ -204,6 +267,10 @@ def _simulation_line(simulation: dict) -> str:
 def _print_entry(report: dict) -> None:
     entry = report.get("entry")
     if not entry:
+        return
+    if entry.get("unchanged"):                  # merge --drop-runs: the folder of the kept ID stays as it is
+        _say(f"entry {report['glycoshape_id']} {str(report.get('glycam_name'))[:90]}: unchanged")
+        _say(f"  folder: {entry['file_count']} files, {_megabytes(entry['total_size'])}, hash {entry['hash']}")
         return
     identity = entry["identity"]["archetype"]
     _say(f"entry {report['glycoshape_id']} {report['glycam_name'][:90]}")
@@ -336,6 +403,9 @@ def _status(args: argparse.Namespace) -> int:
         _say(f"{entry['glycoshape_id']}: {entry['state']}; {entry['stored_objects']} object(s) stored"
              + (f"; {entry['file_count']} files, hash {entry['hash']}" if "hash" in entry else "")
              + (f"; raw entry {'stored' if entry.get('raw', {}).get('stored') else 'not stored'}" if "raw" in entry else ""))
+        merged_into = (entry.get("withdrawn") or {}).get("merged_into")
+        if merged_into:
+            _say(f"  withdrawn into {merged_into} by a merge: the ID is free again (the next new glycan may take it)")
         unanswered = ((entry.get("record") or {}).get("lookups") or {}).get("unanswered")
         if unanswered:
             _say(f"  lookups without an answer at publication: {', '.join(unanswered)}")
@@ -345,7 +415,37 @@ def _status(args: argparse.Namespace) -> int:
 
 
 def _print_operation(report: dict) -> None:
-    """The lines an administrator reads of an update-metadata or reanalyse report."""
+    """The lines an administrator reads of an update-metadata, reanalyse, merge or prune-runs report."""
+    prune = report.get("prune")
+    if prune:
+        removed = ", ".join(f"{row['name']} (frames {row['first_frame']}-{row['first_frame'] + row['frames'] - 1})"
+                            for row in prune["removed"])
+        frames = prune["frames"]
+        _say(f"prune: remove {removed}; {frames['before']} -> {frames['after']} frames; runs after: "
+             f"{', '.join(prune['names_after'])}" + ("" if prune.get("names_unchanged") else " (renamed)"))
+        if prune.get("length_us"):
+            _say(f"  length {prune['length_us']['before']} -> {prune['length_us']['after']} us")
+        _say(f"  the entry before goes to {prune['history_prefix'][:100]}")
+    merge = report.get("merge")
+    if merge:
+        frames = merge["frames"]
+        if merge.get("drop_runs"):
+            anomers = merge.get("anomers") or {}
+            _say(f"merge --drop-runs: {merge['from']} ({str(merge['from_glycam_name'])[:70]}, {anomers.get('absorbed')}) "
+                 f"into {report['glycoshape_id']} ({anomers.get('kept')}); its {frames['absorbed']} frames are not "
+                 f"pooled; {report['glycoshape_id']} keeps its {frames['kept']} frames and its folder")
+        else:
+            _say(f"merge: {merge['from']} ({str(merge['from_glycam_name'])[:70]}) into {report['glycoshape_id']}; "
+                 f"frames {frames['kept']} + {frames['absorbed']} = {frames['total']}"
+                 + (f"; {len(merge['segments'])} segment(s)" if merge.get("segments") else ""))
+        for item in merge["differences"]:
+            _say(f"  {item['field']}: {report['glycoshape_id']} {item['kept']}, {merge['from']} {item['absorbed']} "
+                 + ("(reported only: the runs are not pooled)" if merge.get("drop_runs")
+                    else "(accepted: every run keeps its own)" if item["accepted"] and item["field"] == "salt"
+                    else f"(accepted: the value of {report['glycoshape_id']} stands)" if item["accepted"]
+                    else f"(refused without --accept-difference {item['field']})"))
+        if merge.get("salt_by_run"):
+            _say("  salt by run: " + ", ".join(f"{name} {value:g} mM" for name, value in merge["salt_by_run"].items()))
     rename = report.get("rename")
     if rename:
         raw = rename.get("raw") or {}
@@ -380,6 +480,19 @@ def _print_operation(report: dict) -> None:
         files = diff["files"]
         _say(f"  files: {len(files['added'])} added, {len(files['removed'])} removed, {len(files['changed'])} changed, "
              f"{files['unchanged']} unchanged; {_megabytes(files['bytes_before'])} -> {_megabytes(files['bytes_after'])}")
+    withdrawal = report.get("withdrawal")
+    if withdrawal:
+        static = withdrawal.get("static") or {}
+        _say(f"withdraw {withdrawal['glycoshape_id']} (merged into {withdrawal['merged_into']}"
+             f"{'' if withdrawal.get('runs_pooled', True) else ', runs not pooled'}): {withdrawal['status']}; "
+             "the ID is free again (the next new glycan may take it)"
+             + (f"; {static['delete_afterwards']} file(s) deleted afterwards" if "delete_afterwards" in static else "")
+             + (f"; global_hash -> {static['target_global_hash'][:16]}..." if static.get("target_global_hash") else ""))
+        raw = withdrawal.get("raw")
+        if raw:
+            _say(f"raw {raw['from_key_prefix'][:80]} -> {raw['history_prefix'][:80]}: {raw['relation']}; copy "
+                 f"{len(raw['copy'])} file(s) ({_megabytes(raw['copy_bytes'])}) inside the storage, then merged.json; "
+                 f"index {raw['index']}; delete {len(raw['delete'])} object(s) afterwards")
 
 
 def _operation(args: argparse.Namespace) -> int:
@@ -403,6 +516,16 @@ def _operation(args: argparse.Namespace) -> int:
             except (OSError, ValueError) as exc:
                 raise SystemExit(f"cannot read the changes record {args.changes}: {exc}")
             report = entry_ops.update_metadata(changes, _target(args), args.work_dir, **common)
+        elif args.command == "prune-runs":
+            report = entry_ops.prune_runs(
+                args.id, args.run, _target(args), args.work_dir, note=args.note, author=args.author,
+                workers=args.analysis_workers, memory_limit_gb=args.memory_limit_gb, **common)
+        elif args.command == "merge":
+            report = entry_ops.merge(
+                args.id, args.from_id, _target(args), args.work_dir,
+                accept_differences=args.accept_difference + (["salt"] if args.accept_salt_difference else []),
+                note=args.note, author=args.author, drop_runs=args.drop_runs, workers=args.analysis_workers,
+                memory_limit_gb=args.memory_limit_gb, **common)
         else:
             submission = None
             if args.submission is not None:
@@ -422,10 +545,41 @@ def _operation(args: argparse.Namespace) -> int:
     _print_operation(report)
     _print_plan(report)
     status = _finish(args, report)
-    if status == EXIT_DONE:
+    if status == EXIT_DONE and args.command == "merge":
+        _say(f"dry run: nothing was written to the storage; {report['status']}" if args.dry_run
+             else f"merge: {report['status']} {args.from_id} into {report['glycoshape_id']} "
+                  f"(global_hash {report['database_after']['global_hash'][:16]}...) in {report['seconds']} s")
+    elif status == EXIT_DONE:
         _say("dry run: nothing was written to the storage; this version would be published" if args.dry_run
              else f"{args.command}: {report['status']} {report['glycoshape_id']} "
                   f"(global_hash {report['static']['target_global_hash'][:16]}...) in {report['seconds']} s")
+    return status
+
+
+def _scrub(args: argparse.Namespace) -> int:
+    from lib import entry_ops, entry_publish
+
+    try:
+        report = entry_ops.scrub_raw(
+            args.id, args.field, _target(args), args.work_dir, note=args.note, author=args.author,
+            dry_run=args.dry_run, expect_hash=args.expect_hash, lock_ttl=args.lock_ttl, break_lock=args.break_lock,
+            cache_dir=args.cache_dir, log=_say)
+    except entry_publish.Refused as exc:
+        report = exc.report or {"refused": [str(exc)]}
+    scrub = report.get("scrub")
+    if scrub:
+        _say(f"scrub {', '.join(scrub['fields'])} of {report['glycoshape_id']}: values found {scrub['values_found']}; "
+             f"raw {len(scrub['raw'])} file(s), history {len(scrub['history'])} object(s) "
+             f"({', '.join(name[:40] for name in scrub['history_names'])}), documents {len(scrub['state'])}; "
+             f"published folder: {scrub['static']['files_scanned']} files scanned, {len(scrub['static']['certain'])} "
+             "with the fields")
+        for line in scrub["remains"]:
+            _say(f"  remains: {line}")
+        _say(f"  plan hash {scrub['plan_hash']}")
+    status = _finish(args, report)
+    if status == EXIT_DONE:
+        _say("dry run: nothing was written to the storage; " + report["status"] if args.dry_run
+             else f"scrub-raw: {report['status']} {report['glycoshape_id']} in {report['seconds']} s")
     return status
 
 
@@ -445,7 +599,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     from lib import entry_complete, entry_publish, static_delta, static_publish
 
     handlers = {"publish": _publish, "replace": _publish, "withdraw": _withdraw, "status": _status, "recover": _recover,
-                "update-metadata": _operation, "reanalyse": _operation}
+                "update-metadata": _operation, "reanalyse": _operation, "merge": _operation, "prune-runs": _operation,
+                "scrub-raw": _scrub}
     try:
         return handlers[args.command](args)
     except entry_publish.LockHeld as exc:
