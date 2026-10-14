@@ -621,6 +621,56 @@ def test_a_merge_gives_the_kept_id_the_frames_of_both_and_withdraws_the_other(pa
     assert "salt_by_run" not in pair.data()["archetype"]
 
 
+def test_after_a_merge_the_absorbed_id_and_its_old_name_are_free_for_new_glycans(pair, made_bundle):
+    pair.merge(accept_differences=["salt"])
+    status = entry_publish.status(pair.target, OTHER_GS)["entry"]
+    assert status["state"] == "withdrawn" and status["withdrawn"]["merged_into"] == GS and status["id_free"]
+    raw_history = pair.keys(f"raw-history/raw/{ALT_NAME}/")
+    old_history = pair.keys(f"{STATE}/history/{OTHER_GS}/")
+
+    # the old name of the absorbed entry, a new glycan under a new ID: not bound to the ID it had
+    publish_second(pair.target, made_bundle, pair.tmp, glycan_id="GS01070", name=ALT_NAME, salt=150.0)
+    # another glycan under the absorbed ID: the ID was free; its entry of withdrawn.json goes
+    new_name = "DGlcpa1-2DManpa1-OH"
+    record = submission_record(OTHER_GS, new_name)
+    report = entry_publish.publish_entry("publish", renamed_bundle(pair.tmp / "b-new", made_bundle, new_name), record,
+                                         pair.target, work_dir=pair.tmp / "w-new", log=quiet)
+    assert report["status"] == "published"
+    assert any(f"{OTHER_GS} was free again" in warning for warning in report["warnings"])
+    assert OTHER_GS not in json.loads(pair.backend.read_binary(f"{STATE}/withdrawn.json"))["withdrawn"]
+    assert pair.reader.try_sync() is None and pair.data(OTHER_GS)["archetype"]["name"] == new_name
+    assert pair.data("GS01070")["archetype"]["name"] == ALT_NAME
+    # the records of what the ID was stay
+    assert set(old_history) < set(pair.keys(f"{STATE}/history/{OTHER_GS}/"))
+    assert pair.keys(f"raw-history/raw/{ALT_NAME}/") == raw_history
+    assert entry_publish.status(pair.target, OTHER_GS)["entry"]["state"] == "published"
+
+    # the merge command again leaves the new glycan of the ID, and the raw entry of the new glycan of the name, alone
+    new_raw = {key: pair.backend.read_binary(key) for key in pair.keys(f"raw/{ALT_NAME}/")}
+    again = pair.merge(work="work-again", accept_differences=["salt"])
+    assert again["status"] == "already-merged" and again["id_taken_by"] == new_name
+    assert again["withdrawal"]["raw"]["relation"] == "taken" and again["withdrawal"]["raw"]["held_by"] == ["GS01070"]
+    assert new_raw and {key: pair.backend.read_binary(key) for key in pair.keys(f"raw/{ALT_NAME}/")} == new_raw
+    assert pair.reader.try_sync() is None and pair.data(OTHER_GS)["archetype"]["name"] == new_name
+
+
+def test_a_plain_withdrawal_still_binds_its_id_and_its_name(world, made_bundle):
+    name = world.data("GS00002")["archetype"]["name"]
+    entry_publish.withdraw_entry("GS00002", world.target, world.tmp / "withdraw", log=quiet)
+    assert not entry_publish.status(world.target, "GS00002")["entry"]["id_free"]
+    other = renamed_bundle(world.tmp / "b-other", made_bundle, "DGlcpa1-2DManpa1-OH")
+    with pytest.raises(Refused) as refused:
+        entry_publish.publish_entry("publish", other, submission_record("GS00002", "DGlcpa1-2DManpa1-OH"), world.target,
+                                    work_dir=world.tmp / "w-other", log=quiet)
+    assert any("GS00002 was the ID of a withdrawn glycan" in reason for reason in refused.value.report["refused"])
+    same = renamed_bundle(world.tmp / "b-same", made_bundle, name)
+    with pytest.raises(Refused) as refused:
+        entry_publish.publish_entry("publish", same, submission_record("GS01070", name), world.target,
+                                    work_dir=world.tmp / "w-same", log=quiet)
+    assert any("published as GS00002 and withdrawn: publish it under that ID" in reason
+               for reason in refused.value.report["refused"])
+
+
 def test_an_interrupted_merge_is_continued_by_the_same_command(pair):
     options = dict(accept_differences=["salt"])
     stops = {"pending-cleared": 1, "merge-move:index": 1}
@@ -781,7 +831,7 @@ def stored_manifest_entry(world, glycan_id):
     return json.loads(world.backend.read_binary("static/sync_manifest.json"))["glycans"][glycan_id]
 
 
-def test_a_drop_withdraws_the_other_anomer_and_leaves_the_kept_folder_as_it_is(anomers):
+def test_a_drop_withdraws_the_other_anomer_and_leaves_the_kept_folder_as_it_is(anomers, made_bundle):
     kept_folder = {key: anomers.backend.read_binary(key) for key in anomers.keys(f"static/{OTHER_GS}/")}
     kept_raw = {key: anomers.backend.read_binary(key) for key in anomers.keys(f"raw/{BETA_NAME}/")}
     dropped_raw = {key: anomers.backend.read_binary(key) for key in anomers.keys(f"raw/{GLYCAM_NAME}/")}
@@ -828,6 +878,17 @@ def test_a_drop_withdraws_the_other_anomer_and_leaves_the_kept_folder_as_it_is(a
     # a pooled merge of the dropped ID is refused, and a drop of a pooled one
     refused = anomers.merge(kept=OTHER_GS, absorbed=GS, work="pooled", dry_run=True)
     assert refused["refused"] == [f"{GS} was merged into {OTHER_GS} without its runs (--drop-runs)"]
+
+    # the dropped ID is free again: a new glycan takes it, and the drop command again leaves that one alone
+    assert entry_publish.status(anomers.target, GS)["entry"]["id_free"]
+    new_name = "DGlcpa1-2DManpa1-OH"
+    assert entry_publish.publish_entry("publish", renamed_bundle(anomers.tmp / "b-new", made_bundle, new_name),
+                                       submission_record(GS, new_name), anomers.target, work_dir=anomers.tmp / "w-new",
+                                       log=quiet)["status"] == "published"
+    assert GS not in json.loads(anomers.backend.read_binary(f"{STATE}/withdrawn.json"))["withdrawn"]
+    again = drop(anomers, work="work-again")
+    assert again["status"] == "already-merged" and again["id_taken_by"] == new_name
+    assert anomers.reader.try_sync() is None and anomers.data(GS)["archetype"]["name"] == new_name
 
 
 def versions_of(world, glycan_id):

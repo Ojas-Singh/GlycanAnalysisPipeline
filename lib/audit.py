@@ -1522,7 +1522,8 @@ def registry_issues(f: Mapping[str, Any], ctx: Mapping[str, Any]) -> List[Dict[s
                    + ", ".join(f"{i['glycoshape_id']} ({i['status']})" for i in ids) + ".",
                    {"glycam_name": raw_name or name, "ids": ids},
                    files=[{"store": "registry", "path": "registry-seed.json", "what": "conflicts.name_with_several_ids"}],
-                   actions=[_act("merge-ids", f"keep {gid} for the glycan and retire the others", keep=gid)])]
+                   actions=[_act("merge-ids", f"keep {gid} for the glycan; the others are free again (the next new "
+                                              "glycan may take them)", keep=gid)])]
 
 
 def replica_issues(f: Mapping[str, Any], ctx: Mapping[str, Any]) -> List[Dict[str, Any]]:

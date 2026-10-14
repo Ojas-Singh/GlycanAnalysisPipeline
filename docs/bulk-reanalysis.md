@@ -212,13 +212,14 @@ have the same). Aldoses are flipped exactly as before.
   GS00453, G30648VY with its branches written in another order): `publish_entry.py merge --id GS00303 --from GS00453
   --accept-salt-difference --note "..." --work-dir ... --dry-run`, then the same with `--expect-hash`. GS00303 keeps
   the frames of both (60,006) and the sum of the lengths, GS00453 is withdrawn with `merged_into` and its raw entry
-  goes to `raw-history/`. Their salt differs (200 and 150 mM; the glycan is neutral): without
+  goes to `raw-history/`; the ID GS00453 is free again (the next new glycan may take it). Their salt differs (200 and 150 mM; the glycan is neutral): without
   `--accept-salt-difference` the merge is refused, and with it every run keeps its own salt (`archetype.salt`
   `"150–200"`, `archetype.salt_by_run`).
 * The same glycan simulated once as each reducing-end anomer, published under two IDs (keep the beta entry, the
   linkage that occurs in nature): `publish_entry.py merge --id KEEP --from DROP --drop-runs --note "..." --work-dir
   ... --dry-run`, then with `--expect-hash`. The runs are not pooled and the kept folder does not change; DROP is
-  withdrawn (`merged_into`, `runs_pooled: false`) and its raw entry goes to `raw-history/`. The nine pairs (keep,
+  withdrawn (`merged_into`, `runs_pooled: false`), its ID is free again (the next new glycan may take it), and its
+  raw entry goes to `raw-history/`. The nine pairs (keep,
   drop): GS00037/GS00013, GS00355/GS00679, GS00358/GS00680, GS00359/GS00671, GS00455/GS00578, GS00797/GS00814,
   GS00800/GS00816, GS00803/GS00856, GS00804/GS00832. Checked read-only against the published folders and the archive
   copy: every pair has one archetype WURCS and accession, beta kept and alpha dropped, both raw entries; the reports

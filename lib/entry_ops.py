@@ -25,8 +25,9 @@ last), with a record of the version kept in the storage:
     branches are written in) keeps one.  The raw entry of the kept ID gets
     the frames of the other (``lib.archive_segments.merge_entries``), the
     union is analysed and published as a new version of the kept ID, and
-    in the same command the absorbed ID is withdrawn (its tombstone says
-    ``merged_into``) and its raw entry moves to the history.
+    in the same command the absorbed ID is withdrawn (its entry of
+    ``withdrawn.json`` says ``merged_into``) and its raw entry moves to the
+    history.  The ID is free again: the next new glycan may take it.
 
 Renames
 -------
@@ -1070,7 +1071,7 @@ def check_new_name(database: entry_publish.Database, published: Published, new_n
         if new_name in (name, inventory_name):
             refused.append(f"the name is published as {other}: a rename may not take the name of another entry")
     for other, item in sorted(database.withdrawn.items()):
-        if other != published.glycan_id and item.get("glycam_name") == new_name:
+        if other != published.glycan_id and item.get("glycam_name") == new_name and not entry_publish.id_is_free(item):
             refused.append(f"the name was published as {other} and withdrawn: its ID stays with it")
     return refused
 
@@ -1903,6 +1904,21 @@ def _merge_version(target: Target, store: Store, kept_id: str, absorbed_id: str)
     return None
 
 
+def _withdrawal_into(target: Target, store: Store, absorbed_id: str, kept_id: str,
+                     runs_pooled: bool) -> Optional[Dict[str, Any]]:
+    """The last withdrawal of ``absorbed_id`` into ``kept_id`` in its history (a merge, or a drop); None without one."""
+    found = []
+    for key in sorted(store.list(f"{target.state_prefix}/{target.static_prefix}/history/{absorbed_id}/")):
+        if key.endswith(f"-{entry_publish.WITHDRAW}.json"):
+            try:
+                document = json.loads(store.read(key))
+            except (ValueError, FileNotFoundError):
+                continue
+            if document.get("merged_into") == kept_id and document.get("runs_pooled", True) == runs_pooled:
+                found.append(document)
+    return max(found, key=lambda item: str(item.get("withdrawn_at"))) if found else None
+
+
 def plan_merged_raw_move(target: Target, store: Store, absorbed_name: str, manifest_sha256: str,
                          record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """What moving the raw entry of an absorbed ID to the history takes; only reads.
@@ -2163,7 +2179,9 @@ def merge(
        extension of the stored one, whose manifest stays in the history),
        with a version of operation ``merge`` in its history;
     2. the absorbed ID withdrawn (``withdrawn.json`` and its history say
-       ``merged_into``), its folder deleted;
+       ``merged_into``), its folder deleted.  The ID is free again: the next
+       new glycan may take it (``entry_publish.id_is_free``), and that
+       publication removes its entry of ``withdrawn.json``;
     3. its raw entry moved to ``raw-history/<raw prefix>/<its name>/<its
        manifest SHA-256>/`` next to ``merged.json``, out of ``raw/index.json``,
        its ``raw/`` keys deleted last (:func:`publish_merged_raw_move`).
@@ -2176,7 +2194,7 @@ def merge(
     ``expect_hash`` pins), ``diff``, ``raw`` and ``withdrawal`` (the plan
     of steps 2 and 3, derived from the database step 1 makes).
 
-    ``drop_runs`` gives the absorbed ID up without its runs: for the same
+    ``drop_runs`` withdraws the absorbed ID without pooling its runs: for the same
     glycan simulated once as each reducing-end anomer (the anomer may
     differ; the archetype WURCS and accession may not), whose runs are
     never pooled.  Nothing is merged, analysed or published for the kept
@@ -2228,6 +2246,17 @@ def merge(
             elif tombstone.get("runs_pooled", True) == drop_runs:
                 raise Refused(f"{absorbed_id} was merged into {kept_id} "
                               + ("with its runs pooled" if drop_runs else "without its runs (--drop-runs)"))
+            # The ID was free once this merge withdrew it: a new glycan published under it since is not touched,
+            # and what is left of the merge (the raw entry of the glycan it withdrew) is finished.
+            withdrawn_record = tombstone if absorbed is None else None
+            if absorbed is not None:
+                earlier = _withdrawal_into(target, static_store, absorbed_id, kept_id, runs_pooled=not drop_runs)
+                if earlier is not None and earlier.get("glycam_name") != absorbed.raw_name:
+                    report["warnings"].append(
+                        f"{absorbed_id} was withdrawn into {kept_id} ({str(earlier.get('glycam_name'))[:60]}), and a new "
+                        f"glycan took the free ID since ({absorbed.published_name[:60]}): it is left as it is")
+                    report["id_taken_by"] = absorbed.published_name
+                    absorbed, withdrawn_record = None, earlier
             report["database"] = {"global_hash": database.global_hash, "glycans": len(database.manifest["glycans"]),
                                   "withdrawn": len(database.withdrawn)}
 
@@ -2251,7 +2280,8 @@ def merge(
                     absorbed_frames = int(json.loads(absorbed_manifest_bytes)["frames"])
                     differences, _ = merge_differences(kept, absorbed, kept_frames, absorbed_frames)
                 else:
-                    absorbed_name, absorbed_sha256 = tombstone.get("glycam_name"), tombstone.get("raw_manifest_sha256")
+                    absorbed_name = withdrawn_record.get("glycam_name")
+                    absorbed_sha256 = withdrawn_record.get("raw_manifest_sha256")
                     if not absorbed_name or not absorbed_sha256:
                         raise Refused(f"the withdrawal of {absorbed_id} does not name the raw entry to move")
                 for item in differences:
@@ -2521,10 +2551,10 @@ def merge(
                     held_lock=lock, stats=stats)
             else:
                 withdrawal = {"glycoshape_id": absorbed_id, "status": "already-withdrawn", "refused": [],
-                              "glycam_name": (tombstone or {}).get("glycam_name")}
+                              "glycam_name": absorbed_name}
             report["withdrawal"] = {key: withdrawal.get(key) for key in (
                 "glycoshape_id", "glycam_name", "status", "refused", "static", "history", "switch")}
-            report["withdrawal"].update(merged_into=kept_id, runs_pooled=not drop_runs)
+            report["withdrawal"].update(merged_into=kept_id, runs_pooled=not drop_runs, id_free=True)
             if withdrawal.get("refused"):
                 raise entry_publish._refusal(report, [f"the withdrawal of {absorbed_id}: {reason_}"
                                                       for reason_ in withdrawal["refused"]])
@@ -2541,12 +2571,26 @@ def merge(
                 "accepted_differences": (report["merge"] or {}).get("accepted_differences") or [],
                 "into_key_prefix": kept_prefix,
             }
-            move, move_refused = plan_merged_raw_move(target, raw_store, absorbed_name, absorbed_sha256, record)
-            report["withdrawal"]["raw"] = describe_merged_raw_move(move) if move else None
+            # The name is free as well: once a glycan of that name is published again, its raw entry is that one's.
+            holders = sorted(other for other, name in entry_publish._published_names(database, kept.raw_index).items()
+                             if name == absorbed_name and not (other == absorbed_id and absorbed is not None))
+            if holders:
+                history_root = f"{target.history(absorbed_name)}{absorbed_sha256}/"
+                move, move_refused = {"relation": "moved"}, []
+                report["withdrawal"]["raw"] = {
+                    "relation": "taken", "held_by": holders,
+                    "from_key_prefix": archive_transfer.entry_key_prefix(target.raw_prefix, absorbed_name),
+                    "history_prefix": history_root, "copy": [], "copy_bytes": 0, "in_history": [],
+                    "record": history_root + "merged.json", "index": "unchanged", "delete": []}
+                report["warnings"].append(f"{absorbed_name[:60]} is published again as {', '.join(holders)}: its raw "
+                                          "entry is that glycan's and is left as it is")
+            else:
+                move, move_refused = plan_merged_raw_move(target, raw_store, absorbed_name, absorbed_sha256, record)
+                report["withdrawal"]["raw"] = describe_merged_raw_move(move) if move else None
             if move_refused:
                 if dry_run:
                     raise entry_publish._refusal(report, move_refused)
-                raise OperationError(f"{kept_id} stands for {absorbed_id} now, and the raw entry of "
+                raise OperationError(f"{absorbed_id} is withdrawn into {kept_id}, and the raw entry of "
                                      f"{absorbed_id} cannot be moved to the history: {'; '.join(move_refused)}")
             if not dry_run and move["relation"] != "moved":
                 publish_merged_raw_move(target, raw_store, move, log, checkpoint)

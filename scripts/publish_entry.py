@@ -125,7 +125,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         if name == "merge":
             command.add_argument("--id", required=True, help="GlycoShape ID that is kept and gets the frames of the other.")
             command.add_argument("--from", dest="from_id", required=True, metavar="ID",
-                                 help="GlycoShape ID of the same glycan that is withdrawn into --id.")
+                                 help="GlycoShape ID of the same glycan that is withdrawn into --id; the ID is free "
+                                      "again afterwards (the next new glycan may take it).")
             command.add_argument("--accept-difference", action="append", default=[], metavar="FIELD",
                                  help="Merge although the simulation conditions differ in FIELD (repeatable: package, "
                                       "forcefield, water, temperature, pressure, salt, time_per_frame); the value of "
@@ -372,6 +373,9 @@ def _status(args: argparse.Namespace) -> int:
         _say(f"{entry['glycoshape_id']}: {entry['state']}; {entry['stored_objects']} object(s) stored"
              + (f"; {entry['file_count']} files, hash {entry['hash']}" if "hash" in entry else "")
              + (f"; raw entry {'stored' if entry.get('raw', {}).get('stored') else 'not stored'}" if "raw" in entry else ""))
+        merged_into = (entry.get("withdrawn") or {}).get("merged_into")
+        if merged_into:
+            _say(f"  withdrawn into {merged_into} by a merge: the ID is free again (the next new glycan may take it)")
         unanswered = ((entry.get("record") or {}).get("lookups") or {}).get("unanswered")
         if unanswered:
             _say(f"  lookups without an answer at publication: {', '.join(unanswered)}")
@@ -440,7 +444,8 @@ def _print_operation(report: dict) -> None:
     if withdrawal:
         static = withdrawal.get("static") or {}
         _say(f"withdraw {withdrawal['glycoshape_id']} (merged into {withdrawal['merged_into']}"
-             f"{'' if withdrawal.get('runs_pooled', True) else ', runs not pooled'}): {withdrawal['status']}"
+             f"{'' if withdrawal.get('runs_pooled', True) else ', runs not pooled'}): {withdrawal['status']}; "
+             "the ID is free again (the next new glycan may take it)"
              + (f"; {static['delete_afterwards']} file(s) deleted afterwards" if "delete_afterwards" in static else "")
              + (f"; global_hash -> {static['target_global_hash'][:16]}..." if static.get("target_global_hash") else ""))
         raw = withdrawal.get("raw")
