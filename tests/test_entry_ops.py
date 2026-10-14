@@ -24,7 +24,7 @@ from lib.storage import S3StorageBackend
 import fake_services
 import publish_world
 import synthetic_run
-from bundle_fixtures import renamed_bundle, submission_record
+from bundle_fixtures import renamed_bundle, submission_record, write_bundle_json
 from publish_world import Reader, quiet, stored_tree
 from s3_fakes import FakeS3Client
 from synthetic_glycan import GLYCAM_NAME
@@ -633,9 +633,17 @@ def test_after_a_merge_the_absorbed_id_and_its_old_name_are_free_for_new_glycans
     # another glycan under the absorbed ID: the ID was free; its entry of withdrawn.json goes
     new_name = "DGlcpa1-2DManpa1-OH"
     record = submission_record(OTHER_GS, new_name)
-    report = entry_publish.publish_entry("publish", renamed_bundle(pair.tmp / "b-new", made_bundle, new_name), record,
-                                         pair.target, work_dir=pair.tmp / "w-new", log=quiet)
+    bundle = renamed_bundle(pair.tmp / "b-new", made_bundle, new_name)
+    (bundle / "static" / "output" / "replicas.json").unlink()            # a bundle without replica diagnostics
+    result = json.loads((bundle / "result.json").read_text())
+    result["produced"]["static"]["files"] = [item for item in result["produced"]["static"]["files"]
+                                             if item["path"] != "output/replicas.json"]
+    (bundle / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    write_bundle_json(bundle)
+    assert pair.keys(f"{STATE}/replicas/{OTHER_GS}.json")                # those of the glycan that had the ID
+    report = entry_publish.publish_entry("publish", bundle, record, pair.target, work_dir=pair.tmp / "w-new", log=quiet)
     assert report["status"] == "published"
+    assert pair.keys(f"{STATE}/replicas/{OTHER_GS}.json") == []          # are not shown for the new one
     assert any(f"{OTHER_GS} was free again" in warning for warning in report["warnings"])
     assert OTHER_GS not in json.loads(pair.backend.read_binary(f"{STATE}/withdrawn.json"))["withdrawn"]
     assert pair.reader.try_sync() is None and pair.data(OTHER_GS)["archetype"]["name"] == new_name
