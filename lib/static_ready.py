@@ -473,6 +473,12 @@ def copy_static_ready(
     for landscape_file in LANDSCAPE_FILES:
         if (source / "landscape" / landscape_file).is_file():
             copy(f"landscape/{landscape_file}")
+    # The replica diagnostics are part of the published folder only when they are public;
+    # otherwise the publisher keeps them for the administrators (lib/replicas.py).
+    from lib import replicas
+
+    if replicas.public_placement() and (source / replicas.STATIC_PATH).is_file():
+        copy(replicas.STATIC_PATH)
     return sorted(written)
 
 
