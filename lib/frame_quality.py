@@ -3,16 +3,25 @@
 This module intentionally does not use inter-frame displacement. A frame is
 invalid only when coordinates are non-finite or a recovered covalent bond is
 longer than the configured threshold.
+
+The topology is the bond table of the MOL2, completed from interatomic
+distances: an undeclared pair of atoms is bonded when it lies within the
+covalent distance of its two elements (sum of the covalent radii plus
+0.35 A) in most of the frames.  Components that are still apart are then
+joined by the closest pairs seen at covalent distance (the former recovery).
+The ring of every residue that has a template (``lib.residue_templates``)
+must then be closed, with no bond across it; otherwise the recovery fails.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Iterable
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import polars as pl
@@ -20,9 +29,19 @@ import pyarrow.parquet as pq
 import zarr
 from numcodecs import Blosc
 
+from lib.residue_templates import ring_template
 
-FILTER_VERSION = 1
+logger = logging.getLogger(__name__)
+
+# 2: missing bonds are completed from distances and residue rings are checked
+# against their templates (version 1 only joined disconnected components, so a
+# ring with a missing bond stayed open).
+FILTER_VERSION = 2
 DEFAULT_MAX_BOND_ANGSTROM = 3.0
+#: Covalent distance of a pair: the two covalent radii plus this tolerance (A).
+COVALENT_TOLERANCE_ANGSTROM = 0.35
+#: Frames, evenly spaced over the trajectory, on which undeclared bonds are sought.
+DISTANCE_SAMPLE_FRAMES = 128
 
 _COVALENT_RADII = {
     "H": 0.31, "C": 0.76, "N": 0.71, "O": 0.66, "F": 0.57,
@@ -94,7 +113,7 @@ def _chemically_allowed(left: str, right: str) -> bool:
 
 
 def _covalent_cutoff(left: str, right: str) -> float:
-    return _COVALENT_RADII[left] + _COVALENT_RADII[right] + 0.35
+    return _COVALENT_RADII[left] + _COVALENT_RADII[right] + COVALENT_TOLERANCE_ANGSTROM
 
 
 def quality_manifest_is_current(
@@ -169,26 +188,235 @@ def _read_parquet_exact(path: Path) -> pl.DataFrame:
     return pl.from_arrow(pq.read_table(path))
 
 
+@dataclass(frozen=True)
+class TopologyRecovery:
+    """The recovered bonds and where they came from."""
+
+    bonds: List[Tuple[int, int]]
+    input_bonds: int
+    retained_input_bonds: int
+    completed_from_distances: List[Tuple[int, int]]
+    joined_components: List[Tuple[int, int]]
+    ring_templates_checked: int
+
+
+def _atom_label(atoms: pl.DataFrame, index: int) -> str:
+    columns = atoms.columns
+    name = str(atoms["name"][index]) if "name" in columns else f"atom{index}"
+    res_name = str(atoms["res_name"][index]) if "res_name" in columns else "?"
+    res_id = str(atoms["res_id"][index]) if "res_id" in columns else "?"
+    return f"{res_name} {res_id} {name} (index {index})"
+
+
+def _sample_frames(coords: np.ndarray, count: int = DISTANCE_SAMPLE_FRAMES) -> np.ndarray:
+    """Up to ``count`` frames evenly spaced over the trajectory (first and last included)."""
+    n_frames = coords.shape[0]
+    if n_frames <= count:
+        return np.arange(n_frames)
+    return np.unique(np.linspace(0, n_frames - 1, count).round().astype(np.int64))
+
+
+def _complete_from_distances(
+    coords: np.ndarray,
+    atoms: pl.DataFrame,
+    elements: List[str],
+    bonds: List[Tuple[int, int]],
+    degree: List[int],
+) -> List[Tuple[int, int]]:
+    """Undeclared pairs within covalent distance in most sampled frames, added as bonds.
+
+    A pair is bonded when its two elements may bond and it lies within the
+    sum of their covalent radii plus ``COVALENT_TOLERANCE_ANGSTROM`` in more
+    than half of the sampled frames (that is, its median distance is within
+    it).  Non-bonded atoms never come that close (a hydrogen bond O...H is
+    above 1.6 A, the O-H cutoff 1.32 A; atoms two bonds apart are above
+    2.2 A).  A pair that is bonded by distance but would exceed the valence
+    of one of its atoms cannot be resolved and stops the recovery.
+    """
+    n_atoms = len(elements)
+    known = [index for index in range(n_atoms) if elements[index] in _COVALENT_RADII]
+    if len(known) < 2:
+        return []
+    known_index = np.asarray(known, dtype=np.int64)
+    radii = np.asarray([_COVALENT_RADII[elements[i]] for i in known], dtype=np.float64)
+    cutoff = radii[:, None] + radii[None, :] + COVALENT_TOLERANCE_ANGSTROM
+    symbols = sorted({elements[i] for i in known})
+    pair_allowed = np.asarray(
+        [[_chemically_allowed(left, right) for right in symbols] for left in symbols], dtype=bool
+    )
+    codes = np.asarray([symbols.index(elements[i]) for i in known], dtype=np.int64)
+    allowed = np.triu(pair_allowed[codes[:, None], codes[None, :]], 1)
+    position = {atom: slot for slot, atom in enumerate(known)}
+    for a, b in bonds:
+        if a in position and b in position:
+            low, high = sorted((position[a], position[b]))
+            allowed[low, high] = False
+
+    frames = _sample_frames(coords)
+    close = np.zeros((len(known), len(known)), dtype=np.int32)
+    for frame in frames:
+        xyz = np.asarray(coords[frame][known_index], dtype=np.float64)
+        distance = np.sqrt(((xyz[:, None, :] - xyz[None, :, :]) ** 2).sum(axis=2))
+        with np.errstate(invalid="ignore"):
+            close += (distance <= cutoff) & np.isfinite(distance)
+    found = np.argwhere(np.triu(allowed, 1) & (2 * close > len(frames)))
+    if not len(found):
+        return []
+
+    pairs = [(int(known[a]), int(known[b])) for a, b in found]
+    sampled = np.asarray(coords[frames], dtype=np.float64)
+    first = np.asarray([a for a, _ in pairs], dtype=np.int64)
+    second = np.asarray([b for _, b in pairs], dtype=np.int64)
+    median = np.nanmedian(np.linalg.norm(sampled[:, first, :] - sampled[:, second, :], axis=2), axis=0)
+
+    added: List[Tuple[int, int]] = []
+    for order in np.argsort(median, kind="stable"):
+        a, b = pairs[int(order)]
+        full = [
+            atom for atom in (a, b)
+            if degree[atom] >= _MAX_DEGREE.get(elements[atom], 4)
+        ]
+        if full:
+            raise ValueError(
+                "Topology recovery failed: "
+                f"{_atom_label(atoms, a)} and {_atom_label(atoms, b)} are at covalent distance "
+                f"(median {float(median[order]):.2f} A) but "
+                + ", ".join(_atom_label(atoms, atom) for atom in full)
+                + " already has all its bonds; the bond cannot be resolved"
+            )
+        degree[a] += 1
+        degree[b] += 1
+        added.append((a, b))
+    return added
+
+
+def _check_ring_templates(
+    coords: np.ndarray,
+    atoms: pl.DataFrame,
+    bonds: List[Tuple[int, int]],
+) -> int:
+    """Every residue with a ring template has its ring closed and no bond across it.
+
+    Returns the number of residues checked; raises ValueError naming every
+    residue whose ring is open or has a bond across it.  A residue that lacks
+    some atoms of its ring (a fragment, as in synthetic test structures) cannot
+    be checked: it is logged and not counted.
+    """
+    if not {"name", "res_id", "res_name"}.issubset(atoms.columns):
+        return 0
+    names = [str(value) for value in atoms["name"].to_list()]
+    res_ids = atoms["res_id"].to_list()
+    res_names = [str(value) for value in atoms["res_name"].to_list()]
+    residues: Dict[Tuple[object, str], Dict[str, int]] = {}
+    for index, (name, res_id, res_name) in enumerate(zip(names, res_ids, res_names)):
+        residues.setdefault((res_id, res_name), {}).setdefault(name, index)
+    bonded = {tuple(sorted(pair)) for pair in bonds}
+    frames = _sample_frames(coords)
+
+    def median_distance(a: int, b: int) -> float:
+        values = np.linalg.norm(
+            np.asarray(coords[frames][:, a, :], dtype=np.float64)
+            - np.asarray(coords[frames][:, b, :], dtype=np.float64),
+            axis=1,
+        )
+        return float(np.nanmedian(values))
+
+    problems: List[str] = []
+    checked = 0
+    for (res_id, res_name), by_name in residues.items():
+        template = ring_template(res_name)
+        if template is None:
+            continue
+        missing_atoms = [name for name in template if name not in by_name]
+        if missing_atoms:
+            logger.warning(
+                "Ring of residue %s %s not checked: it has no atom %s",
+                res_name, res_id, ", ".join(missing_atoms),
+            )
+            continue
+        checked += 1
+        ring = [by_name[name] for name in template]
+        ring_edges = {
+            tuple(sorted((ring[i], ring[(i + 1) % len(ring)])))
+            for i in range(len(ring))
+        }
+        for i in range(len(ring)):
+            a, b = ring[i], ring[(i + 1) % len(ring)]
+            if tuple(sorted((a, b))) not in bonded:
+                problems.append(
+                    f"ring of residue {res_name} {res_id} is open: no bond "
+                    f"{template[i]}-{template[(i + 1) % len(ring)]} "
+                    f"(median distance {median_distance(a, b):.2f} A)"
+                )
+        ring_set = set(ring)
+        for a, b in bonded:
+            if a in ring_set and b in ring_set and (a, b) not in ring_edges:
+                problems.append(
+                    f"ring of residue {res_name} {res_id} has a bond across it: "
+                    f"{names[a]}-{names[b]}"
+                )
+    if problems:
+        raise ValueError("Topology recovery failed: " + "; ".join(problems))
+    return checked
+
+
+def recover_topology(
+    coords: np.ndarray,
+    atoms: pl.DataFrame,
+    raw_pairs: Iterable[tuple[int, int]],
+    block_frames: int = 1024,
+) -> TopologyRecovery:
+    """The declared bonds, completed from distances, joined into one molecule, rings checked."""
+    n_frames, n_atoms, _ = coords.shape
+    elements = [_normalise_element(value) for value in atoms["element"].to_list()]
+    bonds, input_count = _sanitise_bonds(n_atoms, elements, raw_pairs)
+    retained_input_count = len(bonds)
+
+    degree = [0] * n_atoms
+    for a, b in bonds:
+        degree[a] += 1
+        degree[b] += 1
+    completed = _complete_from_distances(coords, atoms, elements, bonds, degree)
+    declared_and_completed = sorted(bonds + completed)
+
+    graph = _UnionFind(n_atoms)
+    for a, b in declared_and_completed:
+        graph.union(a, b)
+    joined: List[Tuple[int, int]] = []
+    if graph.component_count() != 1:
+        joined = _join_components(coords, elements, graph, degree, block_frames)
+    recovered = sorted(declared_and_completed + joined)
+    checked = _check_ring_templates(coords, atoms, recovered)
+    return TopologyRecovery(
+        bonds=recovered,
+        input_bonds=input_count,
+        retained_input_bonds=retained_input_count,
+        completed_from_distances=sorted(completed),
+        joined_components=sorted(joined),
+        ring_templates_checked=checked,
+    )
+
+
 def _recover_topology(
     coords: np.ndarray,
     atoms: pl.DataFrame,
     raw_pairs: Iterable[tuple[int, int]],
     block_frames: int,
 ) -> tuple[list[tuple[int, int]], int, int]:
+    """(bonds, input bond count, retained input bond count) of ``recover_topology``."""
+    result = recover_topology(coords, atoms, raw_pairs, block_frames)
+    return result.bonds, result.input_bonds, result.retained_input_bonds
+
+
+def _join_components(
+    coords: np.ndarray,
+    elements: List[str],
+    graph: "_UnionFind",
+    degree: List[int],
+    block_frames: int,
+) -> List[Tuple[int, int]]:
+    """Bonds that join components still apart: the closest pairs seen at covalent distance."""
     n_frames, n_atoms, _ = coords.shape
-    elements = [_normalise_element(value) for value in atoms["element"].to_list()]
-    bonds, input_count = _sanitise_bonds(n_atoms, elements, raw_pairs)
-    retained_input_count = len(bonds)
-
-    graph = _UnionFind(n_atoms)
-    degree = [0] * n_atoms
-    for a, b in bonds:
-        graph.union(a, b)
-        degree[a] += 1
-        degree[b] += 1
-
-    if graph.component_count() == 1:
-        return bonds, input_count, retained_input_count
 
     candidates: list[tuple[int, int, float]] = []
     for a in range(n_atoms):
@@ -252,7 +480,7 @@ def _recover_topology(
             "Topology recovery failed: trajectory evidence could not connect "
             f"{graph.component_count()} remaining molecular components"
         )
-    return sorted(bonds + inferred), input_count, retained_input_count
+    return inferred
 
 
 def _write_compacted_coords(
@@ -319,9 +547,10 @@ def filter_broken_frames(
         (int(a), int(b))
         for a, b in raw_bonds.select(["a", "b"]).iter_rows()
     ]
-    bonds, input_count, retained_input_count = _recover_topology(
-        coords, atoms, raw_pairs, max(1, int(block_frames))
-    )
+    recovery = recover_topology(coords, atoms, raw_pairs, max(1, int(block_frames)))
+    bonds = recovery.bonds
+    input_count = recovery.input_bonds
+    retained_input_count = recovery.retained_input_bonds
     bond_a = np.asarray([pair[0] for pair in bonds], dtype=np.int32)
     bond_b = np.asarray([pair[1] for pair in bonds], dtype=np.int32)
     if bond_a.size == 0 and len(atoms) > 1:
@@ -407,6 +636,11 @@ def filter_broken_frames(
         "input_bonds": input_count,
         "retained_input_bonds": retained_input_count,
         "inferred_bonds": len(bonds) - retained_input_count,
+        # Of the inferred bonds: those at covalent distance in most frames, and
+        # those that join components still apart afterwards.
+        "bonds_completed_from_distances": len(recovery.completed_from_distances),
+        "bonds_joining_components": len(recovery.joined_components),
+        "ring_templates_checked": recovery.ring_templates_checked,
         "topology_repaired": (
             input_count != retained_input_count
             or len(bonds) != retained_input_count

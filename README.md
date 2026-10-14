@@ -172,13 +172,24 @@ in it, both by the numbers they are published under (`Cluster 0` the largest).
 
 Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
 
-Before PCA, the store step repairs connectivity using chemically plausible
-bonds observed at covalent distance in the trajectory. It then excludes only
-frames containing non-finite coordinates or a recovered covalent bond longer
-than `GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM` (default 3.0 Å). Inter-frame atom
-movement and whole-molecule translation are diagnostic only. Frame provenance
-is recorded in `data/frame_quality.parquet`, `data/frame_map.parquet`, and
-`data/frame_filter.json`.
+Before PCA, the store step recovers the bonds (`lib/frame_quality.py`). The
+MOL2 bond table is completed from distances: an undeclared pair of atoms whose
+elements may bond is a bond when it lies within the sum of their covalent
+radii plus 0.35 Å in most of 128 frames spread over the trajectory (302 MOL2
+files of the collection lack the bond of a branch, 15 a bond inside a residue).
+Parts that are still apart are joined by the closest pairs seen at covalent
+distance. The ring of every residue whose GLYCAM name gives a template
+(`lib/residue_templates.py`: aldo- and 2-keto-pyranoses and furanoses,
+sialic acids) must then be closed, with no bond across it. A pair at covalent
+distance that would exceed the valence of an atom, or a ring that stays open,
+stops the analysis of the entry with the atoms named. The store step then
+excludes only frames containing non-finite coordinates or a recovered covalent
+bond longer than `GLYCOSHAPE_MAX_COVALENT_BOND_ANGSTROM` (default 3.0 Å).
+Inter-frame atom movement and whole-molecule translation are diagnostic only.
+Frame provenance is recorded in `data/frame_quality.parquet`,
+`data/frame_map.parquet`, and `data/frame_filter.json` (with the number of
+bonds completed from distances and of bonds that join parts; filter version
+2, so a folder stored by an earlier version is stored again).
 
 ```bash
 python main.py --mode process-only --data-dir data --process-dir process
