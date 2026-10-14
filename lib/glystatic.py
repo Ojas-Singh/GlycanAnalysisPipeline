@@ -609,6 +609,7 @@ def write_identity_files(
         torsion_summary = {
             "count": torsions_block.get("count"),
             "glycosidic": len(torsions_block.get("glycosidic", [])),
+            "substituent": len(torsions_block.get("substituent", [])),
             "non_glycosidic": len(torsions_block.get("non_glycosidic", torsions_block.get("other", []))),
             "by_family": family_summary.get("by_family", {}),
             "by_subtype": family_summary.get("by_subtype", {}),

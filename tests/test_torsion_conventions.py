@@ -1,7 +1,7 @@
 """The definitions of the stored glycosidic torsions, and phi/psi of furanose donors.
 
-The stored omega of a 1-6 linkage is C4-C5-C6-O6 (not the IUPAC O5-C5-C6-O6): on a real hexopyranose
-geometry it is the IUPAC omega plus about 120 degrees, so gg, gt and tg are near +60, 180 and -60.
+The stored omega of a 1-6 linkage is the IUPAC O5-C5-C6-O6, so gg, gt and tg are near -60, +60 and
+180. Up to version 1 of the definitions it was C4-C5-C6-O6, that angle plus about 120 degrees.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from lib.torsion import (
 )
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "dummy_database_data" / "DManpa1-2DManpa1-OH" / "DManpa1-2DManpa1-OH.pdb"
+OMEGA_ATOMS = ("O5", "C5", "C6", "O6")
 RING = [("C1", "C2"), ("C2", "C3"), ("C3", "C4"), ("C4", "C5"), ("C5", "O5"), ("O5", "C1"),
         ("C2", "O2"), ("C3", "O3"), ("C4", "O4"), ("C5", "C6"), ("C6", "O6")]
 
@@ -55,17 +56,18 @@ def rotate_about(point, origin, axis, degrees):
 
 
 @pytest.mark.parametrize("residue", [2, 3])
-def test_stored_omega_is_the_iupac_omega_plus_about_120_degrees(residue):
+def test_stored_omega_is_the_iupac_omega(residue):
     atoms = first_model()[residue]
     offsets = []
-    for target, rotamer, stored_near in ((-60.0, "gg", 60.0), (60.0, "gt", 180.0), (180.0, "tg", -60.0)):
+    for target, rotamer in ((-60.0, "gg"), (60.0, "gt"), (180.0, "tg")):
         # turn O6 about C5-C6 until O5-C5-C6-O6 is the IUPAC value of the rotamer
         now = dihedral(atoms["O5"], atoms["C5"], atoms["C6"], atoms["O6"])
         o6 = rotate_about(atoms["O6"], atoms["C6"], atoms["C6"] - atoms["C5"], target - now)
-        assert abs(wrap(dihedral(atoms["O5"], atoms["C5"], atoms["C6"], o6) - target)) < 1e-6
-        stored = dihedral(atoms["C4"], atoms["C5"], atoms["C6"], o6)
-        assert abs(wrap(stored - stored_near)) < 15.0, (rotamer, stored)
-        offsets.append(wrap(stored - target))
+        positions = {**atoms, "O6": o6}
+        stored = dihedral(*(positions[name] for name in OMEGA_ATOMS))
+        assert abs(wrap(stored - target)) < 1e-6, rotamer
+        # the former definition, C4-C5-C6-O6, lay about 120 degrees from it
+        offsets.append(wrap(dihedral(atoms["C4"], atoms["C5"], atoms["C6"], o6) - target))
     assert all(105.0 < offset < 135.0 for offset in offsets)
 
 
@@ -84,22 +86,25 @@ def man_a1_6_man():
     return atoms, pl.DataFrame({"a": [a for a, _ in bonds], "b": [b for _, b in bonds]})
 
 
-def test_detected_omega_of_a_1_6_linkage_is_c4_c5_c6_o6():
+def test_detected_omega_of_a_1_6_linkage_is_o5_c5_c6_o6():
     atoms, bonds = man_a1_6_man()
     torsions = get_glycan_torsions_enhanced(atoms, bonds)
     metadata = build_torsion_metadata(torsions, atoms, bonds_df=bonds)
     glycosidic = {e["canonical_name"]: e for e in metadata if e["family"] == "glycosidic"}
     assert set(glycosidic) == {"3_2_phi", "3_2_psi", "3_2_omega"}
-    assert glycosidic["3_2_omega"]["atom_names"] == ["C4", "C5", "C6", "O6"]
+    assert glycosidic["3_2_omega"]["atom_names"] == list(OMEGA_ATOMS)
     assert glycosidic["3_2_omega"]["residue_ids"] == [2, 2, 2, 2]
     assert glycosidic["3_2_phi"]["atom_names"] == ["O5", "C1", "O6", "C6"]
+    assert glycosidic["3_2_psi"]["atom_names"] == ["C1", "O6", "C6", "C5"]
+    assert glycosidic["3_2_psi"]["residue_ids"] == [3, 2, 2, 2]
 
 
 def test_conventions_are_written_with_the_torsions():
-    assert TORSION_CONVENTIONS["omega"].startswith("C4-C5-C6-O6")
-    assert "O5-C5-C6-O6" in TORSION_CONVENTIONS["omega"] and "+60, 180 and -60" in TORSION_CONVENTIONS["omega"]
+    assert TORSION_CONVENTIONS["omega"]["atoms"]["1-6 to a hexopyranose"] == list(OMEGA_ATOMS)
+    assert "O5-C5-C6-O6" in TORSION_CONVENTIONS["omega"]["definition"]
     block = v2._level_summary_from_metadata([])
     assert block["conventions"] == TORSION_CONVENTIONS
+    assert block["substituent"] == []
 
 
 @pytest.mark.parametrize("name,expected", [
