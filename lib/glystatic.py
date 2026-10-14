@@ -331,6 +331,12 @@ def generate_glycan_id(glycam_name: str) -> str:
     return f"GS{hash_obj.hexdigest()[:6].upper()}"
 
 
+#: What an administrator may set in place of what :func:`write_identity_files` derives from the GLYCAM name.
+NAME_OVERRIDES = (
+    "iupac", "alpha_glycam", "beta_glycam", "alpha_iupac", "beta_iupac",
+    "glytoucan", "alpha_glytoucan", "beta_glytoucan",
+)
+
 #: The simulation fields of ``archetype`` in ``data.json``, in the units the website shows:
 #: ``length`` in microseconds, ``temperature`` in kelvin, ``pressure`` in bar, ``salt`` in mM.
 SIMULATION_FIELDS = ("length", "package", "forcefield", "temperature", "pressure", "salt")
@@ -376,6 +382,7 @@ def write_identity_files(
     simulation: dict,
     inventory_glytoucan: str | None = None,
     storage=None,
+    names: dict | None = None,
 ) -> dict:
     """``snfg.svg``, ``data.json``, ``glygen.json`` and ``glycosmos.json`` of a static folder.
 
@@ -389,9 +396,21 @@ def write_identity_files(
     (the level names of the folder) and ``remarks``: the accessions and IUPAC
     names for the REMARK block of the PDB files, as the keyword arguments of
     ``copy_and_convert_pdbs``.
+
+    ``names`` holds what an administrator set in place of what is derived
+    from the GLYCAM name (:data:`NAME_OVERRIDES`): ``iupac`` (the IUPAC
+    condensed name of the archetype, from which WURCS, SMILES, mass,
+    composition and the SNFG image follow), ``alpha_glycam``,
+    ``beta_glycam``, ``alpha_iupac``, ``beta_iupac``, and the accessions
+    ``glytoucan``, ``alpha_glytoucan``, ``beta_glytoucan``, which replace
+    what the lookups find.  Without it nothing changes.
     """
     if storage is None:
         storage = get_storage_manager()
+    names = {key: value for key, value in (names or {}).items() if value}
+    unknown = sorted(set(names) - set(NAME_OVERRIDES))
+    if unknown:
+        raise ValueError(f"unknown name overrides: {', '.join(unknown)}")
     length, package, forcefield, temperature, pressure, salt = (simulation.get(name) for name in SIMULATION_FIELDS)
 
     # Get basic glycan info
@@ -401,6 +420,7 @@ def write_identity_files(
     except Exception as e:
         logger.warning(f"Could not canonicalize {glycam_name}; using original glycan string: {e}")
         iupac = glycam_name
+    iupac = names.get("iupac", iupac)
 
     # Generate SNFG diagram. Always render to a temporary local file so both
     # local and Oracle storage use the same backend path.
@@ -422,10 +442,10 @@ def write_identity_files(
             temp_path.unlink(missing_ok=True)
 
     # Process glycan chemical data
-    iupac_alpha = f"{iupac}(a{end_pos}-"
-    iupac_beta = f"{iupac}(b{end_pos}-"
-    glycam_alpha = f"{glycam_tidy}a{end_pos}-OH"
-    glycam_beta = f"{glycam_tidy}b{end_pos}-OH"
+    iupac_alpha = names.get("alpha_iupac", f"{iupac}(a{end_pos}-")
+    iupac_beta = names.get("beta_iupac", f"{iupac}(b{end_pos}-")
+    glycam_alpha = names.get("alpha_glycam", f"{glycam_tidy}a{end_pos}-OH")
+    glycam_beta = names.get("beta_glycam", f"{glycam_tidy}b{end_pos}-OH")
 
     logger.info(f"Processing glycan: {glycam_name}, IUPAC: {iupac}, GlyCAM: {glycam_tidy}")
 
@@ -536,6 +556,9 @@ def write_identity_files(
         glytoucan_beta,
         inventory_glytoucan,
     )
+    glytoucan = names.get("glytoucan", glytoucan)
+    glytoucan_alpha = names.get("alpha_glytoucan", glytoucan_alpha)
+    glytoucan_beta = names.get("beta_glytoucan", glytoucan_beta)
 
     # Get motifs
     try:
@@ -818,6 +841,7 @@ def complete_static_ready(
     output_static_dir,
     simulation: dict,
     inventory_glytoucan: str | None = None,
+    names: dict | None = None,
 ) -> dict:
     """``static/GSxxxxx/`` from a static-ready folder and an explicit submission.
 
@@ -831,9 +855,9 @@ def complete_static_ready(
     the identifier files with :func:`write_identity_files`, and the shared
     files are those of ``lib.static_ready`` under the same REMARK block.
 
-    ``simulation`` holds :data:`SIMULATION_FIELDS` in the published units.
-    Local folders only.  Returns the keys of :func:`process_glycan` plus
-    ``glycan_data``.
+    ``simulation`` holds :data:`SIMULATION_FIELDS` in the published units,
+    ``names`` the overrides of :func:`write_identity_files`.  Local folders
+    only.  Returns the keys of :func:`process_glycan` plus ``glycan_data``.
     """
     from lib.storage import get_storage_manager
 
@@ -858,6 +882,7 @@ def complete_static_ready(
             simulation,
             inventory_glytoucan=inventory_glytoucan,
             storage=storage,
+            names=names,
         )
         copy_static_ready(
             source,

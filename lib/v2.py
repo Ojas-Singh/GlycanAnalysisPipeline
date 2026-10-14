@@ -29,7 +29,7 @@ import sys
 import logging
 import shutil
 import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 import polars as pl
 import numpy as np
 import json
@@ -475,7 +475,7 @@ def step_store(
     if (
         atoms_p.exists()
         and not force
-        and quality_manifest_is_current(out_p, threshold)
+        and quality_manifest_is_current(out_p, threshold, excluded=config.excluded_source_frames)
     ):
         manifest = _load_json_if_exists(str(out_p / "frame_filter.json"), {})
         logger.info(
@@ -516,6 +516,7 @@ def step_store(
             max_bond_distance=threshold,
             block_frames=config.frame_quality_block_frames,
             frame_chunk=config.store_frame_chunk,
+            excluded=config.excluded_source_frames,
         )
 
         if backup.exists():
@@ -1556,6 +1557,7 @@ def _flip_anomer_model(
     base_res_names: List[str],
     *,
     target_anomer: Optional[str] = None,
+    bonds: Optional[Sequence[Tuple[int, int]]] = None,
 ) -> tuple[np.ndarray, List[str]]:
     """Flip reducing-end geometry and return residue names for the target anomer.
 
@@ -1564,6 +1566,17 @@ def _flip_anomer_model(
     Names are normalized before the geometry work so a missing/degenerate OH
     geometry cannot leave the generated counterpart with the source anomer's
     residue code.
+
+    An aldose (``C1`` with ``H1`` in residue 2) exchanges its anomeric
+    hydrogen and the oxygen of the aglycone ``ROH``.  A 2-ketose (sialic
+    acids, Kdn, Kdo, Fru, Psi, Tag, Sor: the ``ROH`` oxygen is bonded to
+    ``C2``, which has no hydrogen) exchanges its two exocyclic groups at
+    ``C2``: the ``ROH`` group and the ``C1`` branch (the carboxylate of a
+    ulosonic acid, the hydroxymethyl of a ketohexose with whatever is linked
+    to it, which ``bonds``, pairs of atom indices, tell).  Both are turned
+    half a turn about the bisector of the two bonds, which puts each where
+    the other was with its bond length kept and inverts the configuration at
+    ``C2``; the ring and the rest of the glycan do not move.
     """
     xyz_out = np.asarray(xyz, dtype=float).copy()
     res_names = list(base_res_names)
@@ -1599,10 +1612,71 @@ def _flip_anomer_model(
                 xyz_out[idx_O1] = new_O1
                 xyz_out[idx_H1] = new_H1
                 xyz_out[idx_HO1] = new_HO1
+        elif idx_H1 is None and idx_O1 is not None:
+            xyz_out = _flip_ketose_reducing_end(xyz_out, atom_names, residue_ids, idx_O1, bonds)
 
     except Exception:
         pass
     return xyz_out, res_names
+
+
+#: Atoms of the C1 branch of a 2-ketose by name, when no bond table is given.
+_KETOSE_C1_BRANCH_NAMES = frozenset({"C1", "O1", "O1A", "O1B", "H11", "H12", "H1O", "HO1"})
+
+
+def _flip_ketose_reducing_end(
+    xyz: np.ndarray,
+    atom_names: List[str],
+    residue_ids: List[int],
+    idx_o_aglycone: int,
+    bonds: Optional[Sequence[Tuple[int, int]]] = None,
+) -> np.ndarray:
+    """The other anomer of a 2-ketose at the reducing end (see :func:`_flip_anomer_model`).
+
+    Returns ``xyz`` unchanged when the reducing residue is not a 2-ketose
+    bonded to the aglycone at ``C2``, or when the geometry is degenerate.
+    """
+    xyz_out = np.asarray(xyz, dtype=float).copy()
+    atoms_of = {(name, int(res_id)): index for index, (name, res_id) in enumerate(zip(atom_names, residue_ids))}
+    idx_c2, idx_c1 = atoms_of.get(("C2", 2)), atoms_of.get(("C1", 2))
+    if idx_c2 is None or idx_c1 is None:
+        return xyz_out
+    oxygen = xyz_out[idx_o_aglycone]
+    # The aglycone oxygen has to be the one bonded to C2 (a 2-ketose), not to C1.
+    if np.linalg.norm(oxygen - xyz_out[idx_c2]) >= np.linalg.norm(oxygen - xyz_out[idx_c1]):
+        return xyz_out
+    aglycone = [index for index, res_id in enumerate(residue_ids) if int(res_id) == 1]
+    if bonds is not None and len(bonds):
+        neighbours: Dict[int, List[int]] = {}
+        for a, b in bonds:
+            neighbours.setdefault(int(a), []).append(int(b))
+            neighbours.setdefault(int(b), []).append(int(a))
+        branch, frontier = {idx_c1}, [idx_c1]
+        while frontier:
+            atom = frontier.pop()
+            for other in neighbours.get(atom, ()):
+                if other == idx_c2 and atom == idx_c1:
+                    continue
+                if other == idx_c2 or other in aglycone:
+                    return xyz_out                       # C1 is in a ring with C2: not a 2-ketose
+                if other not in branch:
+                    branch.add(other)
+                    frontier.append(other)
+    else:
+        branch = {index for index, (name, res_id) in enumerate(zip(atom_names, residue_ids))
+                  if int(res_id) == 2 and name in _KETOSE_C1_BRANCH_NAMES}
+    centre = xyz_out[idx_c2]
+    to_c1, to_oxygen = xyz_out[idx_c1] - centre, oxygen - centre
+    if np.linalg.norm(to_c1) == 0 or np.linalg.norm(to_oxygen) == 0:
+        return xyz_out
+    axis = to_c1 / np.linalg.norm(to_c1) + to_oxygen / np.linalg.norm(to_oxygen)
+    if np.linalg.norm(axis) < 1e-6:
+        return xyz_out
+    axis = axis / np.linalg.norm(axis)
+    half_turn = 2.0 * np.outer(axis, axis) - np.eye(3)        # rotation by 180 degrees about the axis
+    moved = sorted(branch | set(aglycone))
+    xyz_out[moved] = centre + (xyz_out[moved] - centre) @ half_turn.T
+    return xyz_out
 
 
 def _write_representative_model(
@@ -1716,6 +1790,8 @@ def step_save_representative_structures(
     )
     reference_xyz = np.asarray(coords[0], dtype=float).copy()
     conect_block = glypdbio._pdb_conect_block(serials, bonds, atoms, reference_xyz)
+    # what moves with the C1 branch when the other anomer of a 2-ketose is made
+    bond_pairs = list(zip(bonds["a"].to_list(), bonds["b"].to_list())) if {"a", "b"} <= set(bonds.columns) else []
     aligned_cache: Dict[int, np.ndarray] = {0: reference_xyz.copy()}
     
     # Process each clustering level
@@ -1763,6 +1839,7 @@ def step_save_representative_structures(
                         residue_ids,
                         base_res_names,
                         target_anomer=opposite_anomer,
+                        bonds=bond_pairs,
                     )
 
                     if current_anomer == 'alpha':

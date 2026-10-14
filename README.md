@@ -16,6 +16,7 @@ GAP takes the trajectories of one glycan (all its simulations, dry) and produces
 | Whole-database runs | The same analysis over a data directory, then the static folder with identifiers and metadata | Login node and Slurm array | [Running](#running-), [Staged Oracle/Slurm workflow](#staged-oracleslurm-workflow) |
 | Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
 | Publishing one entry | The bundle of one analysed entry becomes `static/GSxxxxx/` and `raw/<GLYCAM name>/`; the root files and `sync_manifest.json` follow from the stored ones. Also: replace, withdraw | The server that approves entries; S3-compatible storage | [One entry: `scripts/publish_entry.py`](#one-entry-scriptspublish_entrypy) |
+| Operations on published entries | `update-metadata` (curated metadata, renames) and `reanalyse` (without some replicas, with the simulated anomer declared) publish a new version of an entry with its history; the bulk re-analysis derives the whole database again | The worker of the website; Iridis for the bulk run | [Operations on published entries](#operations-on-published-entries-update-metadata-reanalyse), [`docs/bulk-reanalysis.md`](docs/bulk-reanalysis.md) |
 | Replica diagnostics | How well the independent simulations of an entry agree, and whether it needs more sampling: `replicas.json` per entry, from the analysis or, for a published entry, from its stored tables | With the analysis of an entry; `scripts/replica_diagnostics.py` for the published ones | [Replica diagnostics](#replica-diagnostics) |
 | Entry audit | Every problem of a published entry as an issue for the administrators' website (`issues.json`: code, severity, evidence, files, suggested actions) | `scripts/audit_entries.py`, over the static database, the raw archive, `replicas.json` and the registry; only reads | [Entry audit](#entry-audit) |
 
@@ -849,6 +850,50 @@ Inside a group the order is free, so an interruption leaves any subset of the gr
 **Two publishers.** One process publishes at a time; a single service serialises its publications this way. Against a second process there are a lock object (`publish-state/static/lock.json`: owner, host, process, expiry; exit status 3 for whoever finds it), the claim of `pending.json` before the switch, and a comparison of the stored manifest with the one the change was derived from. Where the storage honours conditional writes (`If-None-Match`; the tool probes for it and says when it does not) a free lock and `pending.json` are created by one publisher only, and no change is lost. Where it does not, they are written and read back, which does not separate two publishers that take the same step at the same moment. A lock is taken over when it has expired (`--lock-ttl`, one hour), when its process on this machine no longer exists, or with `--break-lock`. `scripts/static_s3.py publish` and `scripts/archive_s3.py upload` do not take the lock and must not run during a publication. Once entries are published this way the storage is the database: `static_s3.py publish` from a local tree that does not have them would publish a manifest without them (and delete their folders with `--delete-stale`), and `archive_s3.py upload` from a local archive without them would write an `index.json` that no longer lists them (their objects stay and are reported as extra). Bring a local tree up to date from the storage before using either.
 
 **Cost.** Adding one glycan (231 atoms, 40,004 frames; bundle 82 MB) to the published database of 1,001 glycans, against a local MinIO that held only the root objects: 17 s for the dry run (1.1 GB peak memory, of which the RDF conversion needs most; 127 MB downloaded) and 5 s for the publication that follows it in the same work folder (229 MB uploaded: 50 MB raw entry, 32 MB folder, 139 MB root files and 7 MB manifest; 146 MB copied inside the storage; the switch took 0.5 s). `--cache-dir` keeps the root files of the last publication, so the next one downloads only the manifest.
+
+**History.** Every publication of an entry (publish, replace, withdraw, and the two operations below) also writes a version: `publish-state/static/history/GSxxxxx/<global hash>-<action>.json`, the record of the entry with `folder_hash_before`, never overwritten. The versions of an entry form a chain (each names the folder it replaced); with the raw history this is what any earlier version is derived from again.
+
+#### Operations on published entries: `update-metadata`, `reanalyse`
+
+What an administrator does to a published entry is a new version of its folder, published like `replace` (same ID, staging, the switch, the manifest last) by `lib/entry_ops.py`:
+
+```bash
+# Curated metadata, no new analysis: names, accessions, keywords, simulation fields, notes
+.venv/bin/python scripts/publish_entry.py update-metadata --changes GS00020.changes.json --work-dir w-GS00020 --dry-run --report r.json
+.venv/bin/python scripts/publish_entry.py update-metadata --changes GS00020.changes.json --work-dir w-GS00020 --expect-hash <entry.hash of r.json>
+
+# A new analysis of the stored raw entry: without some replicas, with the anomer that was simulated declared
+.venv/bin/python scripts/publish_entry.py reanalyse --id GS00020 --simulated-anomer alpha --exclude-replica run_3 \
+    --note "files were exchanged; run 3 is another stereoisomer" --analysis-workers 12 --memory-limit-gb 30 \
+    --work-dir w-GS00020-r --dry-run --report r.json
+```
+
+The changes record (schema `glycoshape-entry-changes`, version 1; every field optional, absent means unchanged, quantities with their unit in the name as in the submission record):
+
+```json
+{
+  "schema": "glycoshape-entry-changes", "schema_version": 1, "glycoshape_id": "GS00020",
+  "expect": {"glycam_name": "<the name the admin saw>", "folder_hash": "<the folder hash the admin saw>"},
+  "names": {"glycam_name": "<new full GLYCAM name>", "keep_old_name_as_alias": true,
+            "iupac": "...", "alpha_glycam": "...", "beta_glycam": "...", "alpha_iupac": "...", "beta_iupac": "..."},
+  "glytoucan": {"archetype": "G00001AA", "alpha": "...", "beta": "..."},
+  "curated": {"common_names": [], "aliases": [], "description": ""},
+  "keywords": {"add": [], "remove": []},
+  "simulation": {"simulation_length_ns": 2500, "md_package": "GROMACS", "force_field": "GLYCAM_06j", "water_model": "TIP3P",
+                 "temperature_k": 300, "pressure_bar": 1, "salt_concentration_mm": 150, "source_type": "", "comments": ""},
+  "curator_note": "kept in the history", "public_note": "shown with the entry (search_meta.curator_note)", "author": "who"
+}
+```
+
+* **update-metadata** downloads the stored folder (verified against the manifest), takes the GlycoShape REMARK block off its PDB files (only where putting it back gives the stored file byte for byte) and completes it again with `lib.entry_complete.complete_folder`: WURCS, IUPAC, SNFG image, mass, keywords, the inventory row, `GSxxxxx.zip` and the RDF follow from the new names with the functions of the static stage. `names` are overrides of what is derived from the GLYCAM name (`lib.glystatic.NAME_OVERRIDES`; an empty text removes one), `glytoucan` replaces what the lookups find, `keywords` is `{"add", "remove"}` or `{"replace"}`. Where the curated metadata come from: the record of the last publication of the entry when there is one (its submission and `curation`), otherwise `data.json` read back (`lib.entry_ops.published_submission`: on the 1,001 published entries, 628 generated descriptions, 308 generated with a submission comment that is kept, 65 generated from older fields, nothing curated otherwise; a temperature of 0 is left out).
+* **reanalyse** downloads the raw entry, runs `scripts/run_entry.py` in a process of its own (refused beforehand when `memory_estimate_gb` exceeds `--memory-limit-gb`; a run that is killed is reported), writes the bundle (`bundle.tar`, opened with `open_bundle` as one from the cluster) and publishes it. `--exclude-replica NAME` (repeatable; a segment name of the manifest or a replica name of `replicas.json`) leaves its frames out of the analysis as excluded frames of the frame filter (`frame_filter.json` `excluded_source_frames`, `excluded_frames`); the raw entry keeps them. `--simulated-anomer alpha|beta|auto` declares the anomer that was simulated (`auto`: the residue code of the reducing residue in `topology.pdb`, reported as evidence either way): when it is not the anomer of the name, the entry is renamed to it, so the analysis files the simulated coordinates under that anomer and generates the other one. The other anomer of a 2-ketose at the reducing end (Neu5Ac, Kdn, Kdo, Fru, ...) exchanges the two exocyclic groups at C2 (the aglycone and the C1 branch with what is linked to it); that of an aldose exchanges H1 and the aglycone oxygen; a furanose's residue code becomes `D` (alpha) or `U` (beta).
+* **Renames** move the raw entry: its data files are copied inside the storage to `raw/<new name>/`, `name.json` and a manifest with `renamed_from` are written there, `raw/index.json` lists the new name instead of the old one, the old keys are deleted, and `raw-history/raw/<old name>/<old manifest SHA-256>/` keeps the old manifest and `renamed.json`. Refused: a name published (or withdrawn) under another ID, a raw entry of another glycan under the name, and for `update-metadata` a change of the reducing-end anomer (use `reanalyse --simulated-anomer`). The old name becomes a search alias unless another name of the entry already gives it.
+
+The report (`--report`; schema `glycoshape-entry-operation`, version 1) has `operation`, `status` (`planned`, `published`, `already-published`), `ok`, `refused`, `warnings`, `glycam_name` and `previous_glycam_name`, `rename` (`from`, `to`, `raw`: the move, or `already-named`), `entry` (`hash` to approve with `--expect-hash`, identity, simulation, search metadata, gaps, problems, lookups), `diff` (`names`, `simulation`, `search_meta`, `analysis.levels.<level>`: populations before and after with their total variation and the representative source frames, `files`: added, removed, changed with sizes), `raw` and `static` (what is uploaded, staged, deleted), `database`, `history`, and for `reanalyse` `anomer`, `memory`, `analysis` (seconds, excluded replicas, frame quality, summary, pipeline), `bundle`. Exit status as for `publish`: 0, 1 stopped (run again), 2 refused, 3 locked.
+
+#### Bulk re-analysis
+
+`scripts/bulk_reanalyse.py` re-analyses every entry of a raw archive into a complete static database (Slurm script `slurm/bulk_reanalyse_amd.sh`), compares it with the published one and publishes it in one publication under the lock of this publisher, onto the database it started from only. Entries that fail keep their published version. Runbook: [`docs/bulk-reanalysis.md`](docs/bulk-reanalysis.md).
 
 #### GlycoShape IDs
 

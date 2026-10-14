@@ -92,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--levels", default=None, help="clustering levels: 1,2 (default) or 1,2,3")
     parser.add_argument("--force", action="store_true", help="recompute even when OUTPUT holds a current result")
     parser.add_argument(
+        "--exclude-replica", action="append", default=[], metavar="NAME",
+        help="leave the frames of this replica out of the analysis (repeatable): a segment name of the "
+             "manifest, or a replica name as replicas.json lists it (run_2, stored_run_1, ...); archive entries only",
+    )
+    parser.add_argument(
         "--no-verify-input", action="store_true",
         help="do not re-hash the files of an archive entry against its manifest",
     )
@@ -316,12 +321,60 @@ def claim_output(output_dir: Path) -> Optional[Dict[str, Any]]:
 
 def _fingerprint(input_info: Dict[str, Any], settings: Dict[str, Any], version: Dict[str, Any]) -> Dict[str, Any]:
     """What must be equal for an existing result to count as current."""
-    return {
+    fingerprint = {
         "input_files": input_info["files"],
         "cluster_levels": settings["cluster_levels"],
         "max_covalent_bond_angstrom": settings["max_covalent_bond_angstrom"],
         "code_sha256": version["code_sha256"],
     }
+    if settings.get("excluded_replicas"):           # absent otherwise: earlier results stay current
+        fingerprint["excluded_replicas"] = settings["excluded_replicas"]
+    return fingerprint
+
+
+def resolve_exclusions(entry_dir: Path, input_info: Dict[str, Any], names: List[str]) -> List[Dict[str, Any]]:
+    """The frames of the replicas to leave out, in source frames; raises :class:`EntryError`.
+
+    A name is a segment name of the manifest or a replica name of
+    ``lib.replicas.replica_boundaries`` (what ``replicas.json`` lists:
+    ``run_2`` of a converted ``simulation.pdb``, ``stored_run_1`` of the
+    stored part of an extension).  Replicas whose boundaries are only
+    assumed (``basis`` ``assumed``) can be excluded; the record says so.
+    """
+    names = [str(name).strip() for name in names or [] if str(name).strip()]
+    if not names:
+        return []
+    if input_info.get("kind") != "archive":
+        raise EntryError("--exclude-replica needs an archive entry: a simulation.pdb folder has no record of its replicas")
+    from lib import archive, replicas
+
+    try:
+        manifest = archive.load_manifest(entry_dir)
+        boundaries = replicas.replica_boundaries(manifest)
+    except (archive.ArchiveError, replicas.ReplicaError, KeyError, TypeError, ValueError) as exc:
+        raise EntryError(f"the replicas of {entry_dir} cannot be told apart: {exc}") from exc
+    by_name = {replica.name: replica for replica in boundaries.replicas}
+    segments = archive.segments_of(manifest)
+    chosen: Dict[str, Dict[str, Any]] = {}
+    for name in names:
+        replica = by_name.get(name)
+        if replica is not None:
+            chosen[name] = {"name": name, "first_frame": int(replica.first_frame), "frames": int(replica.frames),
+                            "basis": replica.basis}
+            continue
+        segment = next((item for item in segments if str(item.get("name")) == name), None)
+        if segment is None:
+            known = sorted(set(by_name) | {str(item.get("name")) for item in segments})
+            raise EntryError(f"no replica or segment named {name!r} in {entry_dir.name}; known: {', '.join(known)}")
+        chosen[name] = {"name": name, "first_frame": int(segment["first_frame"]), "frames": int(segment["frames"]),
+                        "basis": "recorded"}
+    rows = sorted(chosen.values(), key=lambda row: row["first_frame"])
+    for left, right in zip(rows, rows[1:]):
+        if left["first_frame"] + left["frames"] > right["first_frame"]:
+            raise EntryError(f"the replicas {left['name']} and {right['name']} overlap; name each frame once")
+    if sum(row["frames"] for row in rows) >= int(input_info["frames"]):
+        raise EntryError("every frame of the entry would be excluded")
+    return rows
 
 
 def _analysis_summary(process_dir: Path) -> Dict[str, Any]:
@@ -434,8 +487,14 @@ def run_entry(
     force: bool = False,
     verify_input: bool = True,
     verbose: bool = False,
+    exclude_replicas: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run the process stage and the static-ready export for one entry; returns the result.
+
+    ``exclude_replicas`` leaves the frames of these replicas out of the
+    analysis (:func:`resolve_exclusions`); the archive entry itself is the
+    same, and the result records what was left out (``settings`` and
+    ``frame_quality``).
 
     The result is also ``OUTPUT/result.json``: status ``"ok"`` or ``"failed"``
     at the end, ``"running"`` while the run is in progress, so that a job
@@ -469,6 +528,7 @@ def run_entry(
     timings: Dict[str, float] = {}
     step_started = time.perf_counter()
     input_info = describe_input(entry_dir, verify=verify_input)
+    exclusions = resolve_exclusions(entry_dir, input_info, exclude_replicas or [])
     timings["input"] = round(time.perf_counter() - step_started, 3)
     version = pipeline_version()
     settings = {
@@ -481,6 +541,8 @@ def run_entry(
         "store_frames_buffer": int(config.store_frames_buffer),
         "store_frame_chunk": int(config.store_frame_chunk),
     }
+    if exclusions:
+        settings["excluded_replicas"] = exclusions
     folder = entry_dir.name
     process_root = output_dir / "process"
     process_dir = process_root / folder
@@ -538,6 +600,8 @@ def run_entry(
     except ValueError:  # not in the main thread
         pass
     failed_step = "setup"
+    config.excluded_source_frames = [
+        [row["first_frame"], row["frames"], row["name"]] for row in exclusions] or None
     try:
         logger.info(
             "entry %s -> %s (%d workers, levels %s)", entry_dir, output_dir, workers, settings["cluster_levels"]
@@ -611,6 +675,7 @@ def run_entry(
         if not isinstance(exc, (Exception, _Terminated)):
             raise
     finally:
+        config.excluded_source_frames = None
         if previous_handler is not None:
             signal.signal(signal.SIGTERM, previous_handler)
         try:
@@ -646,6 +711,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             force=args.force,
             verify_input=not args.no_verify_input,
             verbose=args.verbose,
+            exclude_replicas=args.exclude_replica,
         )
     except EntryError as exc:
         print(f"run_entry: error: {exc}", file=sys.stderr)

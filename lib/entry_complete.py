@@ -73,8 +73,8 @@ UNLISTED_BUNDLE_FILES = (BUNDLE_FILE, "run.log")
 _GLYCOSHAPE_ID = re.compile(r"GS\d{5}")
 _GLYTOUCAN_ID = re.compile(r"G\d{5}[A-Z]{2}")
 _SIMULATION_KEYS = (
-    "simulation_length_ns", "simulation_length_us", "md_package", "force_field", "temperature_k", "pressure_bar",
-    "salt_concentration_mm", "source_type", "comments",
+    "simulation_length_ns", "simulation_length_us", "md_package", "force_field", "water_model", "temperature_k",
+    "pressure_bar", "salt_concentration_mm", "source_type", "comments",
 )
 #: The fields of ``source`` of a bundle that a submission takes over as they are.
 BUNDLE_SOURCE_KEYS = (
@@ -88,6 +88,7 @@ _REFUSED_SIMULATION_KEYS = {
     "simulationLength": "simulation_length_ns",
     "temperature": "temperature_k", "pressure": "pressure_bar",
     "salt_concentration": "salt_concentration_mm", "salt": "salt_concentration_mm",
+    "water": "water_model",
 }
 _CURATED_KEYS = ("common_names", "aliases", "description", "keywords")
 #: Outside these ranges a value is reported: it is more often a unit mistake than a simulation.
@@ -164,6 +165,7 @@ class Submission:
     length_us: Optional[float] = None
     package: str = ""
     forcefield: str = ""
+    water_model: str = ""
     temperature_k: Optional[float] = None
     pressure_bar: Optional[float] = None
     salt_mm: Optional[float] = None
@@ -249,6 +251,7 @@ class Submission:
             glycam_name=glycam_name,
             package=_text(simulation.get("md_package"), "simulation.md_package", errors),
             forcefield=_text(simulation.get("force_field"), "simulation.force_field", errors),
+            water_model=_text(simulation.get("water_model"), "simulation.water_model", errors),
             source_type=_text(simulation.get("source_type"), "simulation.source_type", errors),
             comments=_text(simulation.get("comments"), "simulation.comments", errors),
             glytoucan_id=glytoucan_id,
@@ -300,6 +303,8 @@ class Submission:
             "source_type": self.source_type,
             "comments": self.comments,
         }
+        if self.water_model:                        # only then: the normal form of every other record is unchanged
+            simulation["water_model"] = self.water_model
         return {
             "schema": SUBMISSION_SCHEMA,
             "schema_version": SUBMISSION_SCHEMA_VERSION,
@@ -664,11 +669,7 @@ def complete_entry(
     :class:`BundleError` or :class:`CompletionError` when no folder can be
     written.  One completion at a time per process.
     """
-    import lib.config as config
-    from lib import glystatic, lookups, replicas, static_levels
-    from lib.glybake import GlycoShapeBaker
-    from lib.glymeta import GlycanMetadataProcessor
-    from lib.storage import local_storage
+    from lib import replicas
 
     submission = Submission.parse(submission)
     if bundle is None:
@@ -679,7 +680,6 @@ def complete_entry(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     warnings = list(submission.warnings)
-    problems: List[str] = []
 
     # What the entry says about itself, against the submission.
     stated = _stated_length_ns(bundle)
@@ -703,29 +703,112 @@ def complete_entry(
         warnings.append("the bundle extends a published entry and the submission gives the length of the new run "
                         "only: the published length has to be added")
 
+    folder, data, summary = complete_folder(
+        bundle.static_dir, bundle.glycam_name, bundle.levels, submission, output_dir, offline=offline,
+        lookup_timeout=lookup_timeout, lookup_budget=lookup_budget)
+    used = {f"static/{path.relative_to(folder).as_posix()}" for path in folder.rglob("*") if path.is_file()}
+    if not replicas.public_placement():
+        used.add(f"static/{replicas.STATIC_PATH}")      # kept by the publisher for the administrators
+    ignored = sorted(relative[len("static/"):] for relative in bundle.files
+                     if relative.startswith("static/") and relative not in used)
+    if ignored:
+        warnings.append(f"{len(ignored)} file(s) of the static-ready folder are not part of a published folder: "
+                        + ", ".join(ignored[:5]))
+    report = folder_report(folder, data, bundle.levels, summary, submission, warnings)
+    report["bundle"] = bundle.summary()
+    return report
+
+
+#: How the keywords of an entry may be edited besides the curated ones of the submission (``lib.entry_ops``).
+KEYWORD_EDITS = ("add", "remove", "replace")
+
+
+def complete_folder(
+    static_dir,
+    glycam_name: str,
+    levels,
+    submission: Any,
+    output_dir,
+    offline: Optional[bool] = None,
+    lookup_timeout: Optional[float] = None,
+    lookup_budget: Optional[float] = 300.0,
+    names: Optional[Dict[str, str]] = None,
+    aliases: Iterable[str] = (),
+    keywords: Optional[Dict[str, List[str]]] = None,
+    public_note: str = "",
+) -> Tuple[Path, Dict[str, Any], Dict[str, Any]]:
+    """Write ``<output_dir>/<GlycoShape ID>/`` from a static-ready folder; returns ``(folder, data, lookups)``.
+
+    The part of :func:`complete_entry` that does not need a bundle: the
+    identity files (``lib.glystatic.complete_static_ready``), the search
+    metadata (``lib.glymeta``) and ``GSxxxxx.zip``.  ``static_dir`` is a
+    static-ready folder (``output/``, ``landscape/`` without identifiers)
+    for ``levels``.  The other arguments are what an administrator may set
+    besides the submission; none of them changes anything when it is not
+    given: ``names`` the overrides of ``lib.glystatic.write_identity_files``,
+    ``aliases`` names the entry is found under in addition to the curated
+    ones, ``keywords`` ``{"add": [...], "remove": [...]}`` or
+    ``{"replace": [...]}``, applied to the keywords that follow from the
+    names and the submission, and ``public_note``, a note shown with the
+    entry (``search_meta.curator_note``).  The water model of the
+    submission is written as ``archetype.water`` when it is given.  One
+    completion at a time per process.
+    """
+    import lib.config as config
+    from lib import glystatic, lookups
+    from lib.glybake import GlycoShapeBaker
+    from lib.glymeta import GlycanMetadataProcessor
+    from lib.storage import local_storage
+
+    submission = Submission.parse(submission)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    keywords = {key: list(value or []) for key, value in (keywords or {}).items()}
+    if set(keywords) - set(KEYWORD_EDITS) or ("replace" in keywords and set(keywords) != {"replace"}):
+        raise SubmissionError('keywords is {"add": [...], "remove": [...]} or {"replace": [...]}')
     with _PROCESS_LOCK:
         previous_levels = config.cluster_levels
-        config.cluster_levels = tuple(bundle.levels)
+        config.cluster_levels = tuple(levels)
         try:
             with local_storage(), lookups.recording(offline=offline, timeout=lookup_timeout, budget=lookup_budget) as log:
                 completed = glystatic.complete_static_ready(
-                    bundle.static_dir,
-                    bundle.glycam_name,
+                    static_dir,
+                    glycam_name,
                     submission.glycoshape_id,
                     output_dir,
                     submission.simulation(),
                     inventory_glytoucan=submission.glytoucan_id or None,
+                    names=names,
                 )
                 folder = Path(completed["final_output_dir"])
                 processor = GlycanMetadataProcessor(output_dir, pb_client=None)
                 if not processor.update_glycan_metadata(folder / "data.json", enrichment=submission.enrichment()):
                     raise CompletionError(f"the search metadata of {folder / 'data.json'} could not be written")
                 data = json.loads((folder / "data.json").read_bytes())
-                extra = _extra_aliases(processor, data, submission.aliases)
+                edited = False
+                curated = list(submission.aliases)
+                known = {alias.casefold() for alias in curated}
+                extra = _extra_aliases(processor, data, curated + [alias for alias in aliases if alias.casefold() not in known])
                 if extra:
                     # Names the entry cannot be found under otherwise.  The key is only written for an
                     # entry that has such aliases, so every other data.json is the one of the static stage.
                     data["search_meta"]["aliases"] = extra
+                    edited = True
+                if keywords:
+                    current = list(keywords["replace"]) if "replace" in keywords else list(
+                        data["search_meta"].get("keywords") or [])
+                    removed = {item.casefold() for item in keywords.get("remove") or []}
+                    current = [item for item in current if item.casefold() not in removed]
+                    current += list(keywords.get("add") or [])
+                    data["search_meta"]["keywords"] = sorted({item.casefold(): item for item in current if item}.values())
+                    edited = True
+                if submission.water_model:
+                    data["archetype"] = _insert_after(data["archetype"], "salt", "water", submission.water_model)
+                    edited = True
+                if public_note:
+                    data["search_meta"]["curator_note"] = public_note
+                    edited = True
+                if edited:
                     (folder / "data.json").write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
                 if not GlycoShapeBaker(output_dir).create_individual_glycan_archive(folder):
                     raise CompletionError(f"{folder.name}.zip could not be built")
@@ -735,9 +818,38 @@ def complete_entry(
             raise CompletionError(f"{type(exc).__name__}: {exc}") from exc
         finally:
             config.cluster_levels = previous_levels
+    return folder, data, log.summary()
 
+
+def _insert_after(mapping: Dict[str, Any], after: str, key: str, value: Any) -> Dict[str, Any]:
+    """A copy of ``mapping`` with ``key`` set, placed after ``after`` (at the end when that is absent)."""
+    out: Dict[str, Any] = {}
+    for name, item in mapping.items():
+        if name == key:
+            continue
+        out[name] = item
+        if name == after:
+            out[key] = value
+    out.setdefault(key, value)
+    return out
+
+
+def folder_report(folder: Path, data: Dict[str, Any], levels, summary: Dict[str, Any], submission: Any,
+                  warnings: Optional[List[str]] = None) -> Dict[str, Any]:
+    """What a completion reports: files, identity, simulation, search metadata, lookups, problems, warnings.
+
+    ``problems`` are the reasons not to publish the folder (a missing file,
+    no SNFG image, neither WURCS nor accession); ``warnings`` are the given
+    ones followed by what the lookups did not answer.
+    """
+    from lib import glystatic, static_levels
+
+    submission = Submission.parse(submission)
+    folder = Path(folder)
+    warnings = list(warnings or [])
+    problems: List[str] = []
     files = _folder_files(folder)
-    for name in static_levels.required_files(bundle.levels):
+    for name in static_levels.required_files(levels):
         if name not in files:
             problems.append(f"{name} is missing")
     for name in ("snfg.svg", "glygen.json", "glycosmos.json", f"{folder.name}.zip"):
@@ -749,15 +861,6 @@ def complete_entry(
     if not archetype.get("wurcs") and not archetype.get("glytoucan"):
         problems.append("the archetype has neither a WURCS nor a GlyTouCan accession "
                         "(the static stage of main.py calls such a folder incomplete)")
-    used = {f"static/{name}" for name in files}
-    if not replicas.public_placement():
-        used.add(f"static/{replicas.STATIC_PATH}")      # kept by the publisher for the administrators
-    ignored = sorted(relative[len("static/"):] for relative in bundle.files
-                     if relative.startswith("static/") and relative not in used)
-    if ignored:
-        warnings.append(f"{len(ignored)} file(s) of the static-ready folder are not part of a published folder: "
-                        + ", ".join(ignored[:5]))
-    summary = log.summary()
     if summary["unanswered"]:
         warnings.append("lookups without an answer: " + ", ".join(summary["unanswered"]))
     if summary["tools"].get("crabwurcs", {}).get("available") is False:
@@ -766,7 +869,7 @@ def complete_entry(
         "glycoshape_id": submission.glycoshape_id,
         "glycam_name": submission.glycam_name,
         "folder": str(folder),
-        "levels": list(bundle.levels),
+        "levels": list(levels),
         "files": files,
         "file_count": len(files),
         "total_size": sum(item["size"] for item in files.values()),
@@ -782,7 +885,7 @@ def complete_entry(
         "warnings": warnings,
         "submission": submission.record(),
         "submission_sha256": submission.sha256(),
-        "bundle": bundle.summary(),
+        "bundle": None,
     }
 
 

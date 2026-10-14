@@ -6,6 +6,8 @@
     withdraw  take a published glycan out (its raw data stays, its ID is never given to another glycan)
     status    what is stored: the database, the lock, an interrupted publication, one entry
     recover   finish a publication that was interrupted while its files were being switched
+    update-metadata   publish a published entry again with other curated metadata, no new analysis
+    reanalyse         analyse the stored raw entry of a published glycan again and publish it in place
 
 ``publish`` and ``replace`` take an extracted bundle directory (bundle.json,
 archive/, static/, result.json, run.log) and a submission record::
@@ -25,6 +27,16 @@ the website: new files, staged replacements, the switch, sync_manifest.json
 last.  After any interruption run the same command again.  ``--dry-run``
 does all of this locally, reads the storage and writes nothing to it; its
 report is what an administrator approves.
+
+``update-metadata`` takes a changes record (schema glycoshape-entry-changes,
+lib/entry_ops.py); ``reanalyse`` the ID and what to do differently::
+
+    publish_entry.py update-metadata --changes GS00020.changes.json --work-dir w/ --dry-run --report r.json
+    publish_entry.py reanalyse --id GS00020 --simulated-anomer alpha --exclude-replica run_3 \
+        --analysis-workers 12 --memory-limit-gb 30 --work-dir w/ --dry-run --report r.json
+
+Both are published like ``replace`` (same ID), keep a record of the version in
+publish-state/<static>/history/, and take --expect-hash like ``publish``.
 
 Exit status: 0 done (or a dry run that would be published), 1 stopped (run
 again), 2 refused by a check (nothing was written), 3 the database is locked
@@ -66,7 +78,7 @@ def _levels(text: str):
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("publish", "replace", "withdraw", "status", "recover"):
+    for name in ("publish", "replace", "withdraw", "status", "recover", "update-metadata", "reanalyse"):
         command = commands.add_parser(name)
         command.add_argument("--static-bucket", help="Database bucket (default: GLYCOSHAPE_S3_STATIC_BUCKET).")
         command.add_argument("--raw-bucket", help="Archive bucket (default: GLYCOSHAPE_S3_RAW_BUCKET).")
@@ -76,12 +88,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                              help="Parallel requests (default 8); also how many copies of the switch are made at the "
                                   "same time, which is what its duration depends on.")
         command.add_argument("--report", type=Path, help="Write the report of the run to this JSON file.")
-        if name in ("publish", "replace", "withdraw", "recover"):
+        if name in ("publish", "replace", "withdraw", "recover", "update-metadata", "reanalyse"):
             command.add_argument("--lock-ttl", type=float, default=3600.0,
                                  help="Seconds after which the lock of a run that died may be taken over (default 3600).")
             command.add_argument("--break-lock", action="store_true",
                                  help="Take the lock although another run holds it: only when that run is known to be gone.")
-        if name in ("publish", "replace", "withdraw"):
+        if name in ("publish", "replace", "withdraw", "update-metadata", "reanalyse"):
             command.add_argument("--work-dir", type=Path,
                                  help="Work folder with the journal (default: <bundle>.publish; required for withdraw).")
             command.add_argument("--cache-dir", type=Path,
@@ -97,6 +109,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             source.add_argument("--submission", type=Path, help="Submission record (JSON file).")
             source.add_argument("--id", help="GlycoShape ID; the metadata is taken from source of bundle.json.")
             command.add_argument("--source-type", default="", help="With --id: where the data came from (keyword Source:<type>).")
+        if name == "update-metadata":
+            command.add_argument("--changes", type=Path, required=True,
+                                 help="Changes record (JSON, schema glycoshape-entry-changes; lib/entry_ops.py).")
+        if name == "reanalyse":
+            command.add_argument("--id", required=True, help="GlycoShape ID of the published entry.")
+            command.add_argument("--exclude-replica", action="append", default=[], metavar="NAME",
+                                 help="Leave this replica out of the analysis (repeatable): a segment name of the raw "
+                                      "manifest or a replica name of replicas.json (run_2, stored_run_1, ...).")
+            command.add_argument("--simulated-anomer", choices=("alpha", "beta", "auto"),
+                                 help="The anomer that was simulated; when it is not the one of the name, the entry is "
+                                      "renamed to it and its files follow.  auto: what the residue code says.")
+            command.add_argument("--note", default="", help="Why (for example the GAP fix this picks up); kept in the history.")
+            command.add_argument("--author", default="", help="Who asked; kept in the history.")
+            command.add_argument("--submission", type=Path,
+                                 help="Curated metadata (submission record); default: those of the stored entry.")
+            command.add_argument("--analysis-workers", type=int, default=8, help="Cores of the analysis (default 8).")
+            command.add_argument("--memory-limit-gb", type=float,
+                                 help="Refuse an entry whose analysis is estimated to need more memory than this.")
+        if name in ("publish", "replace", "update-metadata", "reanalyse"):
             command.add_argument("--expect-hash", help="Publish only when the completed folder has this hash (of a dry run).")
             command.add_argument("--refresh-metadata", action="store_true",
                                  help="Complete the folder again even when the work folder has it (new lookups).")
@@ -111,6 +142,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                                  help="Refuse a bundle made from a checkout with uncommitted changes.")
             command.add_argument("--allow-incomplete", action="store_true",
                                  help="Publish an entry without WURCS and accession, or without its SNFG image.")
+        if name in ("publish", "replace"):
             command.add_argument("--overwrite-raw", action="store_true",
                                  help="Replace a stored raw entry by one that does not extend it.")
             command.add_argument("--keep-previous-raw", choices=("auto", "manifest", "all"), default="auto",
@@ -128,8 +160,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be at least 1")
-    if args.command == "withdraw" and args.work_dir is None:
-        parser.error("withdraw needs --work-dir")
+    if args.command in ("withdraw", "update-metadata", "reanalyse") and args.work_dir is None:
+        parser.error(f"{args.command} needs --work-dir")
+    if args.command == "reanalyse" and args.analysis_workers < 1:
+        parser.error("--analysis-workers must be at least 1")
     return args
 
 
@@ -303,6 +337,91 @@ def _status(args: argparse.Namespace) -> int:
     return EXIT_DONE if report["ok"] else EXIT_STOPPED
 
 
+def _print_operation(report: dict) -> None:
+    """The lines an administrator reads of an update-metadata or reanalyse report."""
+    rename = report.get("rename")
+    if rename:
+        raw = rename.get("raw") or {}
+        _say(f"rename: {str(rename['from'])[:80]} -> {str(rename['to'])[:80]}; raw entry: {raw.get('relation')}")
+    anomer = report.get("anomer")
+    if anomer:
+        _say(f"anomer: named {anomer['named']}, declared {anomer['declared']}, residue code "
+             f"{anomer['residue_code']['residue']} ({anomer['residue_code']['anomer']})")
+    analysis = report.get("analysis")
+    if analysis:
+        excluded = ", ".join(row["name"] for row in analysis.get("excluded_replicas") or []) or "none"
+        _say(f"analysis: {analysis['seconds']} s{' (reused)' if analysis.get('reused') else ''}; "
+             f"excluded replicas: {excluded}")
+    memory = report.get("memory")
+    if memory:
+        _say(f"memory: about {memory['estimate_gb']} GB estimated, limit {memory['limit_gb']}")
+    diff = report.get("diff")
+    if diff:
+        for name, change in list(diff["names"].items())[:12]:
+            _say(f"  {name}: {str(change['before'])[:60]} -> {str(change['after'])[:60]}")
+        for name, change in diff["simulation"].items():
+            _say(f"  simulation {name}: {change['before']} -> {change['after']}")
+        for name, change in diff["search_meta"].items():
+            if "added" in change:
+                _say(f"  {name}: +{change['added']} -{change['removed']}")
+            else:
+                _say(f"  {name} changed")
+        for level, row in diff["analysis"]["levels"].items():
+            reps = row.get("representative_source_frames") or {}
+            _say(f"  {level}: population TV {row['total_variation']}"
+                 + ("" if not reps else "; representatives " + ("unchanged" if reps.get("same") else "changed")))
+        files = diff["files"]
+        _say(f"  files: {len(files['added'])} added, {len(files['removed'])} removed, {len(files['changed'])} changed, "
+             f"{files['unchanged']} unchanged; {_megabytes(files['bytes_before'])} -> {_megabytes(files['bytes_after'])}")
+
+
+def _operation(args: argparse.Namespace) -> int:
+    from lib import entry_complete, entry_ops, entry_publish
+
+    policy = entry_publish.Policy(
+        levels=args.levels,
+        pipeline_versions=tuple(args.accept_pipeline_version),
+        pipeline_commits=tuple(args.accept_pipeline_commit),
+        require_clean=args.require_clean,
+        allow_incomplete=args.allow_incomplete,
+    )
+    common = dict(policy=policy, dry_run=args.dry_run, offline=True if args.offline else None,
+                  lookup_timeout=args.lookup_timeout, lookup_budget=args.lookup_budget, refresh=args.refresh_metadata,
+                  expect_hash=args.expect_hash, lock_ttl=args.lock_ttl, break_lock=args.break_lock,
+                  cache_dir=args.cache_dir, log=_say)
+    try:
+        if args.command == "update-metadata":
+            try:
+                changes = json.loads(args.changes.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise SystemExit(f"cannot read the changes record {args.changes}: {exc}")
+            report = entry_ops.update_metadata(changes, _target(args), args.work_dir, **common)
+        else:
+            submission = None
+            if args.submission is not None:
+                try:
+                    submission = json.loads(args.submission.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise SystemExit(f"cannot read the submission record {args.submission}: {exc}")
+            report = entry_ops.reanalyse(
+                args.id, _target(args), args.work_dir, exclude=args.exclude_replica, simulated=args.simulated_anomer,
+                note=args.note, author=args.author, submission_record=submission, workers=args.analysis_workers,
+                memory_limit_gb=args.memory_limit_gb, **common)
+    except entry_publish.Refused as exc:
+        report = exc.report or {"refused": [str(exc)]}
+    except entry_complete.SubmissionError as exc:
+        report = {"refused": [str(exc)]}
+    _print_entry(report)
+    _print_operation(report)
+    _print_plan(report)
+    status = _finish(args, report)
+    if status == EXIT_DONE:
+        _say("dry run: nothing was written to the storage; this version would be published" if args.dry_run
+             else f"{args.command}: {report['status']} {report['glycoshape_id']} "
+                  f"(global_hash {report['static']['target_global_hash'][:16]}...) in {report['seconds']} s")
+    return status
+
+
 def _recover(args: argparse.Namespace) -> int:
     from lib import entry_publish
 
@@ -318,7 +437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     from lib import entry_complete, entry_publish, static_delta, static_publish
 
-    handlers = {"publish": _publish, "replace": _publish, "withdraw": _withdraw, "status": _status, "recover": _recover}
+    handlers = {"publish": _publish, "replace": _publish, "withdraw": _withdraw, "status": _status, "recover": _recover,
+                "update-metadata": _operation, "reanalyse": _operation}
     try:
         return handlers[args.command](args)
     except entry_publish.LockHeld as exc:

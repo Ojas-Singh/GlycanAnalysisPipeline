@@ -114,6 +114,11 @@ frame_quality_block_frames = _int_env(
     "GLYCOSHAPE_FRAME_QUALITY_BLOCK_FRAMES", 1024, minimum=1
 )
 upload_workers = _int_env("GLYCOSHAPE_UPLOAD_WORKERS", 1)
+# Frames of the source left out of an analysis on purpose (a replica an
+# administrator excluded): None, or [[first_frame, frames, name], ...] in
+# source frames. Set by lib/entry_run.py for one run; never from the
+# environment, so a whole-database run cannot pick it up by accident.
+excluded_source_frames = None
 
 
 def parse_cluster_levels(raw) -> tuple:

@@ -116,9 +116,28 @@ def _covalent_cutoff(left: str, right: str) -> float:
     return _COVALENT_RADII[left] + _COVALENT_RADII[right] + COVALENT_TOLERANCE_ANGSTROM
 
 
+def normalise_exclusions(excluded) -> list:
+    """``[[first_frame, frames, name], ...]`` sorted, from what a caller gives (None: nothing excluded)."""
+    if not excluded:
+        return []
+    rows = []
+    for item in excluded:
+        first, count, name = (list(item) + [None, None, None])[:3]
+        first, count = int(first), int(count)
+        if first < 0 or count < 1:
+            raise ValueError(f"an excluded frame range must start at 0 or later and hold frames: {item!r}")
+        rows.append([first, count, None if name is None else str(name)])
+    rows.sort(key=lambda row: row[0])
+    for left, right in zip(rows, rows[1:]):
+        if left[0] + left[1] > right[0]:
+            raise ValueError(f"excluded frame ranges overlap: {left!r} and {right!r}")
+    return rows
+
+
 def quality_manifest_is_current(
     frame_data_dir: str | Path,
     max_bond_distance: float = DEFAULT_MAX_BOND_ANGSTROM,
+    excluded=None,
 ) -> bool:
     path = Path(frame_data_dir) / "frame_filter.json"
     try:
@@ -126,6 +145,7 @@ def quality_manifest_is_current(
         return (
             int(data.get("filter_version", -1)) == FILTER_VERSION
             and float(data.get("max_bond_distance_A")) == float(max_bond_distance)
+            and (data.get("excluded_source_frames") or []) == normalise_exclusions(excluded)
             and (Path(frame_data_dir) / "frame_quality.parquet").exists()
             and (Path(frame_data_dir) / "frame_map.parquet").exists()
         )
@@ -528,8 +548,18 @@ def filter_broken_frames(
     max_bond_distance: float = DEFAULT_MAX_BOND_ANGSTROM,
     block_frames: int = 1024,
     frame_chunk: int = 0,
+    excluded=None,
 ) -> FrameQualityResult:
-    """Recover topology, remove truly broken frames, and persist provenance."""
+    """Recover topology, remove truly broken frames, and persist provenance.
+
+    ``excluded`` (``[[first_frame, frames, name], ...]`` in source frames)
+    leaves frames out on purpose, for example a replica that an
+    administrator excluded from the analysis.  They are not used for the
+    topology either, are counted as ``excluded_frames`` (not as rejected),
+    and ``frame_quality.parquet`` gets an ``excluded`` column; without
+    exclusions every file is written exactly as before.
+    """
+    excluded = normalise_exclusions(excluded)
     data_dir = Path(frame_data_dir)
     atoms = _read_parquet_exact(data_dir / "atoms.parquet")
     raw_bonds = _read_parquet_exact(data_dir / "bonds.parquet")
@@ -542,12 +572,25 @@ def filter_broken_frames(
     n_source_frames = int(coords.shape[0])
     if n_source_frames == 0:
         raise ValueError("No trajectory frames available for quality filtering")
+    selected = np.ones(n_source_frames, dtype=bool)
+    for first, count, name in excluded:
+        if first + count > n_source_frames:
+            raise ValueError(
+                f"excluded frames {first} to {first + count - 1} ({name}) lie beyond the "
+                f"{n_source_frames} frames of the trajectory"
+            )
+        selected[first:first + count] = False
+    if not selected.any():
+        raise ValueError("every frame of the trajectory is excluded")
 
     raw_pairs = [
         (int(a), int(b))
         for a, b in raw_bonds.select(["a", "b"]).iter_rows()
     ]
-    recovery = recover_topology(coords, atoms, raw_pairs, max(1, int(block_frames)))
+    # The topology is recovered from the frames that are analysed: an excluded replica may be the damaged one.
+    recovery = recover_topology(
+        coords if selected.all() else coords[selected], atoms, raw_pairs, max(1, int(block_frames))
+    )
     bonds = recovery.bonds
     input_count = recovery.input_bonds
     retained_input_count = recovery.retained_input_bonds
@@ -579,15 +622,17 @@ def filter_broken_frames(
     accepted = finite_frame & np.isfinite(max_distance) & (
         max_distance <= float(max_bond_distance)
     )
+    excluded_count = int((~selected).sum())
+    rejected = int((selected & ~accepted).sum())
+    accepted = accepted & selected
     retained = int(accepted.sum())
-    rejected = n_source_frames - retained
     if retained == 0:
         raise ValueError(
             "All trajectory frames are broken or non-finite; original process "
             "coordinates were left unchanged"
         )
 
-    if rejected:
+    if rejected or excluded_count:
         requested_chunk = (
             retained if int(frame_chunk) <= 0 else int(frame_chunk)
         )
@@ -602,13 +647,16 @@ def filter_broken_frames(
     )
 
     source_frames = np.arange(n_source_frames, dtype=np.int32)
-    pl.DataFrame({
+    quality_columns = {
         "source_frame": source_frames,
         "accepted": accepted,
         "max_bond_distance_A": max_distance,
         "offending_bond_a": offending_a,
         "offending_bond_b": offending_b,
-    }).write_parquet(
+    }
+    if excluded:
+        quality_columns["excluded"] = ~selected
+    pl.DataFrame(quality_columns).write_parquet(
         data_dir / "frame_quality.parquet", compression="zstd", statistics=True
     )
     retained_sources = source_frames[accepted]
@@ -647,6 +695,9 @@ def filter_broken_frames(
         ),
         "exclusion_rule": "nonfinite_or_covalent_bond_over_threshold",
     }
+    if excluded:
+        manifest["excluded_frames"] = excluded_count
+        manifest["excluded_source_frames"] = excluded
     temporary_manifest = data_dir / f".frame_filter.json.tmp.{os.getpid()}"
     temporary_manifest.write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
