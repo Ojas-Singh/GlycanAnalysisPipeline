@@ -3,8 +3,7 @@ from pathlib import Path
 import json
 import logging
 from typing import Dict, List, Set, Optional, Union
-import re
-from lib import name_utils
+from lib import glyclass, name_utils
 from lib.storage import get_storage_manager
 
 logging.basicConfig(level=logging.INFO)
@@ -110,283 +109,26 @@ class GlycanMetadataProcessor:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.pb_client = pb_client
         
-    def get_glycan_keywords(self, iupac_string: str) -> List[str]:
-        """Determine keywords based on the IUPAC string.
-        
+    def get_glycan_keywords(self, iupac_string: Optional[str], wurcs: Optional[str] = None) -> List[str]:
+        """Class keywords of a glycan (N-, O-glycan, GAG and the N-glycan types), sorted.
+
+        The keywords are decided on the residue tree of the glycan
+        (:mod:`lib.glyclass`), read from its WURCS when it is given and can be
+        read, else from the IUPAC-condensed name.  A glycan neither of whose
+        names can be read gets no class keyword (and a warning).
+
         Args:
-            iupac_string: IUPAC notation string for the glycan
-            
+            iupac_string: IUPAC-condensed name of the glycan
+            wurcs: WURCS of the glycan
+
         Returns:
             List of keywords describing the glycan type
         """
-        if not iupac_string:
-            return []
-            
-        keywords = set()
-        
-        # N-Glycan classification
-        keywords.update(self._classify_n_glycan(iupac_string))
-        
-        # O-Glycan classification
-        if self._is_o_glycan(iupac_string):
-            keywords.add("O-Glycan")
-            
-        # GAG (Glycosaminoglycan) classification
-        if self._is_gag(iupac_string):
-            keywords.add("GAG")
-            
-        return sorted(list(keywords))
-    
-    def _classify_n_glycan(self, iupac_string: str) -> Set[str]:
-        """Classify N-Glycan types and subtypes.
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            Set of N-Glycan related keywords
-        """
-        keywords = set()
-        
-        # Check if it's an N-Glycan
-        n_glycan_patterns = [
-            r'Man\(b1-4\)GlcNAc\(b1-4\)GlcNAc$',
-            r'Man\(b1-4\)GlcNAc\(b1-4\)\[Fuc\(a1-6\)\]GlcNAc$'
-        ]
-        
-        is_n_glycan = any(re.search(pattern, iupac_string) for pattern in n_glycan_patterns)
-        
-        if not is_n_glycan:
-            return keywords
-            
-        keywords.add("N-Glycan")
-        
-        # Check for core fucosylation
-        if 'Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc' in iupac_string:
-            keywords.add("Fucosylated N-Glycan")
-            
-        # Classify N-Glycan subtypes
-        if self._is_oligomannose(iupac_string):
-            keywords.add("Oligomannose")
-        elif self._is_complex_n_glycan(iupac_string):
-            keywords.add("Complex N-Glycan")
-            # Add antennary classification
-            keywords.update(self._classify_antennary(iupac_string))
-        elif self._is_hybrid_n_glycan(iupac_string):
-            keywords.add("Hybrid N-Glycan")
-            
+        keywords, source = glyclass.class_keywords(wurcs=wurcs, iupac=iupac_string)
+        if source not in ("wurcs", "iupac") and (wurcs or iupac_string):
+            self.logger.warning(f"No residue tree for the class keywords ({source})")
         return keywords
-    
-    def _is_oligomannose(self, iupac_string: str) -> bool:
-        """Check if the glycan is an oligomannose N-Glycan.
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            True if oligomannose, False otherwise
-        """
-        # Must have at least 3 mannose residues
-        if iupac_string.count('Man') < 3:
-            return False
-            
-        # Exclude patterns that indicate complex/hybrid glycans
-        exclusion_patterns = [
-            'GlcNAc(b1-2)Man',
-            'Gal(',
-            'Neu5Ac(',
-            'Xyl(',
-            'GlcNAc(b1-4)]Man',
-            'GlcNAc(b1-6)[GlcNAc(b1-2)]Man',
-            'GlcNAc(b1-4)[GlcNAc(b1-2)]Man'
-        ]
-        
-        for pattern in exclusion_patterns:
-            if pattern in iupac_string:
-                return False
-                
-        # Special case: allow core fucosylation
-        temp_iupac = iupac_string
-        if temp_iupac.endswith('Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc'):
-            temp_iupac = temp_iupac.replace('[Fuc(a1-6)]GlcNAc', 'GlcNAc')
-            
-        # No other fucosylation allowed
-        if 'Fuc(' in temp_iupac:
-            return False
-            
-        # Check for GlcNAc(b1-4)Man pattern (excluding core)
-        if ('GlcNAc(b1-4)Man' in iupac_string and 
-            'Man(b1-4)GlcNAc(b1-4)GlcNAc' not in iupac_string):
-            return False
-            
-        return True
-    
-    def _is_complex_n_glycan(self, iupac_string: str) -> bool:
-        """Check if the glycan is a complex N-Glycan.
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            True if complex N-Glycan, False otherwise
-        """
-        # Must have N-Glycan core
-        core_patterns = [
-            'Man(b1-4)GlcNAc(b1-4)GlcNAc',
-            'Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc',
-            'Man(b1-4)GlcNAc(b1-4)[Fuc(a1-3)]GlcNAc'
-        ]
-        
-        has_core = any(pattern in iupac_string for pattern in core_patterns)
-        if not has_core:
-            return False
-            
-        # Must have GlcNAc extensions on both arms
-        has_glcnac_extension = 'GlcNAc(b1-2)Man' in iupac_string
-        
-        arm_3_patterns = ['GlcNAc(b1-2)Man(a1-3)', 'GlcNAc(b1-2)]Man(a1-3)']
-        arm_6_patterns = ['GlcNAc(b1-2)Man(a1-6)', 'GlcNAc(b1-2)]Man(a1-6)']
-        
-        has_3_arm = any(pattern in iupac_string for pattern in arm_3_patterns)
-        has_6_arm = any(pattern in iupac_string for pattern in arm_6_patterns)
-        
-        return has_glcnac_extension and has_3_arm and has_6_arm
-    
-    def _is_hybrid_n_glycan(self, iupac_string: str) -> bool:
-        """Check if the glycan is a hybrid N-Glycan.
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            True if hybrid N-Glycan, False otherwise
-        """
-        # Must have N-Glycan core
-        core_patterns = [
-            'Man(b1-4)GlcNAc(b1-4)GlcNAc',
-            'Man(b1-4)GlcNAc(b1-4)[Fuc(a1-6)]GlcNAc',
-            'Man(b1-4)GlcNAc(b1-4)[Fuc(a1-3)]GlcNAc'
-        ]
-        
-        has_core = any(pattern in iupac_string for pattern in core_patterns)
-        if not has_core:
-            return False
-            
-        # Must have more than 3 mannose residues
-        if iupac_string.count('Man') <= 3:
-            return False
-            
-        # Must have GlcNAc extension on only one arm (not both)
-        arm_3_patterns = ['GlcNAc(b1-2)Man(a1-3)', 'GlcNAc(b1-2)]Man(a1-3)']
-        arm_6_patterns = ['GlcNAc(b1-2)Man(a1-6)', 'GlcNAc(b1-2)]Man(a1-6)']
-        
-        has_3_arm = any(pattern in iupac_string for pattern in arm_3_patterns)
-        has_6_arm = any(pattern in iupac_string for pattern in arm_6_patterns)
-        
-        # Hybrid has extension on one arm but not both
-        return (has_3_arm and not has_6_arm) or (has_6_arm and not has_3_arm)
-    
-    def _classify_antennary(self, iupac_string: str) -> Set[str]:
-        """Classify antennary structure of complex N-Glycans.
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            Set of antennary keywords
-        """
-        keywords = set()
-        
-        # Count GlcNAc attachments on each arm
-        arm_3_attachments = 0
-        arm_6_attachments = 0
-        
-        # Check for different attachment patterns on 3-arm
-        if any(pattern in iupac_string for pattern in 
-               ['GlcNAc(b1-2)Man(a1-3)', 'GlcNAc(b1-2)]Man(a1-3)']):
-            arm_3_attachments += 1
-            
-        if any(pattern in iupac_string for pattern in
-               ['GlcNAc(b1-4)Man(a1-3)', 'GlcNAc(b1-4)[Man(a1-3)', 
-                'GlcNAc(b1-4)[GlcNAc(b1-2)]Man(a1-3)']):
-            arm_3_attachments += 1
-            
-        # Check for different attachment patterns on 6-arm  
-        if any(pattern in iupac_string for pattern in
-               ['GlcNAc(b1-2)Man(a1-6)', 'GlcNAc(b1-2)]Man(a1-6)']):
-            arm_6_attachments += 1
-            
-        if any(pattern in iupac_string for pattern in
-               ['GlcNAc(b1-6)Man(a1-6)', 'GlcNAc(b1-6)[Man(a1-6)',
-                'GlcNAc(b1-6)[GlcNAc(b1-2)]Man(a1-6)']):
-            arm_6_attachments += 1
-            
-        # Classify based on total antennae
-        total_antennae = arm_3_attachments + arm_6_attachments
-        has_both_arms = arm_3_attachments > 0 and arm_6_attachments > 0
-        
-        if has_both_arms:
-            if total_antennae == 2:
-                keywords.add("Biantennary N-Glycan")
-            elif total_antennae == 3:
-                keywords.add("Triantennary N-Glycan")
-            elif total_antennae >= 4:
-                keywords.add("Tetraantennary N-Glycan")
-                
-        return keywords
-    
-    def _is_o_glycan(self, iupac_string: str) -> bool:
-        """Check if the glycan is an O-Glycan.
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            True if O-Glycan, False otherwise
-        """
-        o_glycan_patterns = [
-            r'GalNAc$',
-            'Gal(b1-3)GalNAc',
-            'GlcNAc(b1-6)[Gal(b1-3)]GalNAc',
-            'GlcNAc(b1-3)GalNAc',
-            'GlcNAc(b1-6)[GlcNAc(b1-3)]GalNAc'
-        ]
-        
-        return any(pattern in iupac_string for pattern in o_glycan_patterns)
-    
-    def _is_gag(self, iupac_string: str) -> bool:
-        """Check if the glycan is a GAG (Glycosaminoglycan).
-        
-        Args:
-            iupac_string: IUPAC notation string
-            
-        Returns:
-            True if GAG, False otherwise
-        """
-        gag_patterns = [
-            'GlcA(b1-3)Gal(b1-3)Gal(b1-4)Xyl',  # Linkage region
-            'IdoA'  # Iduronic acid
-        ]
-        
-        # Check for specific GAG patterns
-        for pattern in gag_patterns:
-            if pattern in iupac_string:
-                return True
-                
-        # Check for combinations indicating GAGs
-        gag_combinations = [
-            ('GlcA', 'GlcNAc'),   # Heparin/Heparan sulfate
-            ('GlcA', 'GalNAc'),   # Chondroitin/Dermatan sulfate
-            ('GlcN', 'GlcA'),     # Heparin variants
-            ('GlcN', 'IdoA')      # Heparin variants
-        ]
-        
-        for combo in gag_combinations:
-            if all(component in iupac_string for component in combo):
-                return True
-                
-        return False
-    
+
     def get_common_names(self, glycan_data: Dict) -> Set[str]:
         """Extract common names from glycan data.
         
@@ -570,12 +312,7 @@ class GlycanMetadataProcessor:
         # Type classification
         type_keywords = [
             k for k in search_meta.get("keywords", [])
-            if k in (
-                "N-Glycan", "O-Glycan", "GAG", "Oligomannose",
-                "Complex N-Glycan", "Hybrid N-Glycan",
-                "Biantennary N-Glycan", "Triantennary N-Glycan",
-                "Tetraantennary N-Glycan", "Fucosylated N-Glycan",
-            )
+            if k in glyclass.CLASS_KEYWORDS
         ]
         if type_keywords:
             parts.append(f"Classified as: {', '.join(type_keywords)}.")
@@ -733,24 +470,29 @@ class GlycanMetadataProcessor:
                 
             search_meta = data["search_meta"]
             
-            # Get archetype IUPAC for keyword generation
+            # Get archetype WURCS and IUPAC for keyword generation
             archetype = data.get("archetype", {})
             iupac_string = archetype.get("iupac")
+            wurcs = archetype.get("wurcs")
 
             # Repair GlyTouCan IDs that may have appeared after static JSON generation.
             self._repair_missing_glytoucan_ids(data, json_file_path.name)
-            
-            # Update keywords
-            if iupac_string:
-                current_keywords = set(search_meta.get("keywords", []))
-                new_keywords = self.get_glycan_keywords(iupac_string)
+
+            # Update keywords: the class keywords are decided again and replace
+            # the ones a previous run wrote; every other keyword is kept (the
+            # curated ones are merged again below).
+            if iupac_string or wurcs:
+                current_keywords = {
+                    k for k in search_meta.get("keywords", []) if k not in glyclass.CLASS_KEYWORDS
+                }
+                new_keywords = self.get_glycan_keywords(iupac_string, wurcs=wurcs)
                 current_keywords.update(new_keywords)
                 search_meta["keywords"] = sorted(list(current_keywords))
-                
+
                 if new_keywords:
                     self.logger.info(f"Updated keywords for {json_file_path.name}: {new_keywords}")
             else:
-                self.logger.warning(f"No archetype IUPAC found in {json_file_path.name}")
+                self.logger.warning(f"No archetype WURCS or IUPAC found in {json_file_path.name}")
                 
             # Update common names
             current_common_names = set(search_meta.get("common_names", []))
