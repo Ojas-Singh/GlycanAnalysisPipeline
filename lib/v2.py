@@ -46,6 +46,7 @@ from lib.frame_quality import (
 )
 from lib.glypdbio import get_conformation_landscape
 from lib.embedding import (
+    PCA_RANDOM_STATE,
     pca_conformation_landscape,
     knn_conformational_entropy,
     save_clustering_results,
@@ -63,6 +64,7 @@ from lib.embedding import (
 )
 from lib import glypdbio
 from lib.torsion import (
+    TORSION_CONVENTIONS,
     build_torsion_metadata,
     classify_glycosidic_from_name,
     circular_stats,
@@ -179,31 +181,20 @@ def _update_pca_json(embedding_dir: str, updates: Dict) -> None:
         if storage.exists(p):
             with storage.open(p, "r") as fh:
                 base = json.load(fh) or {}
-        # deep merge: preserve nested mappings and lists where reasonable
+        # deep merge: preserve nested mappings, replace everything else
         def _deep_merge(a: dict, b: dict) -> dict:
             """Return a new dict that's a deep merge of a and b (b overrides a).
 
             - dict values are merged recursively
-            - list values: if both are lists, we try to merge unique items, else b replaces
-            - scalar values: b overrides
+            - list and scalar values: b replaces a.  A list is the result of
+              the computation that writes it (explained variance ratios, the
+              Level 2 clusters of a Level 1 cluster); merging it with the one
+              of an earlier run put several runs into one list.
             """
             out = dict(a)
             for k, v in b.items():
                 if k in out and isinstance(out[k], dict) and isinstance(v, dict):
                     out[k] = _deep_merge(out[k], v)
-                elif k in out and isinstance(out[k], list) and isinstance(v, list):
-                    # merge lists preserving order and uniqueness for simple scalars
-                    try:
-                        seen = set()
-                        merged = []
-                        for item in out[k] + v:
-                            key = item if not isinstance(item, dict) else json.dumps(item, sort_keys=True)
-                            if key not in seen:
-                                seen.add(key)
-                                merged.append(item)
-                        out[k] = merged
-                    except Exception:
-                        out[k] = v
                 else:
                     out[k] = v
             return out
@@ -389,6 +380,9 @@ def _level_summary_from_metadata(metadata: List[Dict]) -> Dict:
     non_glycosidic = [entry for entry in metadata if entry.get("family") != "glycosidic"]
     return {
         "metadata": metadata,
+        # The definitions of phi, psi and omega (omega is C4-C5-C6-O6, the IUPAC
+        # O5-C5-C6-O6 plus about 120 degrees).
+        "conventions": dict(TORSION_CONVENTIONS),
         "name_mapping": {entry["original_name"]: entry["canonical_name"] for entry in metadata},
         "glycosidic": glycosidic,
         "non_glycosidic": non_glycosidic,
@@ -630,7 +624,10 @@ def _fit_pca_and_write_landscape(
 
     n_components = min(10, n_frames, n_pairs)
     from sklearn.decomposition import PCA as _SkPCA
-    pca = _SkPCA(n_components=n_components, svd_solver="auto")
+    # svd_solver="auto" takes the randomized solver for most glycans (more
+    # than 1,000 atom pairs, or fewer than ten frames per pair); its draws are
+    # seeded so that the same landscape always gives the same projection.
+    pca = _SkPCA(n_components=n_components, svd_solver="auto", random_state=PCA_RANDOM_STATE)
     # copy=False only makes the fit centre X_proc itself rather than a copy;
     # X_proc is not used afterwards. The stored model keeps the default.
     pca.copy = False
@@ -790,6 +787,39 @@ def _levels_to_process(cr) -> List[int]:
     return [int(level) for level in cr.levels() if int(level) in wanted]
 
 
+def coverage_clusters_per_main(
+    level_1: List[Dict],
+    level_2: List[Dict],
+    n_frames: int,
+    n_main: Optional[int] = None,
+) -> Dict[int, List[int]]:
+    """The Level 2 clusters of every Level 1 cluster, both in the published numbering.
+
+    ``level_1`` and ``level_2`` are the cluster lists that
+    ``create_cluster_info_fast`` returns and the clustering results store:
+    sorted by decreasing size, ``cluster_id`` being the number under which a
+    cluster is published (``Cluster 0`` the largest) and ``members`` its
+    frames.  A Level 2 cluster belongs to the Level 1 cluster that holds most
+    of its frames (the lower number on a tie).  The keys are the Level 1
+    clusters ``0 .. n_main - 1``; the Level 2 clusters of each are in
+    increasing order.  (The labels of the clustering algorithms themselves
+    are numbered before this sorting and must not be used here.)
+    """
+    main_of_frame = np.full(int(n_frames), -1, dtype=int)
+    for cluster in level_1:
+        main_of_frame[np.asarray(cluster["members"], dtype=int)] = int(cluster["cluster_id"])
+    keys = range(int(n_main)) if n_main is not None else sorted(int(c["cluster_id"]) for c in level_1)
+    mapping: Dict[int, List[int]] = {int(key): [] for key in keys}
+    for cluster in sorted(level_2, key=lambda c: int(c["cluster_id"])):
+        mains = main_of_frame[np.asarray(cluster["members"], dtype=int)]
+        mains = mains[mains >= 0]
+        if mains.size == 0:
+            continue
+        unique, counts = np.unique(mains, return_counts=True)
+        mapping.setdefault(int(unique[np.argmax(counts)]), []).append(int(cluster["cluster_id"]))
+    return mapping
+
+
 def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, return_context: bool = False):
     """Run two-level clustering:
        - main: H_nats-guided target (1–8) with local silhouette refinement; save silhouettes to pca.json
@@ -917,9 +947,9 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
         min_coverage_improvement=0.01
     )
 
-    # LEVEL 3: k-center with up to 512 centers, only when configured. Each
-    # k-center call seeds the generator itself, so levels 1 and 2 do not
-    # depend on whether this one runs.
+    # LEVEL 3: k-center with up to 512 centers, only when configured. The
+    # k-center clustering draws nothing from a random generator, so levels 1
+    # and 2 do not depend on whether this one runs.
     n_frames = int(len(pca_data))
     n_clusters_level_3 = None
     if 3 in levels:
@@ -964,23 +994,15 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
     save_clustering_results(all_levels, output_path=cluster_out_json)
     save_clustering_results_parquet(all_levels, output_dir=embedding_dir)
 
-    # Map coverage clusters to main clusters
-    # For each coverage cluster, find which main cluster it belongs to (by majority vote of its members)
-    main_to_coverage_map: Dict[int, List[int]] = {i: [] for i in range(n_main)}
-    
+    # Map coverage clusters to main clusters, in the published numbering of
+    # both levels (the clusters as create_cluster_info_fast sorted them).
     try:
-        for cov_cluster_id in range(n_clusters_cov):
-            # Get frames in this coverage cluster
-            cov_frames_mask = labels_cov == cov_cluster_id
-            cov_frames_main_labels = labels_main[cov_frames_mask]
-            
-            # Find the most common main cluster label
-            if len(cov_frames_main_labels) > 0:
-                unique, counts = np.unique(cov_frames_main_labels, return_counts=True)
-                majority_main_cluster = int(unique[np.argmax(counts)])
-                main_to_coverage_map[majority_main_cluster].append(int(cov_cluster_id))
+        main_to_coverage_map = coverage_clusters_per_main(
+            all_levels[1], all_levels[2], n_frames=n_frames, n_main=1 if n_main == 1 else n_main
+        )
     except Exception as exc:
         logger.warning(f"Failed to map coverage clusters to main clusters: {exc}")
+        main_to_coverage_map = {i: [] for i in range(n_main)}
 
     # Update pca.json with main silhouettes and selections
     pca_updates = {
@@ -988,7 +1010,7 @@ def step_clustering_gmm(embedding_dir: str, pca_path: str, force: bool = False, 
             "H_nats": H,
             "silhouette_scores": silhouette_scores,
             "selected_n_clusters": int(1 if n_main == 1 else n_main),
-            "coverage_clusters_per_main": {str(k): v for k, v in main_to_coverage_map.items()},
+            "coverage_clusters_per_main": {str(k): v for k, v in sorted(main_to_coverage_map.items())},
         },
         "coverage_clustering": {
             "selected_n_clusters": int(n_clusters_cov),

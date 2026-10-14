@@ -453,13 +453,24 @@ def get_md_info(glycan: str) -> tuple:
     try:
         df = get_md_info._inventory_df
 
-        # Use positional column access similar to the original implementation
-        cols = list(df.columns)
-        if len(cols) < 11:
-            logger.error("Inventory CSV does not have the expected number of columns")
+        # Columns by their header (the e-mail column is no longer in the
+        # published inventory, so positions are not those of older files)
+        required = (
+            "ID",
+            "Full GLYCAM name of glycan being submitted.",
+            "What is the aggregated length of the simulations?",
+            "What MD package was used for the simulations?",
+            "What force field was used for the simulations?",
+            "What temperature target was used for the simulations? ",
+            "What pressure target was used for the simulations?",
+            "What NaCl concentration was used for the simulations?",
+        )
+        missing = [name for name in required if name not in df.columns]
+        if missing:
+            logger.error(f"Inventory CSV lacks the columns {missing}")
             return 0, 0, 0, 0, 0, 0, 0, "0"
 
-        glycan_col = cols[3]
+        glycan_col = required[1]
         glycan_data = df.filter(pl.col(glycan_col) == glycan)
 
         if glycan_data.height == 0:
@@ -469,7 +480,7 @@ def get_md_info(glycan: str) -> tuple:
         # Get first matching row values
         def _get_val(df_row, col_name):
             try:
-                val = df_row[0][col_name]
+                val = df_row.get_column(col_name)[0]
             except Exception:
                 val = None
             # Convert Polars nulls and NaNs to None
@@ -484,14 +495,14 @@ def get_md_info(glycan: str) -> tuple:
 
         row0 = glycan_data.head(1)
 
-        ID = _get_val(row0, cols[0])
-        length = _get_val(row0, cols[5])
-        package = _get_val(row0, cols[6])
-        FF = _get_val(row0, cols[7])
-        temp = _get_val(row0, cols[8])
-        pressure = _get_val(row0, cols[9])
-        salt = _get_val(row0, cols[10])
-        contributor = _get_val(row0, cols[2])
+        ID = _get_val(row0, required[0])
+        length = _get_val(row0, required[2])
+        package = _get_val(row0, required[3])
+        FF = _get_val(row0, required[4])
+        temp = _get_val(row0, required[5])
+        pressure = _get_val(row0, required[6])
+        salt = _get_val(row0, required[7])
+        contributor = _get_val(row0, "Email address") if "Email address" in df.columns else None
 
         # Normalize to expected return types (strings or None)
         ID = None if ID is None else str(ID)

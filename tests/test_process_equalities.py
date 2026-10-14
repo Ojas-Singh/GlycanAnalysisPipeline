@@ -134,18 +134,21 @@ def test_compact_rewrite_script_accepts_its_default_chunk(tmp_path, monkeypatch,
 # ---------------------------------------------------------------------------
 # k-center
 # ---------------------------------------------------------------------------
-def reference_kcenter(data, max_clusters, seed=42):
-    """lib.embedding.kcenter_coverage_clustering before the speed-up, loop for loop."""
+def reference_kcenter(data, max_clusters):
+    """lib.embedding.kcenter_coverage_clustering before the speed-up, loop for loop.
+
+    The first center is the point nearest the centroid of the standardised data, and when every point
+    coincides with a center the next one is the first point that is not a center (both were random draws
+    from a seeded generator before)."""
     from sklearn.preprocessing import StandardScaler
 
-    np.random.seed(seed)
     n_samples, _ = data.shape
     if n_samples <= max_clusters:
         return np.arange(n_samples), n_samples
     data_scaled = StandardScaler().fit_transform(data)
     centers = []
     center_indices = []
-    first_idx = np.random.randint(0, n_samples)
+    first_idx = int(np.argmin(np.linalg.norm(data_scaled - data_scaled.mean(axis=0), axis=1)))
     centers.append(data_scaled[first_idx])
     center_indices.append(first_idx)
     for k in range(1, max_clusters):
@@ -158,7 +161,7 @@ def reference_kcenter(data, max_clusters, seed=42):
             remaining = [i for i in range(n_samples) if i not in center_indices]
             if not remaining:
                 break
-            farthest_idx = int(np.random.choice(remaining))
+            farthest_idx = remaining[0]
         centers.append(data_scaled[farthest_idx])
         center_indices.append(farthest_idx)
     labels = np.zeros(n_samples, dtype=int)
@@ -186,12 +189,13 @@ def kcenter_cases():
 @pytest.mark.parametrize("name,data,max_clusters", kcenter_cases(), ids=[case[0] for case in kcenter_cases()])
 def test_kcenter_gives_the_labels_of_the_former_loops(name, data, max_clusters):
     expected_labels, expected_count = reference_kcenter(data, max_clusters)
-    state_after_reference = np.random.get_state()[1].copy()
+    np.random.seed(7)
+    state_before = np.random.get_state()[1].copy()
     labels, count = embedding.kcenter_coverage_clustering(data, max_clusters=max_clusters)
     assert count == expected_count
     assert labels.dtype == expected_labels.dtype and np.array_equal(labels, expected_labels)
-    # the global generator is left where the former code left it
-    assert np.array_equal(np.random.get_state()[1], state_after_reference)
+    # the global generator is neither seeded nor drawn from
+    assert np.array_equal(np.random.get_state()[1], state_before)
 
 
 def test_nearest_center_labels_decide_ties_like_the_scalar_loop():
@@ -350,7 +354,7 @@ def reference_pca(landscape, per_pair_scale=False):
     feature_stds = np.nan_to_num(feature_stds, nan=1.0, posinf=1.0, neginf=1.0)
     feature_stds[feature_stds == 0] = 1.0
     X_proc /= feature_stds
-    pca = PCA(n_components=min(10, n_frames, n_pairs), svd_solver="auto")
+    pca = PCA(n_components=min(10, n_frames, n_pairs), svd_solver="auto", random_state=0)
     scores = pca.fit_transform(X_proc)
     return pca, scores, feature_means, feature_stds, pair_stds
 
@@ -363,14 +367,14 @@ def test_pca_fit_in_place_equals_the_former_fit(tmp_path, monkeypatch, frames, a
     data_dir = stored_chain(tmp_path, frames=frames, atoms=atoms)
     landscape, chosen = get_conformation_landscape(data_dir, method="noH_noROH_fast", sample_size=300, seed=0,
                                                    return_atom_indices=True)
-    np.random.seed(123)                     # the randomized solver draws from the global generator
+    np.random.seed(123)                     # the fit does not depend on the global generator
     pca, scores, means, stds, pair_stds = reference_pca(landscape, per_pair_scale)
     assert pca._fit_svd_solver == solver
 
     monkeypatch.setattr(config, "max_workers", 3)
     monkeypatch.setattr(v2, "_column_blocks", lambda r, c, _original=v2._column_blocks: _original(r, c, 8 * r * 7))
     wide = get_conformation_landscape(data_dir, method="noH_noROH_fast", sample_size=300, seed=0, dtype=np.float64)
-    np.random.seed(123)
+    np.random.seed(456)
     frame, evr, cumulative = v2._fit_pca_and_write_landscape(
         data_dir, str(tmp_path / "embedding"), wide, chosen, per_pair_scale=per_pair_scale, overwrite_landscape=True)
 
@@ -389,7 +393,7 @@ def test_pca_fit_in_place_equals_the_former_fit(tmp_path, monkeypatch, frames, a
 
     # a float32 landscape that the caller keeps is not modified
     kept = landscape.copy()
-    np.random.seed(123)
+    np.random.seed(789)
     again, _, _ = v2._fit_pca_and_write_landscape(data_dir, str(tmp_path / "again"), landscape, chosen,
                                                   per_pair_scale=per_pair_scale)
     assert same_bits(landscape, kept) and again.equals(frame)

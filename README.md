@@ -139,8 +139,8 @@ coverage set (5 to 128 structures, from the conformational entropy). Level 3,
 the k-center set of up to 512 structures, is no longer published and is off by
 default: with levels `1,2` nothing of it is computed, written, required or
 exported, in the process stage and in the static stage. Levels 1 and 2 do not
-depend on it (each k-center run seeds the generator itself), so they are the
-same with and without it.
+depend on it (the k-center clustering draws nothing from a random generator),
+so they are the same with and without it.
 
 - `--levels 1,2,3` (or `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3`) restores Level 3
   everywhere: clustering, `output/level_3/`, `torsion_level_3_reps`, the
@@ -161,6 +161,14 @@ same with and without it.
 - A published `static/` database that has Level 3 is turned into the one
   without it, with no `process/` data and no recomputation, by
   [`scripts/static_drop_levels.py`](#static-database-without-level-3-scriptsstatic_drop_levelspy).
+
+The analysis of a trajectory is reproducible: the PCA is seeded (scikit-learn
+takes its randomized SVD for most glycans), the GMM is seeded, and the
+k-center clustering of Level 2 (and 3) starts from the frame nearest the
+centroid of the standardised PCA coordinates and draws nothing at random.
+`coverage_clusters_per_main` (in `pca.json`, `info.json` and `data.json`)
+lists, for every Level 1 cluster, the Level 2 clusters whose frames lie mostly
+in it, both by the numbers they are published under (`Cluster 0` the largest).
 
 Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
 
@@ -233,6 +241,29 @@ When every folder is there the root files are written in the order of the finali
 - **The source is checked on the way.** Every file that is taken from it, kept or read to be rewritten, is compared with the SHA-256 that the `sync_manifest.json` of the source records, and the new `GLYCOSHAPE.json` with the one of the source (equal but for `cluster_levels.level_3`). A difference is a warning in the output and in the report: the source is then not the database its manifest describes (an incomplete copy, a file changed afterwards).
 
 A database of the size of the published one (1,001 glycans, 29 GB without the Level 3 structures, of which 13 GB `torsion_all.csv` and 4.5 GB `info.json`) took one minute with 8 workers and 2 GB of memory, half of it for the glycan folders and half for the archives and the manifest; eight glycans of the largest size in work together took 5 GB. `--skip-finalize` stops after the glycan folders.
+
+### Torsion angles
+
+The torsions of an entry are in `output/torsion_all.csv` (every frame),
+`torsion_glycosidic.csv` and `torsion_level_*_reps.csv`, in degrees from -180
+to 180; `info.json` describes every column (`torsions.metadata`: the four
+atoms, their residues, the family and subtype) and states the definitions
+below (`torsions.conventions`). A glycosidic torsion is named
+`<donor residue>_<acceptor residue>_<phi|psi|omega>`.
+
+| Torsion | Atoms |
+|---|---|
+| φ | ring oxygen, anomeric carbon, glycosidic oxygen, acceptor carbon: O5–C1–O–Cx (pyranose donor), O4–C1–O–Cx (aldofuranose), O5–C2–O–Cx (ketofuranose), O6–C2–O–Cx (sialic acid) |
+| ψ | C1–O–Cx–A (C2–O–Cx–A for C2 donors): A is the ring oxygen when Cx is an anomeric carbon, otherwise C(x−1) or C(x+1), whichever the bond table lists first, so check the atoms in the metadata before comparing the ψ of two linkages |
+| ω | **C4–C5–C6–O6** of the acceptor of a 1–6 linkage (C6–C7–C8–O8 of a sialic acid in a 2–8 linkage) |
+
+The stored ω is not the O5–C5–C6–O6 of the IUPAC recommendation. In a
+D-hexopyranose C4 lies about 120° from O5 about the C5–C6 bond, so the stored
+value is the IUPAC ω plus about 120°: the rotamers gg, gt and tg (−60°, +60°
+and 180° with O5–C5–C6–O6) are near **+60°, 180° and −60°** on the stored
+scale. The values are kept on this scale because the website and other tools
+read them. A free C6 hydroxyl (no glycosidic linkage) is a residue-local
+torsion, stored as O5–C5–C6–O6.
 
 ## Staged Oracle/Slurm workflow
 
