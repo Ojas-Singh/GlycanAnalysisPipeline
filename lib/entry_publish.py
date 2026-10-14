@@ -255,6 +255,20 @@ class Target:
     def record_key(self, glycan_id: str) -> str:
         return f"{self.state_prefix}/{self.static_prefix}/entries/{glycan_id}.json"
 
+    def history_key(self, glycan_id: str, global_hash: str, action: str) -> str:
+        """One version of an entry: ``<state>/<static>/history/GSxxxxx/<global hash>-<action>.json``.
+
+        Written with the record of the entry when a publication switches
+        (publish, replace, withdraw, the operations of ``lib.entry_ops`` and
+        the bulk publication), and never overwritten by a later one: the
+        list of these keys is the history of the entry, and each document
+        says when (``published_at``) and from what.  The key is named by the
+        ``global_hash`` of the database the publication made, which follows
+        from what is published and not from the clock, so a run that
+        completes an interrupted one, or repeats it, writes the same key.
+        """
+        return f"{self.state_prefix}/{self.static_prefix}/history/{glycan_id}/{global_hash[:16]}-{action}.json"
+
     def replicas_key(self, glycan_id: str) -> str:
         """The administrators' copy of the replica diagnostics of a glycan (``lib/replicas.py``)."""
         return replicas.admin_key(self.state_prefix, self.static_prefix, glycan_id)
@@ -629,6 +643,9 @@ def roll_forward(target: Target, store: Store, pending: Dict[str, Any], log: Log
                 "withdrawn": dict(sorted(withdrawn.items()))}))
         if pending.get("record") is not None:
             store.write(target.record_key(pending["glycoshape_id"]), _json(pending["record"]))
+        history = pending.get("history")
+        if history is not None and store.read_optional(history["key"]) != _json(history["document"]):
+            store.write(history["key"], _json(history["document"]))
         checkpoint("recorded")
         # The staged objects go before the document that names them, so none is left without a trace.
         staged = {target.staged(item["sha256"]) for item in pending["switch"] + [pending["manifest"]]}
@@ -1416,10 +1433,16 @@ def publish_entry(
                 publish_raw(target, raw_store, raw_plan, log, checkpoint)
                 journal.step("raw", relation=raw_plan["relation"], bytes=raw_plan["upload_bytes"])
                 record = _entry_record(action, glycan_id, name, owner, database.global_hash, derived["global_hash"], entry, report)
+                stored_entry = database.manifest["glycans"].get(glycan_id) or {}
+                history = {"key": target.history_key(glycan_id, derived["global_hash"], action),
+                           "document": {**record, "kind": "version", "folder_hash_before": stored_entry.get("hash"),
+                                        "raw_manifest_sha256": raw_plan["files"][-1][3]}}
                 done = publish_static(
                     target, static_store, static_plan,
-                    {"glycam_name": name, "record": record, "withdrawn": {} if tombstone is not None else None},
+                    {"glycam_name": name, "record": record, "history": history,
+                     "withdrawn": {} if tombstone is not None else None},
                     owner, lock, lock_ttl, log, checkpoint)
+                report["history"] = {"key": history["key"]}
                 journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
                 report["switch"] = done
                 _remember(cache_dir, derived_dir, derived)
@@ -1624,12 +1647,16 @@ def withdraw_entry(
                 "owner": owner, "reason": reason, "global_hash_before": database.global_hash,
                 "global_hash": derived["global_hash"],
             }
+            history = {"key": target.history_key(glycan_id, derived["global_hash"], WITHDRAW),
+                       "document": {**record, "kind": "version",
+                                    "folder_hash_before": (database.manifest["glycans"].get(glycan_id) or {}).get("hash")}}
             done = publish_static(
                 target, store, plan,
-                {"glycam_name": name, "record": record, "delete_prefix": target.key(f"{glycan_id}/"),
+                {"glycam_name": name, "record": record, "history": history, "delete_prefix": target.key(f"{glycan_id}/"),
                  "withdrawn": {"glycam_name": name, "withdrawn_at": record["withdrawn_at"], "reason": reason,
                                "global_hash_before": database.global_hash}},
                 owner, lock, lock_ttl, log, checkpoint)
+            report["history"] = {"key": history["key"]}
             journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)
             report["switch"] = done
             _remember(cache_dir, derived_dir, derived)

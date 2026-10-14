@@ -59,8 +59,9 @@ def test_publish_replace_and_withdraw_on_a_real_server(published, bundle_dir, tm
     assert reader.try_sync() is None and reader.glycans() == sorted(PUBLISHED + (GS,))
     assert reader.fresh(tmp_path / "behind").try_sync() is None
     assert static_publish.check_published(backend, "static", log=quiet)["ok"]
-    assert [item["key"] for item in backend.list_objects("publish-")] == [
+    assert [item["key"] for item in backend.list_objects("publish-") if "/history/" not in item["key"]] == [
         f"{STATE}/entries/{GS}.json", f"{STATE}/replicas/{GS}.json"]
+    assert len([item for item in backend.list_objects(f"{STATE}/history/{GS}/")]) == 1
     assert entry_publish.publish_entry("publish", bundle_dir, record, target, work_dir=tmp_path / "work", log=quiet)["status"] == "already-published"
     # what the server makes of a conditional write is found out, not assumed
     honoured = entry_publish.conditional_writes(target, entry_publish.Store(backend, entry_publish.new_stats()))
@@ -102,7 +103,8 @@ def test_an_interrupted_switch_on_a_real_server_is_completed_by_recover(publishe
     assert reader.try_sync() is None and reader.glycans() == sorted(PUBLISHED + (GS,))
     assert reader.fresh(tmp_path / "behind").try_sync() is None
     assert static_publish.check_published(backend, "static", log=quiet)["ok"]
-    assert [item["key"] for item in backend.list_objects("publish-")] == [f"{STATE}/entries/{GS}.json"]
+    assert [item["key"] for item in backend.list_objects("publish-") if "/history/" not in item["key"]] == [
+        f"{STATE}/entries/{GS}.json"]
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +295,7 @@ def test_two_processes_publishing_at_once_do_not_lose_an_entry(published, bundle
     assert reader.try_sync() is None and reader.glycans() == sorted(PUBLISHED + (GS, SECOND_GS))
     assert reader.fresh(tmp_path / "behind").try_sync() is None
     assert static_publish.check_published(backend, "static", log=quiet)["ok"]
-    assert sorted(item["key"] for item in backend.list_objects("publish-")) == [
+    assert sorted(item["key"] for item in backend.list_objects("publish-") if "/history/" not in item["key"]) == [
         f"{STATE}/entries/{GS}.json", f"{STATE}/entries/{SECOND_GS}.json",
         f"{STATE}/replicas/{GS}.json", f"{STATE}/replicas/{SECOND_GS}.json"]
     tool.assert_no_credential_anywhere(tmp_path / "work-first", tmp_path / "work-second")

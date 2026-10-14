@@ -45,6 +45,15 @@ def record(glycan_id=GS, name=GLYCAM_NAME, **fields):
     return submission_record(glycan_id, name, **fields)
 
 
+def without_history(keys):
+    """State keys other than the versions of the entries (``history/``), which every publication adds."""
+    return [key for key in keys if "/history/" not in key]
+
+
+def history_of(world, glycan_id=GS, prefix=STATE):
+    return world.keys(f"{prefix}/history/{glycan_id}/")
+
+
 @pytest.fixture(scope="module")
 def prepared(tmp_path_factory):
     """The objects of a published database and archive, built once; every test gets its own copy."""
@@ -188,9 +197,15 @@ def test_publishing_adds_one_glycan_and_touches_no_other(world, bundle_dir, synt
     assert archive_transfer.compare_with_index(world.backend, "raw", index)["ok"]
     assert world.keys("raw-history/") == []
 
-    # nothing is left of the run but the record of the entry and the administrators' copy of its replica diagnostics
-    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [
+    # nothing is left of the run but the record of the entry, its first version and the administrators' copy of
+    # its replica diagnostics
+    assert world.keys("publish-staging/") == [] and without_history(world.keys(STATE)) == [
         f"{STATE}/entries/{GS}.json", f"{STATE}/replicas/{GS}.json"]
+    versions = history_of(world)
+    assert len(versions) == 1 and versions[0].endswith("-publish.json")
+    version = json.loads(world.backend.read_binary(versions[0]))
+    assert version["kind"] == "version" and version["entry"]["hash"] == approved and version["folder_hash_before"] is None
+    assert version["raw_manifest_sha256"] == hashlib.sha256((bundle_dir / "archive" / "manifest.json").read_bytes()).hexdigest()
     kept = json.loads(world.backend.read_binary(f"{STATE}/entries/{GS}.json"))
     assert kept["status"] == "published" and kept["glycam_name"] == name and kept["entry"]["hash"] == approved
     assert kept["global_hash"] == new["global_hash"] and kept["global_hash_before"] == old["global_hash"]
@@ -652,7 +667,7 @@ def test_a_copy_that_fails_stops_the_switch_and_leaves_it_to_be_completed(slow_w
         assert done["switched"] == len(switched) - len(ended) and done["manifest_written"]
     assert sorted(world.client.switched("ended")) == sorted({key for key, _, new in switched if not new} | {manifest})
     assert world.client.switched("ended")[-1] == manifest
-    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [
+    assert world.keys("publish-staging/") == [] and without_history(world.keys(STATE)) == [
         f"{STATE}/entries/{GS}.json", f"{STATE}/replicas/{GS}.json"]
     if failing == "static/GlycoShape.zip":                  # the same command keeps the diagnostics of the new bundle
         assert world.backend.read_binary(f"{STATE}/replicas/{GS}.json") == (
@@ -1229,7 +1244,7 @@ def test_a_trial_under_other_prefixes_of_the_same_bucket_shares_no_key_with_the_
     assert {key: content for key, content in stored_tree(world.backend, "").items() if not key.startswith("trial/")
             and not any(key.startswith(place) for place in places(trial))} == real_before
     assert world.keys("raw-history/") == replaced["raw"]["history"]
-    assert world.keys("publish-state/") == [
+    assert without_history(world.keys("publish-state/")) == [
         f"{STATE}/lock.json", "publish-state/trial/static/entries/GS00002.json",
         f"publish-state/trial/static/entries/{GS}.json", f"publish-state/trial/static/replicas/{GS}.json",
         "publish-state/trial/static/withdrawn.json"]
@@ -1265,7 +1280,7 @@ def test_the_replica_diagnostics_are_kept_for_the_administrators_outside_the_pub
     report = world.publish(bundle_dir)
     assert report["status"] == "published" and report["replicas"]["written"] is True
     assert world.backend.read_binary(key) == diagnostics
-    assert world.keys(STATE) == [f"{STATE}/entries/{GS}.json", key]
+    assert without_history(world.keys(STATE)) == [f"{STATE}/entries/{GS}.json", key]
     assert world.reader.try_sync() is None and (world.reader.folder / GS / "data.json").is_file()
     assert not (world.reader.folder / GS / "output" / "replicas.json").exists()
     assert "output/replicas.json" not in stored_manifest(world.backend)["glycans"][GS]["files"]
