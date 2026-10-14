@@ -646,3 +646,177 @@ def test_check_of_an_extension_notices_frames_that_were_changed(tmp_path, stored
     compared = segs.compare_trajectories(entry, other)
     assert compared == {"equal": False, "frames_compared": 0, "first_difference": "coordinates of frame 17"}
     assert segs.check_extension(old, old)["errors"] == ["the manifest has no extends record"]
+
+
+# ---------------------------------------------------------------------------
+# Merging two stored entries of one glycan
+# ---------------------------------------------------------------------------
+KEPT = "LFucpa1-3[DGalpb1-4]DGlcpNAcb1-OH"            # the same glycan, its branches written in two orders
+ABSORBED = "DGalpb1-4[LFucpa1-3]DGlcpNAcb1-OH"
+
+
+def stored_entry(root, name, coords, **options):
+    """An entry converted from one simulation.pdb, as most stored entries are."""
+    source = make_source(Path(root) / "data", name, coords, info_json=name, **options)
+    (source / "structure.mol2").write_text(mol2_text(list(range(1, coords.shape[1] + 1))))
+    return Path(archive.convert_entry(source, Path(root) / "stored")["entry"])
+
+
+def runs_by_model_numbers(runs):
+    """MODEL numbers that restart for every run of ``runs`` frames: the runs are recorded."""
+    return lambda index: "MODEL     %d" % (index % runs + 1)
+
+
+@pytest.mark.parametrize("atoms", [ATOMS, 6])                   # compressed frames, and the plain ones of <= 9 atoms
+def test_merged_entry_holds_the_frames_of_both_entries(tmp_path, atoms):
+    kept_coords, absorbed_coords = random_coords(30, atoms, seed=40), random_coords(25, atoms, seed=41)
+    kept = stored_entry(tmp_path / "kept", KEPT, kept_coords, header=CELLS[2])
+    sources = run_of(tmp_path / "run", absorbed_coords, [0, 10, 25])
+    sources = [segs.SegmentSource(s.name, s.pdb, s.mol2, 50.0) for s in sources]
+    absorbed = Path(segs.convert_segments(sources, tmp_path / "absorbed", ABSORBED)["entry"])
+    before = {"kept": files_of(kept), "absorbed": files_of(absorbed)}
+
+    result = segs.merge_entries(kept, absorbed, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453")
+    entry, manifest = Path(result["entry"]), result["manifest"]
+    assert result["status"] == "merged" and entry.name == KEPT and manifest == archive.load_manifest(entry)
+    assert {"kept": files_of(kept), "absorbed": files_of(absorbed)} == before        # both are only read
+
+    # the frames of the kept entry as the bytes they were, then those of the absorbed one
+    kept_xtc, absorbed_xtc = before["kept"]["trajectory.xtc"], before["absorbed"]["trajectory.xtc"]
+    trajectory = (entry / "trajectory.xtc").read_bytes()
+    assert trajectory[:len(kept_xtc)] == kept_xtc and len(trajectory) == len(kept_xtc) + len(absorbed_xtc)
+    frames = archive.ArchiveEntry(entry).read_frames(unit="milliangstrom")
+    assert np.array_equal(frames, np.concatenate([kept_coords, absorbed_coords]))
+    back = archive._read_back(entry, atoms)
+    assert back["frames"] == 55 and back["index_ok"]                       # steps and times 0..54
+    assert np.array_equal(back["boxes"][30:], archive._read_back(absorbed, atoms)["boxes"])
+    # only step and time of the absorbed frames changed: numbered from 0 again they are its trajectory
+    (tmp_path / "tail.xtc").write_bytes(trajectory[len(kept_xtc):])
+    with open(tmp_path / "again.xtc", "wb") as handle:
+        again = segs.renumber_xtc(tmp_path / "tail.xtc", handle, 0, atoms)
+    assert (tmp_path / "again.xtc").read_bytes() == absorbed_xtc and again["frames"] == 25
+    assert again["sha256_written"] == hashlib.sha256(absorbed_xtc).hexdigest()
+
+    # the files of the kept entry
+    for name in ("topology.pdb", "structure.mol2", "info.json"):
+        assert (entry / name).read_bytes() == before["kept"][name]
+    assert json.loads((entry / "name.json").read_text()) == {"indexOrderedSequence": KEPT}
+    assert manifest["glycam_name"] == KEPT and manifest["source"]["folder"] == KEPT
+    assert manifest["source"]["segments"] == 3 and manifest["warnings"] == []
+
+    # the segments: the kept entry, then those of the absorbed one under its ID
+    kept_sha256 = hashlib.sha256(before["kept"]["manifest.json"]).hexdigest()
+    absorbed_sha256 = hashlib.sha256(before["absorbed"]["manifest.json"]).hexdigest()
+    first, second, third = manifest["segments"]
+    assert [(s["index"], s["name"], s["first_frame"], s["frames"]) for s in manifest["segments"]] == [
+        (0, KEPT, 0, 30), (1, "GS00453/replica_1", 30, 10), (2, "GS00453/replica_2", 40, 15)]
+    assert first["carried_from"] == {"glycam_name": KEPT, "manifest_sha256": kept_sha256, "segment": None}
+    assert "merged_from" not in first and first["trajectory_offset"] == 0
+    absorbed_segments = archive.load_manifest(absorbed)["segments"]
+    for index, (segment, old) in enumerate(zip((second, third), absorbed_segments)):
+        assert segment["carried_from"] == {"glycam_name": ABSORBED, "manifest_sha256": absorbed_sha256, "segment": index}
+        assert segment["merged_from"] == {"glycoshape_id": "GS00453", "glycam_name": ABSORBED,
+                                          "manifest_sha256": absorbed_sha256}
+        assert segment["trajectory_offset"] == len(kept_xtc) + old["trajectory_offset"]
+        assert (segment["coordinates_sha256"], segment["source"], segment["time_per_frame_ps"]) == (
+            old["coordinates_sha256"], old["source"], 50.0)
+    assert manifest["extends"]["manifest_sha256"] == kept_sha256 and manifest["extends"]["frames"] == 30
+    merged_from = manifest["merged_from"]
+    assert (merged_from["glycoshape_id"], merged_from["kept_glycoshape_id"], merged_from["glycam_name"]) == (
+        "GS00453", "GS00303", ABSORBED)
+    assert (merged_from["manifest_sha256"], merged_from["frames"], merged_from["first_frame"]) == (absorbed_sha256, 25, 30)
+    assert merged_from["atom_records"] == "identical"
+    assert manifest["box"]["kind"] == "varying" and [c["first_frame"] for c in manifest["box"]["cells"]] == [0, 30, 40]
+    verification = manifest["verification"]
+    assert (verification["frames_carried_over"], verification["frames_merged"], verification["segments_checked"]) == (30, 25, 3)
+    assert verification["merged"]["trajectory_sha256"] == hashlib.sha256(absorbed_xtc).hexdigest()
+
+    # every reader reads it; it extends the kept entry
+    report = archive.verify_entry(entry)
+    assert report["ok"] and report["segments_checked"] == 3 and report["frames"] == 55
+    assert segs.check_extension(entry, kept)["ok"]
+    assert segs.compare_trajectories(entry, kept) == {"equal": True, "frames_compared": 30, "first_difference": None}
+    index, problems = archive.build_index(tmp_path / "merged")
+    assert problems == [] and index["records"][0]["frames"] == 55
+    from lib import replicas
+
+    runs = replicas.replica_boundaries(manifest).replicas
+    assert [run.name for run in runs][1:] == ["GS00453/replica_1", "GS00453/replica_2"]
+
+    # once more: the merge of these two entries is there
+    assert segs.merge_entries(kept, absorbed, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453")["status"] == "skipped"
+    assert segs.merge_entries(kept, absorbed, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453",
+                              force=True)["status"] == "merged"
+
+
+def test_an_absorbed_entry_of_one_simulation_pdb_is_one_segment_named_by_its_id(tmp_path):
+    kept = stored_entry(tmp_path / "kept", KEPT, random_coords(20, ATOMS, seed=42), header=CELLS[2],
+                        model=runs_by_model_numbers(10))
+    absorbed = stored_entry(tmp_path / "absorbed", ABSORBED, random_coords(20, ATOMS, seed=43), header=CELLS[2],
+                            model=runs_by_model_numbers(10))
+    manifest = segs.merge_entries(kept, absorbed, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453",
+                                  kept_time_per_frame_ps=50.0)["manifest"]
+    assert [(s["name"], s["first_frame"], s["frames"], s["time_per_frame_ps"]) for s in manifest["segments"]] == [
+        (KEPT, 0, 20, 50.0), ("GS00453", 20, 20, None)]
+    assert manifest["segments"][1]["carried_from"]["segment"] is None
+    assert manifest["box"]["kind"] == "constant"
+    # the runs of each part as its source recorded them; those of the absorbed entry under its ID
+    from lib import replicas
+
+    runs = replicas.replica_boundaries(manifest).replicas
+    assert [(run.name, run.first_frame, run.frames) for run in runs] == [
+        ("stored_run_1", 0, 10), ("stored_run_2", 10, 10), ("GS00453/run_1", 20, 10), ("GS00453/run_2", 30, 10)]
+    assert archive.verify_entry(Path(tmp_path / "merged" / KEPT))["ok"]
+    # without IDs the absorbed entry is named by its GLYCAM name
+    manifest = segs.merge_entries(kept, absorbed, tmp_path / "merged-2")["manifest"]
+    assert manifest["segments"][1]["name"] == ABSORBED and manifest["merged_from"]["glycoshape_id"] is None
+
+
+def test_a_merge_is_refused_when_the_atoms_or_bonds_differ_and_says_what_differs(tmp_path):
+    kept = stored_entry(tmp_path / "kept", KEPT, random_coords(12, ATOMS, seed=44))
+    coords = random_coords(8, ATOMS, seed=45)
+    swapped = stored_entry(tmp_path / "swapped", ABSORBED, coords, atoms=changed_atoms("other order"))
+    before = files_of(kept)
+    with pytest.raises(segs.SegmentMismatchError) as refused:
+        segs.merge_entries(kept, swapped, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453")
+    assert str(refused.value) == (
+        "topology.pdb of GS00453 does not have the atoms of topology.pdb of GS00303: 2 of 14 atoms differ in name, "
+        "residue or order; the first is atom 4: name 'O5' residue 'ROH' 1 in topology.pdb of GS00453 against name "
+        "'C4' residue 'ROH' 1 in topology.pdb of GS00303")
+    fewer = stored_entry(tmp_path / "fewer", ABSORBED, coords[:, :12])
+    with pytest.raises(segs.SegmentMismatchError, match="topology.pdb of GS00453 has 12 atoms, topology.pdb of GS00303 has 14"):
+        segs.merge_entries(kept, fewer, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453")
+
+    # other bonds in structure.mol2 are refused; other atom types are a warning
+    other = tmp_path / "other" / ABSORBED
+    shutil.copytree(stored_entry(tmp_path / "bonds", ABSORBED, coords), other)
+    mol2 = (other / "structure.mol2").read_text()
+
+    def with_mol2(text):
+        (other / "structure.mol2").write_text(text)
+        manifest = archive.load_manifest(other)
+        manifest["files"]["structure.mol2"] = {"size": len(text.encode()), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+        (other / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    with_mol2(mol2.replace("13 13 14 1\n", ""))
+    with pytest.raises(segs.SegmentMismatchError, match=r"structure.mol2 of GS00453 does not have the bonds of "
+                                                        r"structure.mol2 of GS00303: 0 bonds only in .*, 1 only in .* "
+                                                        r"\(for example atoms 13-14\)"):
+        segs.merge_entries(kept, other, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453")
+    with_mol2(mol2.replace(" C.3 1 RES", " C.ar 1 RES", 1))
+    manifest = segs.merge_entries(kept, other, tmp_path / "merged", kept_id="GS00303", absorbed_id="GS00453")["manifest"]
+    assert manifest["warnings"] == ["structure.mol2 of GS00453 and structure.mol2 of GS00303: 1 atoms differ in type "
+                                    "or substructure"]
+    shutil.rmtree(tmp_path / "merged")
+
+    # an entry with itself, an entry of the same name, an archive inside an entry, an entry that does not verify
+    with pytest.raises(archive.SourceError, match="both entries are named"):
+        segs.merge_entries(kept, kept, tmp_path / "merged")
+    with pytest.raises(archive.SourceError, match="the archive directory must be outside"):
+        segs.merge_entries(kept, other, kept / "inside")
+    with pytest.raises(archive.SourceError, match="the kept entry is the entry that would be written"):
+        segs.merge_entries(kept, other, kept.parent)
+    (other / "trajectory.xtc").write_bytes((other / "trajectory.xtc").read_bytes()[:-4])
+    with pytest.raises(archive.VerificationError, match="the absorbed entry does not verify"):
+        segs.merge_entries(kept, other, tmp_path / "merged")
+    assert files_of(kept) == before and not (tmp_path / "merged").exists()

@@ -19,6 +19,15 @@ last), with a record of the version kept in the storage:
     The analysis of the stored raw entry again, with this code: optionally
     without some replicas, and with the anomer that was simulated declared.
 
+``merge`` (:func:`merge`)
+    One GlycoShape ID per simulated glycan: a glycan published under two
+    IDs (two simulations, two GLYCAM names that differ in the order the
+    branches are written in) keeps one.  The raw entry of the kept ID gets
+    the frames of the other (``lib.archive_segments.merge_entries``), the
+    union is analysed and published as a new version of the kept ID, and
+    in the same command the absorbed ID is withdrawn (its tombstone says
+    ``merged_into``) and its raw entry moves to the history.
+
 Renames
 -------
 The raw archive is keyed by the GLYCAM name, and so is everything that looks
@@ -75,7 +84,15 @@ CHANGES_SCHEMA_VERSION = 1
 REPORT_SCHEMA = "glycoshape-entry-operation"
 REPORT_SCHEMA_VERSION = 1
 RENAME_SCHEMA = "glycoshape-raw-rename"
-UPDATE_METADATA, REANALYSE = "update-metadata", "reanalyse"
+MERGE_SCHEMA = "glycoshape-raw-merge"
+UPDATE_METADATA, REANALYSE, MERGE = "update-metadata", "reanalyse", "merge"
+#: The simulation conditions two entries have to share to be merged: key of ``archetype`` (``time_per_frame``:
+#: its length over the frames of its raw entry), unit, what it is.  ``--accept-difference <key>`` accepts one.
+MERGE_FIELDS = (
+    ("package", "", "MD package"), ("forcefield", "", "force field"), ("water", "", "water model"),
+    ("temperature", "K", "temperature"), ("pressure", "bar", "pressure"), ("salt", "mM", "salt concentration"),
+    ("time_per_frame", "ps", "time per frame"),
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 Log = Callable[[str], None]
@@ -698,12 +715,13 @@ def write_renamed_entry(entry_dir: Path, dest_root: Path, new_name: str, renamed
     return final
 
 
-def index_with(stored: Optional[Dict[str, Any]], remove: Iterable[str], record: Dict[str, Any]) -> Dict[str, Any]:
-    """``raw/index.json`` without the records of ``remove`` and with ``record`` (inserted or replaced)."""
-    removed = set(remove) | {record["glycam_name"]}
+def index_with(stored: Optional[Dict[str, Any]], remove: Iterable[str],
+               record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``raw/index.json`` without the records of ``remove`` and with ``record`` (inserted or replaced; None: none)."""
+    removed = set(remove) | ({record["glycam_name"]} if record is not None else set())
     base = stored or {"schema": archive.INDEX_SCHEMA, "schema_version": archive.SCHEMA_VERSION,
                       "converter_version": archive.CONVERTER_VERSION, "records": []}
-    records = [item for item in base["records"] if item["glycam_name"] not in removed] + [record]
+    records = [item for item in base["records"] if item["glycam_name"] not in removed] + ([record] if record else [])
     records.sort(key=lambda item: item["glycam_name"])
     index = dict(base)
     index.update(
@@ -1765,6 +1783,651 @@ def reanalyse(
                 {**entry, "glycam_name": new_name, "bundle": bundle.summary(),
                  "submission": submission.record()}, report, refused, raw, record_extra, owner, lock, lock_ttl,
                 dry_run, offline, cache_dir, bundle, log, checkpoint)
+    except Refused as exc:
+        if not report["refused"]:
+            entry_publish._refusal(report, exc.report.get("refused") if exc.report and exc.report.get("refused")
+                                   else [str(exc)])
+        if not dry_run:
+            exc.report = report
+            raise
+    return _finish(report, journal, started, dry_run, stats)
+
+
+# ---------------------------------------------------------------------------
+# merge
+# ---------------------------------------------------------------------------
+def same_glycan(kept: Published, absorbed: Published) -> List[str]:
+    """Why two published entries are not known to be the same glycan with the same reducing end; [] when they are.
+
+    The same glycan: the same archetype WURCS (and the same GlyTouCan
+    accession when both have one); the same anomer at the reducing end of
+    their names (two entries of the alpha and the beta anomer are two
+    entries by the rules of the database).
+    """
+    refused: List[str] = []
+    ids = f"{kept.glycan_id} and {absorbed.glycan_id}"
+    first, second = (entry.data.get("archetype") or {} for entry in (kept, absorbed))
+    if not first.get("wurcs") or not second.get("wurcs"):
+        missing = [entry.glycan_id for entry, row in ((kept, first), (absorbed, second)) if not row.get("wurcs")]
+        refused.append(f"{' and '.join(missing)} has no archetype WURCS: whether {ids} are the same glycan cannot "
+                       "be told")
+    elif first["wurcs"] != second["wurcs"]:
+        refused.append(f"{ids} are not the same glycan: their archetype WURCS differ")
+    if first.get("glytoucan") and second.get("glytoucan") and first["glytoucan"] != second["glytoucan"]:
+        refused.append(f"{ids} have other GlyTouCan accessions ({first['glytoucan']} and {second['glytoucan']})")
+    anomers = reducing_end_anomer(kept.published_name), reducing_end_anomer(absorbed.published_name)
+    if anomers[0] != anomers[1]:
+        refused.append(f"{ids} do not have the same reducing end: {anomers[0] or 'none'} and {anomers[1] or 'none'} "
+                       "anomer")
+    return refused
+
+
+def _condition(value: Any) -> Any:
+    """A simulation condition as it is compared: a number, a text without surrounding space, or None."""
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return value
+
+
+def _length_us(data: Dict[str, Any]) -> Optional[float]:
+    number = _number((data.get("archetype") or {}).get("length"))
+    return number if number else None
+
+
+def merge_differences(kept: Published, absorbed: Published, kept_frames: int, absorbed_frames: int
+                      ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The simulation conditions (:data:`MERGE_FIELDS`) in which two published entries differ; and what forbids a merge.
+
+    The values are those of ``archetype`` of their ``data.json``; the time
+    per frame is the published length over the frames of the raw entry.
+    Numbers are equal when they agree to 1e-9 (the time per frame to 1e-6,
+    relative), texts when they are the same after the surrounding space.
+    An entry without a published length cannot be merged: the length of
+    the union would not be known.
+    """
+    differences: List[Dict[str, Any]] = []
+    problems = [f"the simulation length of {entry.glycan_id} is not published: the length of the merged entry "
+                "cannot be known (update-metadata can set it)"
+                for entry in (kept, absorbed) if _length_us(entry.data) is None]
+    first, second = (entry.data.get("archetype") or {} for entry in (kept, absorbed))
+    for key, unit, what in MERGE_FIELDS:
+        if key == "time_per_frame":
+            if problems:
+                continue
+            a = round(_length_us(kept.data) * 1e6 / kept_frames, 6)
+            b = round(_length_us(absorbed.data) * 1e6 / absorbed_frames, 6)
+            if math.isclose(a, b, rel_tol=1e-6):
+                continue
+        else:
+            a, b = _condition(first.get(key)), _condition(second.get(key))
+            if isinstance(a, float) and isinstance(b, float) and math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9):
+                continue
+            if a == b:
+                continue
+            a, b = first.get(key), second.get(key)
+        differences.append({"field": key, "what": what, "unit": unit, "kept": a, "absorbed": b})
+    return differences, problems
+
+
+def _merge_version(target: Target, store: Store, kept_id: str, absorbed_id: str) -> Optional[Dict[str, Any]]:
+    """The version in the history of ``kept_id`` that merged ``absorbed_id`` into it; None when there is none."""
+    for key in sorted(store.list(f"{target.state_prefix}/{target.static_prefix}/history/{kept_id}/")):
+        if key.endswith(f"-{MERGE}.json"):
+            try:
+                document = json.loads(store.read(key))
+            except (ValueError, FileNotFoundError):
+                continue
+            if (document.get("merge") or {}).get("from") == absorbed_id:
+                return document
+    return None
+
+
+def plan_merged_raw_move(target: Target, store: Store, absorbed_name: str, manifest_sha256: str,
+                         record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """What moving the raw entry of an absorbed ID to the history takes; only reads.
+
+    Every object under ``raw/<absorbed name>/`` is copied inside the
+    storage to ``raw-history/<raw prefix>/<absorbed name>/<its manifest
+    SHA-256>/`` (the files its manifest lists with their recorded size and
+    SHA-256, the manifest with ``manifest_sha256``), ``merged.json``
+    (``record``) is written next to them, the record of the entry leaves
+    ``raw/index.json``, and the old keys are deleted.  Returns ``(plan,
+    refused)``; ``plan["relation"]`` is ``move``, or ``moved`` when an
+    earlier run did all of it.
+    """
+    refused: List[str] = []
+    try:
+        prefix = archive_transfer.entry_key_prefix(target.raw_prefix, absorbed_name)
+    except archive.ArchiveError as exc:
+        return {}, [str(exc)]
+    history_root = f"{target.history(absorbed_name)}{manifest_sha256}/"
+    listing = store.list(prefix)
+    stored = store.read_optional(prefix + archive.MANIFEST_FILE) if prefix + archive.MANIFEST_FILE in listing else None
+    if stored is not None and _sha256_bytes(stored) != manifest_sha256:
+        refused.append(f"the raw entry under {prefix[:100]} is not the one that was merged (its manifest changed)")
+    manifest_bytes = stored if stored is not None else store.read_optional(history_root + archive.MANIFEST_FILE)
+    if manifest_bytes is None:
+        return {}, refused + [f"no raw entry is stored under {prefix[:100]}, and none under {history_root[:100]}"]
+    manifest = json.loads(manifest_bytes)
+    described = dict(manifest["files"])
+    described[archive.MANIFEST_FILE] = {"size": len(manifest_bytes), "sha256": manifest_sha256}
+    copies: List[Dict[str, Any]] = []
+    for name in sorted(set(described) | {key[len(prefix):] for key in listing}):
+        info = described.get(name)
+        if info is None:                                    # an object its manifest does not list: as it is stored
+            info = store.head(prefix + name)
+            if info is None:
+                continue
+        item = {"name": name, "source": prefix + name, "key": history_root + name, "size": info["size"],
+                "sha256": info["sha256"]}
+        if store.holds(item["key"], item["size"], item["sha256"]):
+            item["how"] = "stored"
+        elif store.holds(item["source"], item["size"], item["sha256"]):
+            item["how"] = "copy"
+        else:
+            item["how"] = "missing"
+            refused.append(f"{name} of the raw entry of {record.get('from_glycoshape_id')} is neither stored as its "
+                           "manifest describes it nor in the history")
+        copies.append(item)
+    index_key = f"{target.raw_prefix}/{archive.INDEX_FILE}"
+    index_bytes = store.read_optional(index_key)
+    stored_index = None
+    if index_bytes is not None:
+        try:
+            stored_index = archive_transfer.parse_index(index_bytes, f"the stored {index_key}")
+        except archive_transfer.TransferError as exc:
+            refused.append(str(exc))
+    listed = absorbed_name in {item["glycam_name"] for item in (stored_index or {}).get("records", [])}
+    record_key = history_root + "merged.json"
+    done = not listing and not listed and store.head(record_key) is not None
+    plan = {
+        "relation": "moved" if done else "move",
+        "from_name": absorbed_name, "from_key_prefix": prefix, "history_prefix": history_root,
+        "copies": copies,
+        "record_key": record_key, "record": record,
+        "index_key": index_key,
+        "index": index_with(stored_index, [absorbed_name], None) if listed else None,
+        "delete": sorted(listing),
+    }
+    return plan, refused
+
+
+def describe_merged_raw_move(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "relation": plan["relation"],
+        "from_key_prefix": plan["from_key_prefix"],
+        "history_prefix": plan["history_prefix"],
+        "copy": [item["name"] for item in plan["copies"] if item["how"] == "copy"],
+        "copy_bytes": sum(item["size"] for item in plan["copies"] if item["how"] == "copy"),
+        "in_history": [item["name"] for item in plan["copies"] if item["how"] == "stored"],
+        "record": plan["record_key"],
+        "index": "unchanged" if plan["index"] is None else f"{plan['index']['entries']} entries",
+        "delete": plan["delete"],
+    }
+
+
+def publish_merged_raw_move(target: Target, store: Store, plan: Dict[str, Any], log: Log = print,
+                            checkpoint: Callable[[str], None] = _noop) -> None:
+    """Move the raw entry of an absorbed ID to the history as planned; every step skips what is done.
+
+    1. every object is copied to the history, and every copy is checked
+       (size and SHA-256) before anything is deleted;
+    2. ``merged.json`` (kept as it is when an earlier run wrote it);
+    3. ``raw/index.json`` without the entry (from the index stored now);
+    4. the old keys are deleted, the manifest first.
+    """
+    try:
+        for item in plan["copies"]:
+            if store.holds(item["key"], item["size"], item["sha256"]):
+                continue
+            if not store.holds(item["source"], item["size"], item["sha256"]):
+                raise OperationError(f"{item['name']} of {plan['from_key_prefix'][:80]} is not stored as planned")
+            store.copy(item["source"], item["key"], item["size"], item["sha256"])
+            checkpoint(f"merge-move:{item['name']}")
+        unverified = [item["name"] for item in plan["copies"]
+                      if not store.holds(item["key"], item["size"], item["sha256"])]
+        if unverified:
+            raise OperationError(f"the copies of {', '.join(unverified)} in {plan['history_prefix'][:80]} are not "
+                                 "what was copied: nothing was deleted")
+        if store.head(plan["record_key"]) is None:
+            store.write(plan["record_key"], _json_bytes(plan["record"]))
+        checkpoint("merge-move:history")
+        current = store.read_optional(plan["index_key"])
+        if current is not None:
+            index = archive_transfer.parse_index(current, f"the stored {plan['index_key']}")
+            if plan["from_name"] in {item["glycam_name"] for item in index["records"]}:
+                store.write(plan["index_key"], _json_bytes(index_with(index, [plan["from_name"]], None)))
+        checkpoint("merge-move:index")
+        doomed = sorted(store.list(plan["from_key_prefix"]))
+        manifest_key = plan["from_key_prefix"] + archive.MANIFEST_FILE
+        if manifest_key in doomed:
+            store.delete(manifest_key)
+            doomed.remove(manifest_key)
+        for _ in parallel_map(store.delete, doomed, target.workers):
+            pass
+        checkpoint("merge-move:deleted")
+    except (PublishEntryError, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        raise OperationError(
+            f"the raw entry of the absorbed ID was not moved to the history completely ({type(exc).__name__}: "
+            f"{exc}); run the command again to continue") from exc
+    log(f"raw entry moved to the history: {plan['from_key_prefix'][:80]} -> {plan['history_prefix'][:80]}")
+
+
+def _derived_database(derived_dir: Path, withdrawn: Dict[str, Any]) -> entry_publish.Database:
+    """The database a dry run would publish, from the root files it derived (to plan what follows it)."""
+    from lib import static_publish
+
+    payload = (derived_dir / entry_publish.MANIFEST).read_bytes()
+    manifest = static_publish.parse_manifest(payload, f"the derived {entry_publish.MANIFEST}")
+    inventory = json.loads((derived_dir / static_delta.INVENTORY).read_bytes())
+    return entry_publish.Database(manifest, _sha256_bytes(payload), derived_dir, inventory, dict(withdrawn))
+
+
+def _seed_base(derived_dir: Path, work: Path, global_hash: str) -> None:
+    """Hard links of root files this run derived where ``read_database`` looks for files kept from an earlier
+    attempt, so that the database this run published is not downloaded again (they are checked there)."""
+    base = work / "base" / global_hash[:16]
+    base.mkdir(parents=True, exist_ok=True)
+    for name in static_delta.DERIVED_ROOT_FILES:
+        source, target = derived_dir / name, base / name
+        if source.is_file() and not target.exists():
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copyfile(source, target)
+
+
+def _merge_block(merged_manifest: Dict[str, Any], kept_id: str, absorbed_id: str, absorbed_name: str,
+                 differences: List[Dict[str, Any]], accepted: List[str], hashes: Dict[str, Any]) -> Dict[str, Any]:
+    """``merge`` of the report and of the history: what was merged, from where, and what was accepted."""
+    kept_frames = int(merged_manifest["extends"]["frames"])
+    absorbed_frames = int(merged_manifest["merged_from"]["frames"])
+    return {
+        "from": absorbed_id, "from_glycam_name": absorbed_name, "into": kept_id,
+        "glycam_name": merged_manifest["glycam_name"],
+        "frames": {"kept": kept_frames, "absorbed": absorbed_frames, "total": int(merged_manifest["frames"])},
+        "segments": [{"index": segment["index"], "name": segment["name"], "first_frame": segment["first_frame"],
+                      "frames": segment["frames"],
+                      "from": absorbed_id if "merged_from" in segment else kept_id}
+                     for segment in archive.segments_of(merged_manifest)],
+        "differences": [dict(item, accepted=item["field"] in accepted) for item in differences],
+        "accepted_differences": [item["field"] for item in differences if item["field"] in accepted],
+        **hashes,
+    }
+
+
+def merge(
+    kept_id: str,
+    absorbed_id: str,
+    target: Target,
+    work_dir,
+    accept_differences: Iterable[str] = (),
+    note: str = "",
+    author: str = "",
+    workers: int = 8,
+    memory_limit_gb: Optional[float] = None,
+    policy: Optional[Policy] = None,
+    dry_run: bool = False,
+    offline: Optional[bool] = None,
+    lookup_timeout: Optional[float] = None,
+    lookup_budget: Optional[float] = 300.0,
+    refresh: bool = False,
+    expect_hash: Optional[str] = None,
+    lock_ttl: float = entry_publish.DEFAULT_LOCK_TTL,
+    break_lock: bool = False,
+    cache_dir=None,
+    owner: Optional[str] = None,
+    log: Log = print,
+    checkpoint: Callable[[str], None] = _noop,
+) -> Dict[str, Any]:
+    """Merge the published entry ``absorbed_id`` into ``kept_id``: one GlycoShape ID per simulated glycan.
+
+    Refused (exit status 2, nothing written): the same ID twice; an ID that
+    is not published; two entries that are not the same glycan with the
+    same reducing end (:func:`same_glycan`); simulation conditions that
+    differ (:func:`merge_differences`), unless ``accept_differences`` names
+    each of them (then the kept entry's value stands, and the difference is
+    a warning kept in the history); raw entries that are not stored or do
+    not have the same atoms (``lib.archive_segments.merge_entries``); and
+    what refuses a ``reanalyse``.
+
+    Then, in the work folder: both raw entries are downloaded and merged
+    into one under the kept entry's GLYCAM name (its frames first, as the
+    bytes they are), analysed as ``reanalyse`` analyses (memory estimate
+    and ``memory_limit_gb``), and completed with the kept entry's curated
+    metadata and the sum of the two lengths.  Published, under one lock:
+
+    1. the kept ID as a new version (``replace``; the raw entry is the
+       extension of the stored one, whose manifest stays in the history),
+       with a version of operation ``merge`` in its history;
+    2. the absorbed ID withdrawn (``withdrawn.json`` and its history say
+       ``merged_into``), its folder deleted;
+    3. its raw entry moved to ``raw-history/<raw prefix>/<its name>/<its
+       manifest SHA-256>/`` next to ``merged.json``, out of ``raw/index.json``,
+       its ``raw/`` keys deleted last (:func:`publish_merged_raw_move`).
+
+    Each step that is done is skipped when the command runs again, so the
+    same command continues after any interruption; when all three are done
+    the status is ``already-merged``.  A dry run reads, merges, analyses
+    and plans in the work folder and writes nothing to the storage; its
+    report has ``merge``, ``entry`` (the folder ``hash`` that
+    ``expect_hash`` pins), ``diff``, ``raw`` and ``withdrawal`` (the plan
+    of steps 2 and 3, derived from the database step 1 makes).
+    """
+    from lib import archive_segments, entry_bundle
+
+    policy = policy or Policy()
+    owner = owner or entry_publish.new_owner()
+    started = time.perf_counter()
+    stats = entry_publish.new_stats()
+    static_store = Store(target.static, stats, dry_run)
+    raw_store = Store(target.raw, stats, dry_run)
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    accepted = sorted({str(name).strip() for name in accept_differences if str(name).strip()})
+    report = _new_report(MERGE, kept_id, dry_run, owner, work, stats)
+    report.update(merge=None, withdrawal=None)
+    journal: Optional[entry_publish.Journal] = None
+    try:
+        for value in (kept_id, absorbed_id):
+            if not id_registry.is_id(value):
+                raise Refused(f"not a GlycoShape ID: {value!r}")
+        if kept_id == absorbed_id:
+            raise Refused(f"{kept_id} cannot be merged into itself: name two IDs")
+        known = [key for key, _, _ in MERGE_FIELDS]
+        unknown = [name for name in accepted if name not in known]
+        if unknown:
+            raise Refused(f"--accept-difference {', '.join(unknown)}: the fields that are compared are "
+                          f"{', '.join(known)}")
+        with _locked(target, static_store, owner, MERGE, kept_id, lock_ttl, break_lock, dry_run,
+                     report, log, checkpoint) as lock:
+            database = entry_publish.read_database(target, static_store, work, cache_dir)
+            kept = read_published(target, static_store, raw_store, database, kept_id)
+            report.update(glycam_name=kept.raw_name, previous_glycam_name=kept.published_name)
+            journal = entry_publish.Journal(work, MERGE, kept_id, kept.raw_name, owner)
+            journal.data.setdefault("merged_at", journal.data["started"])
+            journal.save()
+            tombstone = database.withdrawn.get(absorbed_id)
+            absorbed: Optional[Published] = None
+            if absorbed_id in database.inventory:
+                absorbed = read_published(target, static_store, raw_store, database, absorbed_id)
+            elif not (tombstone and tombstone.get("merged_into") == kept_id):
+                raise Refused(f"{absorbed_id} is not published" + (" (it was withdrawn)" if tombstone else ""))
+            report["database"] = {"global_hash": database.global_hash, "glycans": len(database.manifest["glycans"]),
+                                  "withdrawn": len(database.withdrawn)}
+
+            # How far an earlier run came: the raw entry of the kept ID holds the frames of the absorbed one,
+            # and a version of the kept ID in its history merged it.
+            kept_prefix = archive_transfer.entry_key_prefix(target.raw_prefix, kept.raw_name)
+            kept_manifest_bytes = raw_store.read_optional(kept_prefix + archive.MANIFEST_FILE)
+            if kept_manifest_bytes is None:
+                raise Refused(f"no raw entry is stored for {kept.raw_name[:100]}")
+            kept_manifest = json.loads(kept_manifest_bytes)
+            merged_record = kept_manifest.get("merged_from") if isinstance(kept_manifest.get("merged_from"), dict) else None
+            raw_merged = merged_record is not None and merged_record.get("glycoshape_id") == absorbed_id
+            version = _merge_version(target, static_store, kept_id, absorbed_id)
+            if absorbed is None and version is None:
+                raise Refused(f"{absorbed_id} was withdrawn as merged into {kept_id}, and the history of {kept_id} "
+                              "has no version that merged it")
+            kept_done = version is not None and (absorbed is None or raw_merged)
+
+            if kept_done:
+                log(f"{kept_id} is published with the frames of {absorbed_id} ({version.get('published_at')})")
+                report["merge"] = version["merge"]
+                report["kept"] = {"status": "already-published", "hash": (version.get("entry") or {}).get("hash"),
+                                  "history": version.get("key")}
+                report["static"] = {"base_global_hash": database.global_hash, "target_global_hash": database.global_hash}
+                if expect_hash is not None and expect_hash != report["kept"]["hash"]:
+                    raise Refused(f"{kept_id} was published by the merge with the hash "
+                                  f"{str(report['kept']['hash'])[:16]}... and {expect_hash[:16]}... was approved")
+                absorbed_name = version["merge"]["from_glycam_name"]
+                absorbed_sha256 = version["merge"]["absorbed_manifest_sha256"]
+                merged_sha256 = version["merge"]["merged_manifest_sha256"]
+                report["status"] = "planned"
+            else:
+                refused: List[str] = same_glycan(kept, absorbed)
+                absorbed_name = absorbed.raw_name
+                absorbed_prefix = archive_transfer.entry_key_prefix(target.raw_prefix, absorbed_name)
+                absorbed_manifest_bytes = raw_store.read_optional(absorbed_prefix + archive.MANIFEST_FILE)
+                if absorbed_manifest_bytes is None:
+                    raise Refused(f"no raw entry is stored for {absorbed_name[:100]}")
+                absorbed_sha256 = _sha256_bytes(absorbed_manifest_bytes)
+                if raw_merged and merged_record.get("manifest_sha256") != absorbed_sha256:
+                    raise Refused(f"the raw entry of {kept_id} holds the frames of another raw entry of "
+                                  f"{absorbed_id} than the one stored for it")
+                if raw_merged:
+                    kept_frames, absorbed_frames = int(kept_manifest["extends"]["frames"]), int(merged_record["frames"])
+                else:
+                    kept_frames = int(kept_manifest["frames"])
+                    absorbed_frames = int(json.loads(absorbed_manifest_bytes)["frames"])
+                differences, problems = merge_differences(kept, absorbed, kept_frames, absorbed_frames)
+                refused += problems
+                for item in differences:
+                    values = (f"{kept_id} {item['kept']} {item['unit']}".rstrip() + ", "
+                              + f"{absorbed_id} {item['absorbed']} {item['unit']}".rstrip())
+                    if item["field"] in accepted:
+                        report["warnings"].append(f"the {item['what']} differs ({values}); accepted: the value of "
+                                                  f"{kept_id} stands")
+                    else:
+                        refused.append(f"the {item['what']} differs ({values}): --accept-difference {item['field']} "
+                                       f"merges them with the value of {kept_id}")
+                for name in accepted:
+                    if name not in {item["field"] for item in differences}:
+                        report["warnings"].append(f"--accept-difference {name}: the entries do not differ in it")
+                report["merge"] = {
+                    "from": absorbed_id, "from_glycam_name": absorbed_name, "into": kept_id,
+                    "glycam_name": kept.raw_name,
+                    "frames": {"kept": kept_frames, "absorbed": absorbed_frames, "total": kept_frames + absorbed_frames},
+                    "segments": None,
+                    "differences": [dict(item, accepted=item["field"] in accepted) for item in differences],
+                    "accepted_differences": [item["field"] for item in differences if item["field"] in accepted],
+                }
+                if refused:
+                    raise entry_publish._refusal(report, refused)
+
+                # The merged raw entry: the stored one when an earlier run stored it, else made here.
+                local = work / "merged"
+                if raw_merged:
+                    log(f"the raw entry of {kept_id} holds the frames of {absorbed_id} already: downloading it")
+                    row = archive_transfer.download_entry(target.raw, target.raw_prefix, kept.raw_name, local)
+                    stats["downloaded_bytes"] += row.get("bytes", 0)
+                else:
+                    for name in (kept.raw_name, absorbed_name):
+                        log(f"downloading the raw entry {name[:80]}")
+                        row = archive_transfer.download_entry(target.raw, target.raw_prefix, name, work / "raw")
+                        stats["downloaded_bytes"] += row.get("bytes", 0)
+                    try:
+                        made = archive_segments.merge_entries(
+                            work / "raw" / archive.entry_folder_name(kept.raw_name),
+                            work / "raw" / archive.entry_folder_name(absorbed_name), local,
+                            kept_id=kept_id, absorbed_id=absorbed_id)
+                    except archive.ArchiveError as exc:
+                        raise Refused(f"the raw entries of {kept_id} and {absorbed_id} cannot be merged: {exc}") from exc
+                    log(f"merged the raw entries: {made['status']}")
+                merged_dir = local / archive.entry_folder_name(kept.raw_name)
+                merged_manifest = archive.load_manifest(merged_dir)
+                merged_sha256 = file_sha256(merged_dir / archive.MANIFEST_FILE)[1]
+                hashes = {"kept_manifest_sha256": merged_manifest["extends"]["manifest_sha256"],
+                          "absorbed_manifest_sha256": absorbed_sha256, "merged_manifest_sha256": merged_sha256}
+                report["merge"] = _merge_block(merged_manifest, kept_id, absorbed_id, absorbed_name, differences,
+                                               accepted, hashes)
+                report["warnings"] += [f"merged raw entry: {warning}" for warning in merged_manifest.get("warnings") or []]
+
+                # Memory, the analysis and the bundle, as reanalyse.
+                frames = int(merged_manifest["frames"])
+                atoms = heavy_atoms(merged_dir / archive.TOPOLOGY_FILE)
+                estimate = memory_estimate_gb(frames, atoms, workers)
+                report["memory"] = {"estimate_gb": estimate, "limit_gb": memory_limit_gb, "frames": frames,
+                                    "landscape_atoms": atoms, "workers": workers}
+                if memory_limit_gb is not None and estimate > memory_limit_gb:
+                    raise Refused(f"the analysis needs about {estimate:g} GB ({frames} frames, {atoms} landscape "
+                                  f"atoms) and the limit is {memory_limit_gb:g} GB: run it where there is more memory")
+                levels = tuple(policy.levels) if policy.levels is not None else _configured_levels()
+                log(f"analysing {kept.raw_name[:80]} ({frames} frames; about {estimate:g} GB) with {workers} workers")
+                analysis_started = time.perf_counter()
+                earlier = work / "result" / "result.json"
+                earlier_sha256 = file_sha256(earlier)[1] if earlier.is_file() else None
+                result = run_analysis(merged_dir, work / "result", workers, [], work / "analysis.log", levels)
+                report["analysis"] = {
+                    "seconds": round(time.perf_counter() - analysis_started, 3),
+                    "reused": earlier_sha256 is not None and file_sha256(earlier)[1] == earlier_sha256,
+                    "excluded_replicas": result["settings"].get("excluded_replicas") or [],
+                    "frame_quality": result.get("frame_quality"), "summary": result.get("analysis"),
+                    "pipeline": {key: result["pipeline"].get(key) for key in ("commit", "uncommitted_changes", "code_sha256")},
+                    "peak_rss_gb": result.get("peak_rss_gb"), "warnings": result.get("warnings") or [],
+                    "note": note,
+                }
+                report["warnings"] += result.get("warnings") or []
+
+                base_submission, curation, notes = published_submission(kept.data, kept.published_name, kept.record)
+                report["curated_from"] = notes
+                length_us = round(_length_us(kept.data) + _length_us(absorbed.data), 9)
+                submission_record_new, curation = apply_changes(
+                    base_submission, curation, Changes(glycoshape_id=kept_id, simulation={"simulation_length_us": length_us}),
+                    kept.published_name, kept.raw_name)
+                submission_record_new["glycoshape_id"] = kept_id
+                try:
+                    submission = entry_complete.Submission.parse(submission_record_new)
+                except entry_complete.SubmissionError as exc:
+                    raise Refused(str(exc)) from exc
+                operation_record = {"operation": MERGE, "from": absorbed_id, "accepted_differences":
+                                    report["merge"]["accepted_differences"], "note": note,
+                                    "raw_manifest_sha256": merged_sha256}
+                source = _bundle_source(kept, submission_record_new, operation_record)
+                source["run_id"] = f"merge-{absorbed_id}-into-{kept_id}"
+                bundle_tar, bundle_dir = work / "bundle.tar", work / "bundle"
+                fingerprint = json.dumps([file_sha256(work / "result" / "result.json")[1], merged_sha256,
+                                          submission.sha256()])
+                if journal.data.get("bundle_fingerprint") != fingerprint or not (bundle_dir / "bundle.json").is_file():
+                    for stale in (bundle_tar, bundle_dir):
+                        if stale.is_dir():
+                            shutil.rmtree(stale)
+                        elif stale.exists():
+                            stale.unlink()
+                    entry_bundle.write_bundle(bundle_tar, merged_dir, work / "result", source,
+                                              created=journal.data["started"])
+                    entry_bundle.open_bundle(bundle_tar, bundle_dir, expected_glycam_name=kept.raw_name)
+                    journal.data["bundle_fingerprint"] = fingerprint
+                    journal.save()
+                bundle = entry_complete.load_bundle(bundle_dir)
+                policy_refused, policy_warnings = entry_publish.check_bundle_policy(bundle, policy)
+                refused += policy_refused
+                report["warnings"] += policy_warnings
+                report["bundle"] = {"path": str(bundle_tar), "size": bundle_tar.stat().st_size,
+                                    "sha256": file_sha256(bundle_tar)[1], **bundle.summary()}
+
+                def complete() -> Dict[str, Any]:
+                    folder, data, summary = entry_complete.complete_folder(
+                        bundle.static_dir, kept.raw_name, bundle.levels, submission, work / "static",
+                        offline=offline, lookup_timeout=lookup_timeout, lookup_budget=lookup_budget,
+                        names=curation["names"], aliases=curation.get("aliases") or [],
+                        keywords=curation.get("keywords") or {}, public_note=curation.get("public_note") or "")
+                    return entry_complete.folder_report(folder, data, bundle.levels, summary, submission,
+                                                        list(submission.warnings))
+
+                fingerprint = hashlib.sha256(json.dumps(
+                    [bundle.sha256, submission.sha256(), curation, list(bundle.levels)], sort_keys=True).encode()).hexdigest()
+                entry = _cached_completion(work, journal, fingerprint, refresh, log, complete)
+                folder = Path(entry["folder"])
+                report["entry"] = _entry_summary(entry)
+                report["warnings"] += entry["warnings"]
+                if entry["problems"] and not policy.allow_incomplete:
+                    refused += [f"the entry is not complete: {problem}" for problem in entry["problems"]]
+                if expect_hash is not None and expect_hash != entry["hash"]:
+                    refused.append(f"the folder has the hash {entry['hash'][:16]}... and {expect_hash[:16]}... was approved")
+                reps = [f"output/torsion_level_{level}_reps.csv" for level in bundle.levels]
+                old_folder = download_folder(target, static_store, database, kept_id, work / "stored",
+                                             only=[name for name in reps if name in kept.files])
+                new_data = json.loads((folder / "data.json").read_bytes())
+                report["diff"] = diff_entry(
+                    kept.data, new_data, kept.files, entry["files"],
+                    {f"level_{level}": old_folder / f"output/torsion_level_{level}_reps.csv" for level in bundle.levels},
+                    {f"level_{level}": folder / f"output/torsion_level_{level}_reps.csv" for level in bundle.levels})
+
+                plan, raw_refused = entry_publish.plan_raw(target, raw_store, bundle, policy)
+                refused += raw_refused
+                if plan and plan["relation"] not in ("extension", "same"):
+                    refused.append(f"the stored raw entry of {kept_id} changed while it was merged "
+                                   f"(relation {plan['relation']})")
+                report["raw"] = entry_publish.describe_raw(plan) if plan else None
+                record_extra = {"operation": MERGE, "merge": report["merge"], "curation": curation,
+                                "curator_note": note, "author": author, "raw_manifest_sha256": merged_sha256}
+                report = publish_version(
+                    MERGE, target, work, journal, (static_store, raw_store), database, kept, folder,
+                    {**entry, "glycam_name": kept.raw_name, "bundle": bundle.summary(),
+                     "submission": submission.record()}, report, refused, {"kind": "bundle", "plan": plan},
+                    record_extra, owner, lock, lock_ttl, dry_run, offline, cache_dir, bundle, log, checkpoint)
+                if report["refused"]:
+                    return _finish(report, journal, started, dry_run, stats)
+                report["kept"] = {"status": report["status"], "hash": entry["hash"],
+                                  "history": (report.get("history") or {}).get("key")}
+
+            # 2. The absorbed ID leaves the database, with merged_into in its tombstone.
+            reason = f"merged into {kept_id}" + (f": {note}" if note else "")
+            withdraw_work = work / "withdraw"
+            after = report["static"]["target_global_hash"]
+            if dry_run:
+                derived_dir = work / "derived" / database.global_hash[:16]
+                base = database
+                if report["kept"]["status"] == "planned" and (derived_dir / entry_publish.MANIFEST).is_file():
+                    base = _derived_database(derived_dir, database.withdrawn)
+                withdrawal = entry_publish.withdraw_entry(
+                    absorbed_id, target, withdraw_work, reason=reason, dry_run=True, offline=offline, owner=owner,
+                    log=log, merged_into=kept_id, database=base, stats=stats)
+            elif absorbed is not None:
+                if report["kept"]["status"] == "published":
+                    _seed_base(work / "derived" / database.global_hash[:16], withdraw_work, after)
+                withdrawal = entry_publish.withdraw_entry(
+                    absorbed_id, target, withdraw_work, reason=reason, offline=offline, lock_ttl=lock_ttl,
+                    cache_dir=cache_dir, owner=owner, log=log, checkpoint=checkpoint, merged_into=kept_id,
+                    held_lock=lock, stats=stats)
+            else:
+                withdrawal = {"glycoshape_id": absorbed_id, "status": "already-withdrawn", "refused": [],
+                              "glycam_name": (tombstone or {}).get("glycam_name")}
+            report["withdrawal"] = {key: withdrawal.get(key) for key in (
+                "glycoshape_id", "glycam_name", "status", "refused", "static", "history", "switch")}
+            report["withdrawal"]["merged_into"] = kept_id
+            if withdrawal.get("refused"):
+                raise entry_publish._refusal(report, [f"the withdrawal of {absorbed_id}: {reason_}"
+                                                      for reason_ in withdrawal["refused"]])
+            after = (withdrawal.get("static") or {}).get("target_global_hash") or after
+
+            # 3. Its raw entry moves to the history.
+            record = {
+                "schema": MERGE_SCHEMA, "schema_version": 1,
+                "from": absorbed_name, "into": kept.raw_name,
+                "from_glycoshape_id": absorbed_id, "into_glycoshape_id": kept_id,
+                "manifest_sha256_from": absorbed_sha256, "manifest_sha256_into": merged_sha256,
+                "merged_at": journal.data["merged_at"], "author": author, "note": note,
+                "accepted_differences": (report["merge"] or {}).get("accepted_differences") or [],
+                "into_key_prefix": kept_prefix,
+            }
+            move, move_refused = plan_merged_raw_move(target, raw_store, absorbed_name, absorbed_sha256, record)
+            report["withdrawal"]["raw"] = describe_merged_raw_move(move) if move else None
+            if move_refused:
+                if dry_run:
+                    raise entry_publish._refusal(report, move_refused)
+                raise OperationError(f"{kept_id} is published with the frames of {absorbed_id}, and the raw entry of "
+                                     f"{absorbed_id} cannot be moved to the history: {'; '.join(move_refused)}")
+            if not dry_run and move["relation"] != "moved":
+                publish_merged_raw_move(target, raw_store, move, log, checkpoint)
+                journal.step("merge-raw-moved", history=move["history_prefix"])
+            report["database_after"] = {"global_hash": after}
+            nothing_left = report["kept"]["status"] == "already-published" and withdrawal["status"] == "already-withdrawn" \
+                and move["relation"] == "moved"
+            report["status"] = "already-merged" if nothing_left else "planned" if dry_run else "merged"
     except Refused as exc:
         if not report["refused"]:
             entry_publish._refusal(report, exc.report.get("refused") if exc.report and exc.report.get("refused")

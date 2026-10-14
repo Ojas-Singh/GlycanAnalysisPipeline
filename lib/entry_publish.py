@@ -1553,6 +1553,10 @@ def withdraw_entry(
     owner: Optional[str] = None,
     log: Log = print,
     checkpoint: Checkpoint = _noop,
+    merged_into: Optional[str] = None,
+    held_lock: Optional[Dict[str, Any]] = None,
+    database: Optional[Database] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Take a published glycan out of the database.
 
@@ -1562,20 +1566,28 @@ def withdraw_entry(
     glycan: it can come back for that glycan (``publish``), and is refused
     for any other.  ``glycam_name``, when given, has to be the name the ID
     is published for.  Returns a report; raises as :func:`publish_entry`.
+
+    For ``lib.entry_ops.merge``: ``merged_into`` (the ID that holds the
+    frames of this glycan now) is kept in the record, the history and the
+    entry of ``withdrawn.json``; ``held_lock`` is the lock of the caller,
+    which this run then neither takes nor releases (nor completes a pending
+    publication: the caller did); ``database`` is the database to derive
+    from instead of the stored one (a dry run that follows another change);
+    ``stats`` counts the requests into the caller's report.
     """
     if not id_registry.is_id(glycan_id):
         raise PublishEntryError(f"not a GlycoShape ID: {glycan_id!r}")
     owner = owner or new_owner()
     started = time.perf_counter()
-    stats = new_stats()
+    stats = stats if stats is not None else new_stats()
     store = Store(target.static, stats, dry_run)
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
     report: Dict[str, Any] = {"action": WITHDRAW, "glycoshape_id": glycan_id, "dry_run": dry_run, "ok": True,
                               "owner": owner, "work_dir": str(work), "refused": [], "warnings": [], "transfers": stats}
     with contextlib.ExitStack() as stack:
-        lock: Optional[Dict[str, Any]] = None
-        if not dry_run:
+        lock: Optional[Dict[str, Any]] = held_lock
+        if not dry_run and held_lock is None:
             stack.enter_context(_in_process(target))
             lock = acquire_lock(target, store, owner, WITHDRAW, glycan_id, lock_ttl, break_lock, log)
             stack.callback(lambda: _release_quietly(target, store, lock, log))
@@ -1584,19 +1596,20 @@ def withdraw_entry(
             if pending is not None:
                 log(f"completing the interrupted {pending['action']} of {pending['glycoshape_id']} (by {pending['owner']})")
                 roll_forward(target, store, pending, log, checkpoint)
-        else:
+        elif dry_run:
             pending = read_pending(target, store)
             if pending is not None:
                 _refusal(report, [f"an interrupted {pending['action']} of {pending['glycoshape_id']} is pending"])
                 return report
 
-        try:
-            database = read_database(target, store, work, cache_dir)
-        except Refused as exc:
-            failure = _refusal(report, [str(exc)])
-            if dry_run:
-                return report
-            raise failure from exc
+        if database is None:
+            try:
+                database = read_database(target, store, work, cache_dir)
+            except Refused as exc:
+                failure = _refusal(report, [str(exc)])
+                if dry_run:
+                    return report
+                raise failure from exc
         refused: List[str] = []
         raw_index_bytes = Store(target.raw, stats, dry_run).read_optional(f"{target.raw_prefix}/{archive.INDEX_FILE}")
         try:
@@ -1647,14 +1660,17 @@ def withdraw_entry(
                 "owner": owner, "reason": reason, "global_hash_before": database.global_hash,
                 "global_hash": derived["global_hash"],
             }
+            tombstone = {"glycam_name": name, "withdrawn_at": record["withdrawn_at"], "reason": reason,
+                         "global_hash_before": database.global_hash}
+            if merged_into is not None:
+                record["merged_into"] = tombstone["merged_into"] = merged_into
             history = {"key": target.history_key(glycan_id, derived["global_hash"], WITHDRAW),
                        "document": {**record, "kind": "version",
                                     "folder_hash_before": (database.manifest["glycans"].get(glycan_id) or {}).get("hash")}}
             done = publish_static(
                 target, store, plan,
                 {"glycam_name": name, "record": record, "history": history, "delete_prefix": target.key(f"{glycan_id}/"),
-                 "withdrawn": {"glycam_name": name, "withdrawn_at": record["withdrawn_at"], "reason": reason,
-                               "global_hash_before": database.global_hash}},
+                 "withdrawn": tombstone},
                 owner, lock, lock_ttl, log, checkpoint)
             report["history"] = {"key": history["key"]}
             journal.step("static", base_global_hash=database.global_hash, global_hash=derived["global_hash"], **done)

@@ -208,3 +208,9 @@ have the same). Aldoses are flipped exactly as before.
   `reanalyse --exclude-replica run_3`.
 * The two entries estimated over 32 GB are refused by a worker limited to 32 GB (`--memory-limit-gb`); a later
   single-entry `reanalyse` of them runs on the Spark (128 GB, where the R2 keys are) with the same command.
+* One glycan published under two IDs (audit issue `duplicate-entry`, action `merge-ids`; for example GS00303 and
+  GS00453, G30648VY with its branches written in another order): `publish_entry.py merge --id GS00303 --from GS00453
+  --accept-difference salt --note "..." --work-dir ... --dry-run`, then the same with `--expect-hash`. GS00303 keeps
+  the frames of both (60,006) and the sum of the lengths, GS00453 is withdrawn with `merged_into` and its raw entry
+  goes to `raw-history/`. Their salt differs (200 and 150 mM): without `--accept-difference salt` the merge is
+  refused, and with it the 200 mM of GS00303 stands; decide that before approving.

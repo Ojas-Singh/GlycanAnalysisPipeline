@@ -96,6 +96,11 @@ class World:
         options.setdefault("workers", 2)
         return entry_ops.reanalyse(GS, self.target, self.tmp / work, **options)
 
+    def merge(self, kept=GS, absorbed=OTHER_GS, work="work", **options):
+        options.setdefault("log", quiet)
+        options.setdefault("workers", 2)
+        return entry_ops.merge(kept, absorbed, self.target, self.tmp / work, **options)
+
 
 @pytest.fixture
 def world(prepared, tmp_path, monkeypatch):
@@ -410,6 +415,274 @@ def test_a_memory_estimate_that_follows_the_measurements():
 
 
 # ---------------------------------------------------------------------------
+# merge
+# ---------------------------------------------------------------------------
+#: The synthetic glycan written another way.  Here it is the name of another disaccharide, and the IUPAC name the
+#: static stage derives from it is made that of GLYCAM_NAME (:func:`one_glycan`), as GS00453 and GS00303 have one.
+ALT_NAME = NEW_NAME
+
+
+def one_glycan(patching):
+    """The two names are one glycan: the same IUPAC name, so the same archetype WURCS and accession."""
+    from lib import glystatic
+
+    canonical = glystatic.canonicalize_iupac
+    patching.setattr(glystatic, "canonicalize_iupac", lambda name: canonical(GLYCAM_NAME if name == ALT_NAME else name))
+
+
+def publish_second(target, made_bundle, root, glycan_id=OTHER_GS, name=ALT_NAME, salt=200.0):
+    """The same simulation published once more under another ID and name (as GS00453 next to GS00303)."""
+    record = submission_record(glycan_id, name)
+    record["simulation"]["salt_concentration_mm"] = salt
+    bundle = renamed_bundle(Path(root) / f"bundle-{glycan_id}", made_bundle, name)
+    report = entry_publish.publish_entry("publish", bundle, record, target, work_dir=Path(root) / f"w-{glycan_id}",
+                                         log=quiet)
+    assert report["status"] == "published"
+
+
+@pytest.fixture(scope="module")
+def prepared_pair(tmp_path_factory, prepared, made_bundle):
+    """The database of ``prepared`` with the synthetic glycan published a second time, as GS01068 (salt 200 mM)."""
+    root = tmp_path_factory.mktemp("published-pair")
+    client = FakeS3Client("bucket")
+    client.objects = copy.deepcopy(prepared["objects"])
+    backend = S3StorageBackend(client, bucket="bucket", sleep=lambda seconds: None)
+    with pytest.MonkeyPatch.context() as patching:
+        fake_services.install(patching)
+        one_glycan(patching)
+        publish_second(Target(static=backend, raw=backend, workers=4), made_bundle, root)
+    return {"objects": client.objects}
+
+
+@pytest.fixture
+def pair(prepared_pair, tmp_path, monkeypatch):
+    fake_services.install(monkeypatch)
+    return World(prepared_pair, tmp_path)
+
+
+def test_the_two_entries_of_a_pair_are_one_glycan(pair):
+    kept, absorbed = pair.data(GS), pair.data(OTHER_GS)
+    assert kept["archetype"]["wurcs"] == absorbed["archetype"]["wurcs"] and kept["archetype"]["name"] != absorbed["archetype"]["name"]
+    assert (kept["archetype"]["salt"], absorbed["archetype"]["salt"]) == (150.0, 200.0)
+
+
+def segment_names(made_bundle):
+    return [segment["name"] for segment in json.loads((made_bundle / "archive" / "manifest.json").read_text())["segments"]]
+
+
+def test_a_dry_run_of_a_merge_reports_everything_and_writes_nothing(pair, made_bundle):
+    before = stored_tree(pair.backend, "")
+    report = pair.merge(dry_run=True)
+    assert pair.writes() == [] and stored_tree(pair.backend, "") == before
+    assert not report["ok"] and report["operation"] == "merge" and report["schema"] == "glycoshape-entry-operation"
+    assert report["refused"] == [f"the salt concentration differs ({GS} 150.0 mM, {OTHER_GS} 200.0 mM): "
+                                 f"--accept-difference salt merges them with the value of {GS}"]
+    assert report["merge"]["differences"] == [{"field": "salt", "what": "salt concentration", "unit": "mM",
+                                               "kept": 150.0, "absorbed": 200.0, "accepted": False}]
+    assert "entry" not in report                                    # refused before anything was analysed
+
+    report = pair.merge(dry_run=True, accept_differences=["salt"], note="the same glycan", author="curator")
+    assert report["ok"], report["refused"]
+    assert pair.writes() == [] and stored_tree(pair.backend, "") == before
+    assert report["status"] == "planned" and report["glycoshape_id"] == GS and report["glycam_name"] == GLYCAM_NAME
+    assert any("salt concentration differs" in warning and "accepted" in warning for warning in report["warnings"])
+    merge = report["merge"]
+    assert (merge["from"], merge["from_glycam_name"], merge["glycam_name"]) == (OTHER_GS, ALT_NAME, GLYCAM_NAME)
+    assert merge["frames"] == {"kept": 480, "absorbed": 480, "total": 960}
+    names = segment_names(made_bundle)
+    assert [(s["name"], s["first_frame"], s["from"]) for s in merge["segments"]] == [
+        (names[0], 0, GS), (names[1], 200, GS), (names[2], 330, GS),
+        (f"{OTHER_GS}/{names[0]}", 480, OTHER_GS), (f"{OTHER_GS}/{names[1]}", 680, OTHER_GS),
+        (f"{OTHER_GS}/{names[2]}", 810, OTHER_GS)]
+    assert merge["accepted_differences"] == ["salt"] and merge["differences"][0]["accepted"]
+    assert report["memory"]["frames"] == 960 and report["analysis"]["frame_quality"]
+    # the kept ID: a new version with the sum of the lengths and its own salt; the raw entry is an extension
+    assert len(report["entry"]["hash"]) == 64 and report["entry"]["simulation"]["length"] == 5.0
+    assert report["diff"]["simulation"] == {"length": {"before": 2.5, "after": 5.0}}
+    assert report["raw"]["relation"] == "extension" and "trajectory.xtc" in report["raw"]["upload"]
+    assert report["raw"]["history"] == [f"raw-history/raw/{GLYCAM_NAME}/"
+                                        f"{report['merge']['kept_manifest_sha256']}/manifest.json"]
+    # the absorbed ID: withdrawn from the database the kept version makes, its raw entry to the history
+    withdrawal = report["withdrawal"]
+    assert withdrawal["glycoshape_id"] == OTHER_GS and withdrawal["status"] == "planned"
+    assert withdrawal["merged_into"] == GS and withdrawal["static"]["delete_afterwards"] > 0
+    assert withdrawal["static"]["base_global_hash"] == report["static"]["target_global_hash"]
+    raw = withdrawal["raw"]
+    assert raw["relation"] == "move" and raw["from_key_prefix"] == f"raw/{ALT_NAME}/"
+    assert raw["history_prefix"] == f"raw-history/raw/{ALT_NAME}/{merge['absorbed_manifest_sha256']}/"
+    assert "trajectory.xtc" in raw["copy"] and "manifest.json" in raw["copy"] and raw["index"] == "2 entries"
+    assert sorted(raw["delete"]) == sorted(pair.keys(f"raw/{ALT_NAME}/"))
+
+
+def test_a_merge_gives_the_kept_id_the_frames_of_both_and_withdraws_the_other(pair, made_bundle):
+    absorbed_manifest = pair.backend.read_binary(f"raw/{ALT_NAME}/manifest.json")
+    absorbed_sha256 = hashlib.sha256(absorbed_manifest).hexdigest()
+    absorbed_files = {key: pair.backend.read_binary(key) for key in pair.keys(f"raw/{ALT_NAME}/")}
+    kept_manifest = pair.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json")
+    kept_sha256 = hashlib.sha256(kept_manifest).hexdigest()
+    options = dict(accept_differences=["salt"], note="GS01068 is GS01067 written another way", author="curator")
+    dry = pair.merge(dry_run=True, **options)
+    report = pair.merge(expect_hash=dry["entry"]["hash"], **options)
+    assert report["status"] == "merged" and report["kept"]["status"] == "published", report["refused"]
+    assert report["entry"]["hash"] == dry["entry"]["hash"]
+    assert report["withdrawal"]["status"] == "withdrawn"
+    assert report["database_after"]["global_hash"] == report["withdrawal"]["static"]["target_global_hash"]
+    # the dry run derived the database the merge made: the kept version first, then the withdrawal on it
+    assert report["static"]["target_global_hash"] == dry["static"]["target_global_hash"]
+    assert report["database_after"]["global_hash"] == dry["withdrawal"]["static"]["target_global_hash"]
+
+    # the website: one ID for the glycan, with the frames and the length of both simulations
+    assert pair.reader.try_sync() is None and pair.reader.fresh(pair.tmp / "fresh").try_sync() is None
+    assert OTHER_GS not in pair.reader.glycans() and GS in pair.reader.glycans()
+    assert pair.reader.global_hash == report["database_after"]["global_hash"]
+    data = pair.data()
+    assert data["archetype"]["length"] == 5.0 and data["archetype"]["salt"] == 150.0
+    assert data["archetype"]["name"] == GLYCAM_NAME
+
+    # the raw entry of the kept ID holds the frames of both, and extends the one it was
+    manifest = json.loads(pair.backend.read_binary(f"raw/{GLYCAM_NAME}/manifest.json"))
+    assert manifest["frames"] == 960 and manifest["extends"]["manifest_sha256"] == kept_sha256
+    assert manifest["merged_from"]["glycoshape_id"] == OTHER_GS and manifest["merged_from"]["manifest_sha256"] == absorbed_sha256
+    names = segment_names(made_bundle)
+    assert [s["name"] for s in manifest["segments"]] == names + [f"{OTHER_GS}/{name}" for name in names]
+    assert [s["carried_from"]["glycam_name"] for s in manifest["segments"]] == [GLYCAM_NAME] * 3 + [ALT_NAME] * 3
+    assert [s.get("merged_from", {}).get("glycoshape_id") for s in manifest["segments"]] == [None] * 3 + [OTHER_GS] * 3
+    assert pair.backend.read_binary(f"raw-history/raw/{GLYCAM_NAME}/{kept_sha256}/manifest.json") == kept_manifest
+    from lib import archive_transfer
+
+    archive_transfer.download_entry(pair.backend, "raw", GLYCAM_NAME, pair.tmp / "check")
+    assert archive.verify_entry(pair.tmp / "check" / GLYCAM_NAME, deep=True)["ok"]
+
+    # the raw entry of the absorbed ID: in the history with merged.json, gone from raw/ and from the index
+    assert pair.keys(f"raw/{ALT_NAME}/") == []
+    history = f"raw-history/raw/{ALT_NAME}/{absorbed_sha256}/"
+    for key, content in absorbed_files.items():
+        assert pair.backend.read_binary(history + key[len(f"raw/{ALT_NAME}/"):]) == content
+    merged = json.loads(pair.backend.read_binary(history + "merged.json"))
+    assert (merged["schema"], merged["from"], merged["into"]) == ("glycoshape-raw-merge", ALT_NAME, GLYCAM_NAME)
+    assert (merged["from_glycoshape_id"], merged["into_glycoshape_id"]) == (OTHER_GS, GS)
+    assert merged["manifest_sha256_from"] == absorbed_sha256
+    assert merged["manifest_sha256_into"] == hashlib.sha256(pair.backend.read_binary(
+        f"raw/{GLYCAM_NAME}/manifest.json")).hexdigest()
+    assert (merged["author"], merged["accepted_differences"]) == ("curator", ["salt"])
+    index = json.loads(pair.backend.read_binary("raw/index.json"))
+    names = {item["glycam_name"]: item for item in index["records"]}
+    assert ALT_NAME not in names and names[GLYCAM_NAME]["frames"] == 960 and index["entries"] == len(names)
+
+    # the records: withdrawn.json says where the ID went; both histories say what was done
+    withdrawn = json.loads(pair.backend.read_binary(f"{STATE}/withdrawn.json"))["withdrawn"]
+    assert withdrawn[OTHER_GS]["merged_into"] == GS and withdrawn[OTHER_GS]["glycam_name"] == ALT_NAME
+    version = versions(pair)[-1]
+    assert version["operation"] == "merge" and version["merge"]["from"] == OTHER_GS
+    assert version["merge"]["accepted_differences"] == ["salt"] and version["author"] == "curator"
+    assert version["curator_note"] == options["note"] and version["entry"]["hash"] == report["entry"]["hash"]
+    other = [json.loads(pair.backend.read_binary(key)) for key in pair.keys(f"{STATE}/history/{OTHER_GS}/")]
+    assert [item["action"] for item in other if item.get("merged_into") == GS] == ["withdraw"]
+    status = entry_publish.status(pair.target, OTHER_GS)
+    assert status["entry"]["state"] == "withdrawn" and status["entry"]["withdrawn"]["merged_into"] == GS
+
+    # the same command again: nothing is left to do, and nothing is written but the lock
+    pair.client.calls.clear()
+    again = pair.merge(**options)
+    assert again["ok"] and again["status"] == "already-merged"
+    assert again["withdrawal"]["status"] == "already-withdrawn" and again["withdrawal"]["raw"]["relation"] == "moved"
+    assert {call[2] for call in pair.writes()} <= {f"{STATE}/lock.json"} | {
+        call[2] for call in pair.writes() if call[2].startswith(f"{STATE}/probe-")}
+    assert pair.merge(work="work-2", dry_run=True)["status"] == "already-merged"
+
+
+def test_an_interrupted_merge_is_continued_by_the_same_command(pair):
+    options = dict(accept_differences=["salt"])
+    stops = {"pending-cleared": 1, "merge-move:index": 1}
+
+    def checkpoint(name):
+        if stops.get(name):
+            stops[name] -= 1
+            raise RuntimeError(f"stopped at {name}")
+
+    # stopped when the kept version is published, before the absorbed ID is withdrawn
+    with pytest.raises(entry_publish.PublishEntryError):
+        pair.merge(checkpoint=checkpoint, **options)
+    assert pair.reader.try_sync() is None
+    assert OTHER_GS in pair.reader.glycans() and pair.data()["archetype"]["length"] == 5.0
+    # stopped while the raw entry of the absorbed ID was moved: copied to the history, out of the index, not deleted
+    with pytest.raises(entry_ops.OperationError):
+        pair.merge(checkpoint=checkpoint, **options)
+    assert pair.reader.try_sync() is None and OTHER_GS not in pair.reader.glycans()
+    assert pair.keys(f"raw/{ALT_NAME}/")                       # nothing is deleted before the index is written
+    report = pair.merge(checkpoint=checkpoint, **options)
+    assert report["status"] == "merged" and report["kept"]["status"] == "already-published"
+    assert report["withdrawal"]["status"] == "already-withdrawn" and pair.keys(f"raw/{ALT_NAME}/") == []
+    assert [item["action"] for item in versions(pair)] == ["publish", "merge"]
+    assert pair.merge(**options)["status"] == "already-merged"
+
+
+def test_a_merge_is_refused_for_entries_with_other_atoms(pair):
+    # two atoms of the absorbed entry's topology exchanged (its stored manifest describes the file)
+    key = f"raw/{ALT_NAME}/topology.pdb"
+    lines = pair.backend.read_binary(key).decode().splitlines(keepends=True)
+    atoms = [index for index, line in enumerate(lines) if line.startswith(("ATOM", "HETATM"))]
+    lines[atoms[5]], lines[atoms[6]] = lines[atoms[6]], lines[atoms[5]]
+    swapped = "".join(lines).encode()
+    pair.backend.write_binary(key, swapped)
+    manifest = json.loads(pair.backend.read_binary(f"raw/{ALT_NAME}/manifest.json"))
+    manifest["files"]["topology.pdb"] = {"size": len(swapped), "sha256": hashlib.sha256(swapped).hexdigest()}
+    pair.backend.write_binary(f"raw/{ALT_NAME}/manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
+    pair.client.calls.clear()
+    report = pair.merge(dry_run=True, accept_differences=["salt"])
+    assert not report["ok"] and pair.writes() == []
+    assert report["refused"][0].startswith(
+        f"the raw entries of {GS} and {OTHER_GS} cannot be merged: topology.pdb of {OTHER_GS} does not have the atoms "
+        f"of topology.pdb of {GS}: 2 of 45 atoms differ in name, residue or order; the first is atom 6: ")
+    with pytest.raises(Refused):
+        pair.merge(work="work-2", accept_differences=["salt"])
+    assert OTHER_GS in [key.split("/")[1] for key in pair.keys("static/GS")]
+
+
+def test_a_merge_is_refused_for_two_glycans_the_same_id_and_an_id_that_is_not_published(pair, made_bundle):
+    report = pair.merge(kept=GS, absorbed=GS, dry_run=True)
+    assert not report["ok"] and report["refused"] == [f"{GS} cannot be merged into itself: name two IDs"]
+    report = pair.merge(absorbed="GS09999", work="w2", dry_run=True)
+    assert report["refused"] == ["GS09999 is not published"]
+    report = pair.merge(kept="GS09999", work="w3", dry_run=True)
+    assert report["refused"] == ["GS09999 is not published"]
+    report = pair.merge(work="w4", dry_run=True, accept_differences=["colour"])
+    assert report["refused"][0].startswith("--accept-difference colour: the fields that are compared are package")
+    # another glycan
+    publish_second(pair.target, made_bundle, pair.tmp, glycan_id="GS01069", name="DGlcpa1-2DManpa1-OH", salt=150.0)
+    report = pair.merge(absorbed="GS01069", work="w5", dry_run=True)
+    assert report["refused"][0] == f"{GS} and GS01069 are not the same glycan: their archetype WURCS differ"
+    assert report["refused"][1].startswith(f"{GS} and GS01069 have other GlyTouCan accessions")
+    # an ID that was withdrawn (and not into this one)
+    entry_publish.withdraw_entry("GS01069", pair.target, pair.tmp / "withdraw", log=quiet)
+    report = pair.merge(absorbed="GS01069", work="w6", dry_run=True)
+    assert report["refused"] == ["GS01069 is not published (it was withdrawn)"]
+    assert [item["action"] for item in versions(pair)] == ["publish"]
+
+
+def test_the_command_line_of_a_merge(pair, monkeypatch, tmp_path, capsys):
+    report = tmp_path / "report.json"
+    common = ["merge", "--id", GS, "--from", OTHER_GS, "--work-dir", str(tmp_path / "w"), "--analysis-workers", "2",
+              "--report", str(report)]
+    assert _cli(pair, monkeypatch, common + ["--dry-run"]) == 2
+    assert "--accept-difference salt" in json.loads(report.read_text())["refused"][0]
+    capsys.readouterr()
+    assert _cli(pair, monkeypatch, common + ["--dry-run", "--accept-difference", "salt", "--note", "one glycan"]) == 0
+    written = json.loads(report.read_text())
+    out = capsys.readouterr().out
+    assert f"merge: {OTHER_GS} ({ALT_NAME}) into {GS}; frames 480 + 480 = 960; 6 segment(s)" in out
+    assert f"  salt: {GS} 150.0, {OTHER_GS} 200.0 (accepted: the value of {GS} stands)" in out
+    assert f"withdraw {OTHER_GS} (merged into {GS}): planned" in out
+    assert f"raw raw/{ALT_NAME}/ -> raw-history/raw/{ALT_NAME}/" in out
+    assert "dry run: nothing was written to the storage; planned" in out
+    assert _cli(pair, monkeypatch, common + ["--accept-difference", "salt", "--note", "one glycan",
+                                             "--expect-hash", written["entry"]["hash"]]) == 0
+    assert f"merge: merged {OTHER_GS} into {GS}" in capsys.readouterr().out
+    assert json.loads(report.read_text())["status"] == "merged"
+    assert pair.reader.try_sync() is None and OTHER_GS not in pair.reader.glycans()
+
+
+# ---------------------------------------------------------------------------
 # The command line
 # ---------------------------------------------------------------------------
 def _cli(world, monkeypatch, argv):
@@ -478,4 +751,33 @@ def test_a_rename_on_a_real_server(s3_bucket, made_bundle, tmp_path, monkeypatch
     assert (moved["size"], moved["sha256"]) == (trajectory["size"], trajectory["sha256"])
     assert reader.try_sync() is None and reader.fresh(tmp_path / "fresh").try_sync() is None
     assert json.loads((reader.folder / GS / "data.json").read_text())["archetype"]["name"] == NEW_NAME
+    assert [item["key"] for item in backend.list_objects("publish-state/static/lock")] == []
+
+
+def test_a_merge_on_a_real_server(s3_bucket, made_bundle, tmp_path, monkeypatch):
+    backend, client, bucket = s3_bucket
+    fake_services.install(monkeypatch)
+    one_glycan(monkeypatch)
+    publish_world.build(tmp_path / "published", backend, raw_source=publish_world.other_archive(tmp_path / "stored"))
+    target = Target(static=backend, raw=backend, workers=4)
+    assert entry_publish.publish_entry("publish", made_bundle, submission_record(GS, GLYCAM_NAME), target,
+                                       work_dir=tmp_path / "w1", log=quiet)["status"] == "published"
+    publish_second(target, made_bundle, tmp_path)
+    absorbed = {item["key"]: backend.head(item["key"]) for item in backend.list_objects(f"raw/{ALT_NAME}/")}
+    options = dict(accept_differences=["salt"], workers=2, log=quiet)
+    dry = entry_ops.merge(GS, OTHER_GS, target, tmp_path / "w2", dry_run=True, **options)
+    report = entry_ops.merge(GS, OTHER_GS, target, tmp_path / "w2", expect_hash=dry["entry"]["hash"], **options)
+    assert report["status"] == "merged" and report["database_after"] == {
+        "global_hash": dry["withdrawal"]["static"]["target_global_hash"]}
+    # the absorbed raw entry was copied inside the storage to the history, then deleted
+    assert not list(backend.list_objects(f"raw/{ALT_NAME}/"))
+    history = f"raw-history/raw/{ALT_NAME}/{report['merge']['absorbed_manifest_sha256']}/"
+    for key, head in absorbed.items():
+        moved = backend.head(history + key.rsplit("/", 1)[1])
+        assert (moved["size"], moved["sha256"]) == (head["size"], head["sha256"])
+    assert backend.head(history + "merged.json") is not None
+    reader = Reader(backend, tmp_path / "website")
+    assert reader.try_sync() is None and OTHER_GS not in reader.glycans()
+    assert json.loads((reader.folder / GS / "data.json").read_text())["archetype"]["length"] == 5.0
+    assert entry_ops.merge(GS, OTHER_GS, target, tmp_path / "w3", workers=2, log=quiet)["status"] == "already-merged"
     assert [item["key"] for item in backend.list_objects("publish-state/static/lock")] == []

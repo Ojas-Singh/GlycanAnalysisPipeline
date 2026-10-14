@@ -64,7 +64,11 @@ recovered as the evidence audit of the thesis recovered them
 ``none``      not determinable: the entry is one replica of unknown composition.
 
 The stored entry inside an extended entry (the segment with ``carried_from``
-and no segment of its own) is divided the same way from its own ``source``.
+and no segment of its own) is divided the same way from its own ``source``;
+its runs are ``stored_run_1``, ...  In an entry merged from two
+(``lib.archive_segments.merge_entries``) the absorbed entry of one
+``simulation.pdb`` is such a segment too, named by its GlycoShape ID, and
+its runs are ``GS00453/run_1``, ...
 
 Verdict (:func:`verdict`)
 -------------------------
@@ -512,8 +516,11 @@ def replica_boundaries(manifest: Optional[Mapping[str, Any]], frames: Optional[i
         tpf = float(tpf) if isinstance(tpf, (int, float)) and not isinstance(tpf, bool) and tpf > 0 else None
         carried = segment.get("carried_from") if isinstance(segment.get("carried_from"), dict) else None
         if carried is not None and carried.get("segment") is None and isinstance(segment.get("source"), dict):
-            # the stored entry of an extension, itself one simulation.pdb: its runs as its source recorded them
-            block, evidence = _divide_block(segment["source"], size, first, "stored_run_",
+            # the stored entry of an extension, itself one simulation.pdb: its runs as its source recorded them;
+            # those of the absorbed entry of a merge are named after its segment (GS00453/run_1)
+            merged = isinstance(segment.get("merged_from"), dict)
+            block, evidence = _divide_block(segment["source"], size, first,
+                                            f"{segment.get('name')}/run_" if merged else "stored_run_",
                                             tpf if tpf is not None else time_per_frame_ps,
                                             "segment" if tpf is not None else hint_from,
                                             parameters, divisions, segment=index)
