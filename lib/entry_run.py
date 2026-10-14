@@ -14,7 +14,9 @@ result folder::
       input/               manifest.json, info.json, name.json of the entry (small files only)
       process/<folder>/    the processed data, laid out as process/<glycan>/ of the pipeline
       static/              the files of static/GSxxxxx/ that need no identifier and no network
-                           (lib/static_ready.py)
+                           (lib/static_ready.py), and output/replicas.json: how well the
+                           replicas of the entry agree (lib/replicas.py), which publishing
+                           keeps for the administrators or publishes with the entry
 
 Nothing here talks to PocketBase, GlyTouCan, the format services or object
 storage, and nothing needs the GlycoShape ID: identifiers, metadata and upload
@@ -354,6 +356,35 @@ def _analysis_summary(process_dir: Path) -> Dict[str, Any]:
     }
 
 
+def write_replicas(entry_dir: Path, input_info: Dict[str, Any], process_dir: Path, static_dir: Path,
+                   glycam_name: str) -> Optional[str]:
+    """``static/output/replicas.json``: how well the replicas of the entry agree (``lib/replicas.py``).
+
+    The replicas are those of the manifest of an archive entry (its segments, or the runs its source
+    recorded); a ``simulation.pdb`` folder has no record of them.  Diagnostics never stop a run: a
+    problem is returned as a warning and the file is not written.
+    """
+    from lib import archive, replicas
+
+    try:
+        manifest = archive.load_manifest(entry_dir) if input_info.get("kind") == "archive" else None
+        quality = json.loads((process_dir / "data" / "frame_filter.json").read_text(encoding="utf-8"))
+        frames = int(manifest["frames"]) if manifest is not None else int(quality["source_frames"])
+        document = replicas.diagnose_result(process_dir, manifest, frames, glycam_name=glycam_name)
+        replicas.write(document, static_dir / replicas.STATIC_PATH)
+        verdict = document["verdict"]
+        logger.info("replicas: %d (%s), verdict %s%s", document["boundaries"]["replicas"],
+                    document["boundaries"]["basis"], verdict["value"],
+                    "".join(f"; {reason['text']}" for reason in verdict["reasons"]))
+        return None
+    except Exception as exc:
+        logger.warning("replica diagnostics were not written: %s: %s", type(exc).__name__, exc, exc_info=True)
+        partial = static_dir / replicas.STATIC_PATH
+        if partial.exists():
+            partial.unlink()
+        return f"replica diagnostics were not written ({type(exc).__name__}: {exc})"
+
+
 def _configure_logging(log_path: Path, verbose: bool):
     """Log to OUTPUT/run.log and to stderr; returns a function that undoes it."""
     root = logging.getLogger()
@@ -548,6 +579,13 @@ def run_entry(
         missing += [name for name in ("output/info.json", "output/pca.csv") if not (static_dir / name).is_file()]
         if missing:
             raise RuntimeError("static-ready files were not written: " + ", ".join(missing))
+
+        failed_step = "replicas"
+        step_started = time.perf_counter()
+        problem = write_replicas(entry_dir, input_info, process_dir, static_dir, glycam_name)
+        if problem:
+            result["warnings"].append(problem)
+        timings["replicas"] = round(time.perf_counter() - step_started, 3)
 
         failed_step = "result"
         step_started = time.perf_counter()

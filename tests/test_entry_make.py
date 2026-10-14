@@ -166,7 +166,13 @@ def test_bundle_of_the_replicas_is_the_entry_and_the_analysis_of_the_whole_traje
                 for path in (tmp_path / "result" / "static").rglob("*") if path.is_file()}
     assert sorted(static) == sorted(expected)
     different = [name for name in static if static[name] != expected[name]]
-    assert all(name.endswith("dist.svg") for name in different), different     # the figures carry ids of their run
+    # the figures carry ids of their run; the replica diagnostics know the replicas from the segments
+    assert all(name.endswith("dist.svg") or name == "output/replicas.json" for name in different), different
+    replicas_doc = json.loads(static["output/replicas.json"])
+    assert replicas_doc["boundaries"]["basis"] == "recorded" and replicas_doc["boundaries"]["recorded_by"] == "segments"
+    assert [(r["name"], r["first_frame"], r["frames"], r["segment"]) for r in replicas_doc["replicas"]] == [
+        (REPLICA_NAMES[0], 0, 200, 0), (REPLICA_NAMES[1], 200, 130, 1), (REPLICA_NAMES[2], 330, 150, 2)]
+    assert replicas_doc["verdict"]["value"] in ("ok", "more_sampling_suggested", "more_sampling_needed", "not_assessable")
     bundled = json.loads(members["result.json"])
     assert bundled["analysis"] == result["analysis"] and bundled["frame_quality"] == result["frame_quality"]
     assert bundled["frame_quality"]["retained_frames"] == 478 and bundled["input"]["kind"] == "archive"
@@ -494,7 +500,15 @@ def test_extending_a_stored_entry_gives_the_bundle_of_the_union(run, tmp_path, c
     assert members["archive/trajectory.xtc"] == union["archive/trajectory.xtc"]
     assert members["archive/topology.pdb"] == union["archive/topology.pdb"]
     different = [name for name in union if name.startswith("static/") and members[name] != union[name]]
-    assert all(name.endswith("dist.svg") for name in different), different
+    assert all(name.endswith("dist.svg") or name == "static/output/replicas.json" for name in different), different
+    # the same replicas and measures; only their names and recorded times differ
+    extended_doc = json.loads(members["static/output/replicas.json"])
+    union_doc = json.loads(union["static/output/replicas.json"])
+    span = lambda doc: [(r["first_frame"], r["frames"], r["retained"], r["population"]) for r in doc["replicas"]]
+    assert span(extended_doc) == span(union_doc)
+    for key in ("frames", "clusters", "between", "halves", "floor", "linkages", "landscape", "torsion_histograms"):
+        assert extended_doc[key] == union_doc[key], key
+    assert extended_doc["verdict"]["value"] == union_doc["verdict"]["value"]
     assert json.loads(members["result.json"])["analysis"] == json.loads(union["result.json"])["analysis"]
 
     # another glycan's replica is refused, and says what differs

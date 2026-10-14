@@ -16,6 +16,7 @@ GAP takes the trajectories of one glycan (all its simulations, dry) and produces
 | Whole-database runs | The same analysis over a data directory, then the static folder with identifiers and metadata | Login node and Slurm array | [Running](#running-), [Staged Oracle/Slurm workflow](#staged-oracleslurm-workflow) |
 | Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
 | Publishing one entry | The bundle of one analysed entry becomes `static/GSxxxxx/` and `raw/<GLYCAM name>/`; the root files and `sync_manifest.json` follow from the stored ones. Also: replace, withdraw | The server that approves entries; S3-compatible storage | [One entry: `scripts/publish_entry.py`](#one-entry-scriptspublish_entrypy) |
+| Replica diagnostics | How well the independent simulations of an entry agree, and whether it needs more sampling: `replicas.json` per entry, from the analysis or, for a published entry, from its stored tables | With the analysis of an entry; `scripts/replica_diagnostics.py` for the published ones | [Replica diagnostics](#replica-diagnostics) |
 
 Level 3 (a coverage set of up to 512 structures) is no longer produced by default; `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3` brings it back, and folders that still contain it are accepted.
 
@@ -346,6 +347,8 @@ The result folder is self-contained:
     output/pca.csv, torsion_glycosidic.csv, torsion_all.csv, torsion_level_1_reps.csv, torsion_level_2_reps.csv
     output/level_1/, level_2/     dist.svg, GLYCAM/alpha.pdb, GLYCAM/beta.pdb, PDB/alpha.pdb, PDB/beta.pdb
     landscape/pca_model.joblib, landscape_metadata.json, preprocessing.npz
+    output/replicas.json          how well the replicas of the entry agree (Replica diagnostics, below); kept
+                                  for the administrators when the entry is published, or published with it
 ```
 
 `result.json` has status `running` while the run is in progress, so a job that
@@ -436,7 +439,7 @@ bundle.json     schema "glycoshape-entry-bundle", schema_version 1, glycam_name,
                 files {path: {size, sha256}} for every other member, source {...}, extends
 archive/        trajectory.xtc, topology.pdb, structure.mol2, manifest.json, info.json, name.json: the archive
                 entry (in a bundle its folder is "archive", not the folder its manifest names)
-static/         output/..., landscape/...: the static-ready files of run_entry.py
+static/         output/..., landscape/...: the static-ready files of run_entry.py (with output/replicas.json)
 result.json     as run_entry.py writes it
 run.log
 ```
@@ -485,6 +488,106 @@ Measured on a 20-core ARM machine with the replicas on a local disk: the whole c
 Sixteen workers were not faster than eight there. Of the 91 s of the largest, 6 s are the conversion (four replicas in four processes), 84 s the analysis (clustering 37 s, PCA 18 s, figures 14 s) and 1 s the bundle with reading it back. The memory is that of the analysis ([One entry on a compute node](#one-entry-on-a-compute-node)): one matrix of 8 bytes x retained frames x atom pairs. Extending a stored entry of 120,012 frames with 5,000 new ones took 64 s and 14.4 GiB with 8 workers (346 MB bundle).
 
 `requirements-node.txt` is the part of `requirements.txt` that the node command loads: 13 packages, 36 with what they depend on, 0.87 GB installed (the environment of `requirements.txt` with the test tools is 1.3 GB). The command fails without any one of the 13. Importing everything it loads takes 0.8 s and 0.28 GB; on a trajectory of 480 frames the whole command takes 2 to 4 s and 0.35 GB. `lib/entry_bundle.py`, the receiving side, imports the standard library only.
+
+## Replica diagnostics
+
+An entry is made of independent simulations (replicas, runs), analysed together. `lib/replicas.py` compares them with one another on what the analysis already has, without the trajectory: the Level 1 cluster, the first two principal components and the glycosidic torsions of every retained frame. It says, for every entry, how well its replicas agree and whether it needs more sampling, so that the administrators can decide to simulate more replicas, to extend the runs, or to leave the entry as it is. The result is `replicas.json`.
+
+The measurements are those of the sampling-robustness analysis of the thesis (section "How reproducible the sampling is" of the GlycoShape chapter; `figures/GlycoShape/scripts/robustness_data.py` of the thesis repository), with the same definitions, grids and thresholds. On the published database they reproduce the thesis for every one of its 969 entries with runs (530 recorded, 413 assumed, 26 single): the runs, every measure of an entry and every measure of a linkage, to the digits the thesis tabulated.
+
+**What is measured** (all on the retained frames, the rows of `pca.csv` and `torsion_glycosidic.csv`):
+
+| | |
+|---|---|
+| per replica | frames, retained frames, time per frame and simulated time; Level 1 population (fraction of its frames in each cluster); the Level 1 clusters that hold at least 10% of the pooled frames and less than 1% of its own; rotamer occupancy (thirds of the circle around 60°, 180° and −60°; gg, gt, tg for ω of a 1–6 or 2–6 linkage) and rotamer transitions of every glycosidic torsion; TV and overlap between its two halves; the rank of the jump into its first frame (below) |
+| between replicas | over all pairs of full-length replicas, the mean and the largest: total variation distance (TV) of the populations, 0.5 Σ\|p − q\|, the share of frames that would have to change cluster; overlap of the (PC1, PC2) distributions, Σ min(P, Q) on a 25 × 25 grid over the 0.5th to 99.5th percentile of the frames of the entry; Jensen–Shannon divergence (base 2) of every glycosidic torsion, 36 bins of 10°, and of every linkage (its largest torsion); the standard error of each pooled population |
+| halves | first against second half of one replica (within) and first half of one against second half of another (across): the same amount of data either way |
+| floor | the same between-replica measures after the frames were dealt at random to the replicas: what uncorrelated frames of one distribution give for this many frames, against which a disagreement is read. One deal, seeded with the number of the GlycoShape ID as in the thesis; on the node, before an entry has an ID, with its GLYCAM name, so that the two differ by the noise of the deal (for GS00877 a TV of 0.006 against 0.0096) |
+
+A replica is *full-length* when it has at least 95% of the length of the longest replica of the entry (in frames; in simulated time when every replica records its time per frame) and at least a quarter of its frames passed the frame-quality filter. Only full-length replicas are compared with one another; every replica is described on its own. Transitions are counted between the cores of the rotamers (within 40° of the staggered positions), so that fluctuation across a border does not count.
+
+**Which frames belong to which replica.** An entry made by `make_entry.py` lists its replicas as `segments` in its manifest. An entry converted from one `simulation.pdb` has none, and its runs are recovered as the evidence audit of the thesis recovered them; `boundaries.basis` of `replicas.json` says which applies, and the verdict depends on it:
+
+| Basis | When | Entries of the database |
+|---|---|---|
+| `recorded` | segments of the manifest; or an `END`/`CRYST1` record stands between two frames of the source (`records`: one file per run, joined); or the MODEL numbers restart at 1 and the frames are restarts × largest number (`model_numbers`) | 530 (497 `records`, 33 `model_numbers`) |
+| `single` | one block of 10,001 frames with an unbroken MODEL count: one run of the recipe | 26 |
+| `assumed` | no record; cut into equal runs where the class test of the thesis supports that division for all entries of that frame count together (`lib.replicas.ASSUMED_DIVISIONS`: 30,003 → 3 × 10,001, 40,004 → 4, 50,005 → 5, 60,006 → 6, 80,008 → 8; 30,000 → 3 × 10,000, 40,000 → 4, 90,000 → 9; 45,000 → 9 × 5,000; 9,000 → 9 × 1,000; 8,000 → 8 × 1,000). Supported for the class, not for the single entry | 413 |
+| `none` | not determinable: the entry is one replica of unknown composition | 32 |
+
+The class test ranks the change from frame b−1 to frame b (root mean square over the glycosidic torsions of the chord 2 sin(Δ/2)) among all such changes of an entry: at a run boundary the glycan jumps from the end of one simulation to the start of another and the rank is high. `boundary_rank` of every replica after the first is that rank at its first frame, the evidence for the single entry (0.86 in the mean at the 1,374 recorded boundaries of the database, above 0.99 at 55% of them; for glycans of one or two residues it is often unremarkable). `scripts/replica_diagnostics.py --check-divisions` runs the class test again over a collection and compares it with the table. The stored part of an extended entry (a segment with `carried_from` and no segment of its own) is divided the same way, from its own `source`.
+
+**Verdict.** `verdict.value` is one of
+
+| Value | When |
+|---|---|
+| `ok` | two or more full-length replicas, and none of the reasons below |
+| `more_sampling_suggested` | at least one reason |
+| `more_sampling_needed` | the first three reasons at once: the rule by which the thesis lists the first candidates for more sampling |
+| `not_assessable` | fewer than two full-length replicas (`too_few_replicas`), or replicas that cannot be told apart (`replicas_unknown`) |
+
+with `reasons`, each with its code, the measured value and threshold, and a sentence for a person (which cluster, which replica, which linkage):
+
+| Reason | Default threshold (`lib.replicas.Parameters`) | From |
+|---|---|---|
+| `population_tv` | mean TV between replicas ≥ 0.5 (`population_tv`) | thesis, criterion 1 of the candidates for more sampling (31 of the 474 eligible glycans) |
+| `cluster_missing` | a Level 1 cluster with ≥ 10% of the pooled frames has < 1% of the frames of a replica (`cluster_pooled_min`, `cluster_replica_max`) | thesis, criterion 2 (98 of 474) |
+| `rotamer_missing` | a torsion of a linkage has a rotamer with ≥ 25% of the frames of one replica and ≤ 2.5% of another (`rotamer_present_min`, `rotamer_absent_max`) | thesis, criterion 3 (105 of 474) |
+| `omega_never_changes` | the ω of a 1–6 (or α2–6) linkage changes rotamer fewer than once in a full-length replica (`omega_min_transitions`, `omega_classes`): that replica reports only the rotamer it started in | thesis: 30 of the 1,708 runs of a 1–6 linkage never change |
+
+The thresholds apply to the values as the file shows them (four decimals), as in the thesis. Stereocentres are not looked at: the thesis left out three entries whose runs differ in the configuration of an anomeric carbon (G04196SD, G71956IS, G97921YP), which needs the trajectory.
+
+**The file.** `replicas.json` (schema `glycoshape-replica-diagnostics`, version 1; compact JSON, 10 to 130 KB, median 33 KB) is a function of the entry and the parameters only: no time stamp, the same analysis gives the same bytes. Its keys:
+
+```
+schema, schema_version, glycam_name, glycoshape_id (null before publishing), generator, parameters
+frames        trajectory, retained, unassigned
+boundaries    basis, recorded_by, replicas, full_length_replicas, full_length_by, evidence
+replicas[]    index, name, first_frame, frames, retained, basis, recorded_by, segment, time_per_frame_ps,
+              time_from, simulated_ns, full_length, population[cluster id], clusters_missing, boundary_rank, halves
+clusters      ids, pooled, by_population, pooled_over
+between       replicas, pairs[] {replicas, population_tv, overlap}, population_tv_mean/max, population_absdiff_max,
+              population_se[], population_se_max, top_cluster_same, overlap_mean/min, linkage_jsd_max(_label), linkage_jsd_median
+halves        population_tv_within/across, overlap_within/across
+floor         population_tv, overlap, seed
+linkages[]    donor, acceptor, label, class, subclass, positions, jsd, jsd_torsion, jsd_floor, jsd_within, jsd_across,
+              rotamer_absdiff, rotamer_missing, torsions {phi|psi|omega: name, jsd, jsd_max, jsd_floor, jsd_within,
+              jsd_across, rotamer_absdiff, rotamers[replica][3], transitions[replica], rotamer_names (gg, gt, tg)}
+torsion_histograms   bins, from_degrees, torsions[] {name, counts[replica][36]}: the torsions whose replicas agree least
+verdict       value, reasons[], criteria, thresholds
+landscape     pc1_range, pc2_range, grid, sigma_cells, mass; pooled[] {mass, lines}; replicas[] {replica, frames_outside,
+              lines}; overlap_grid {size, pc1, pc2, replicas[] {replica, cells, counts}}
+```
+
+`landscape` is what a web page needs to draw the overlap panel of the thesis without the trajectory: the outline that encloses 80% of the frames of every replica and the pooled landscape at 60, 85 and 97% (64 × 64 grid one fifth wider than the overlap grid, Gaussian smoothing of 1.3 cells), each as polylines `[x0, y0, x1, y1, ...]` in PC units; and the counts of the 25 × 25 overlap grid per replica (cell = PC1 bin × 25 + PC2 bin, frames outside the range in the edge cells), from which the overlap of any two replicas can be recomputed.
+
+**Where it is written.** `run_entry.py` (and so `make_entry.py`) writes it into the static-ready folder of its result as `static/output/replicas.json`, after the static-ready files and before `result.json` lists them, so that it travels in the bundle without a change to the bundle format (a receiver of the earlier version reports it as a file it does not publish). A problem with the diagnostics never stops a run: it is a warning of `result.json`, and the file is missing. A `simulation.pdb` folder has no record of its runs, so its replicas are `none`. The static stage of `main.py` does not write it.
+
+Whether it becomes part of the published entry is one setting, `GLYCOSHAPE_REPLICAS_PUBLIC`:
+
+- *off* (the default): administrators only. `publish_entry.py` keeps it, after the entry is published, at `publish-state/<static prefix>/replicas/GSxxxxx.json` in the database bucket, outside the published prefix (no reader of `static/` looks there; the report says `replicas.placement: "admin"` and the key; a copy with the same bytes is left alone). It is not in `static/GSxxxxx/`, `sync_manifest.json`, `GSxxxxx.zip` or `GlycoShape.zip`, and stays when an entry is withdrawn, as the raw entry does. It is written after the switch: a run that stops there has published the entry and says so, and the same command writes the copy; a replacement that `recover` completes (it has no bundle) keeps the earlier copy until the same `replace` is run again.
+- *on*: published with the entry as `static/GSxxxxx/output/replicas.json` (`lib.static_ready.copy_static_ready` copies it); the website synchronises it like any other file. It is not part of `GSxxxxx.zip`, which holds the structures.
+
+**Published entries: `scripts/replica_diagnostics.py`.** For entries that are published already, the file is computed from the static database and the raw archive, without clustering again (the Level 1 labels are those of the stored entry; the time per frame of replicas that do not record it follows from the simulation length of `data.json`):
+
+```bash
+.venv/bin/python scripts/replica_diagnostics.py --static-dir static --archive-dir archive --out replicas \
+    [--glycan GS00760 ...] [--workers 16] [--check-divisions]
+```
+
+It writes `<out>/GSxxxxx.json` (the content of `replicas.json`) and `<out>/summary.json`: one line per entry (verdict, reasons, basis, main numbers), the counts by verdict and basis, the archive entries without a published entry, failures and, with `--check-divisions`, the class test against `ASSUMED_DIVISIONS`. Both folders are only read.
+
+Over the published database (1,001 entries; the archive has three more that are not published) it took 19 to 21 s with 16 workers on the 20-core ARM machine, at most 0.6 GB per process, 36 MB written; the class test found exactly the divisions of the table. Verdicts:
+
+| Basis | `ok` | `more_sampling_suggested` | `more_sampling_needed` | `not_assessable` |
+|---|---|---|---|---|
+| recorded (530) | 348 | 156 | 25 | 1 |
+| assumed (413) | 231 | 152 | 30 | 0 |
+| single (26) | | | | 26 |
+| none (32) | | | | 32 |
+| all (1,001) | 579 | 308 | 55 | 59 |
+
+All 19 glycans of the thesis' list of candidates for more sampling are `more_sampling_needed`; the 36 others with that verdict are 30 with assumed runs, five whose frames the filter thinned and one without a GlyTouCan accession, which the thesis left out of that list. Among the reasons, `rotamer_missing` holds for 286 entries, `cluster_missing` for 234, `population_tv` for 73 and `omega_never_changes` for 64 (all of them 1–6 linkages; no α2–6 ω stays in one rotamer).
 
 ## Raw trajectory archive
 
@@ -690,7 +793,7 @@ Inside a group the order is free, so an interruption leaves any subset of the gr
 
 **Replace.** Files that did not change are not sent. A bundle whose `extends` names the stored raw manifest replaces the raw entry in place: the previous trajectory is dropped, since the new one holds its frames, and the previous `manifest.json` is kept under `raw-history/raw/<GLYCAM name>/<its SHA-256>/` (the record of what the earlier publication was computed from). A raw entry that the bundle does not extend is replaced only with `--overwrite-raw`, and then all of its files are copied to the history prefix first (`--keep-previous-raw`).
 
-**Several environments in one bucket.** Everything a publication writes outside the two published prefixes is kept under the prefix it belongs to: `publish-state/<static prefix>/` (`lock.json`, `pending.json`, `withdrawn.json`, `entries/GSxxxxx.json`) and `publish-staging/<static prefix>/<SHA-256>` in the database bucket, `raw-history/<raw prefix>/<GLYCAM name>/<SHA-256>/` in the archive bucket. A trial with `--static-prefix trial/static --raw-prefix trial/raw` therefore shares no key with the database under `static/` and the archive under `raw/`, takes another lock, and leaves the history of the real archive (`raw-history/raw/`) alone. The rule has no exception for the default prefixes, so the listing of `raw-history/raw/` holds the history of `raw/` and of nothing else. Two conditions: the prefixes of two environments must not lie inside each other (`static` and `static/trial`), and two databases must not be published over one raw prefix, because the lock belongs to the database and the raw entries and `index.json` would be written under two locks.
+**Several environments in one bucket.** Everything a publication writes outside the two published prefixes is kept under the prefix it belongs to: `publish-state/<static prefix>/` (`lock.json`, `pending.json`, `withdrawn.json`, `entries/GSxxxxx.json`, `replicas/GSxxxxx.json`) and `publish-staging/<static prefix>/<SHA-256>` in the database bucket, `raw-history/<raw prefix>/<GLYCAM name>/<SHA-256>/` in the archive bucket. A trial with `--static-prefix trial/static --raw-prefix trial/raw` therefore shares no key with the database under `static/` and the archive under `raw/`, takes another lock, and leaves the history of the real archive (`raw-history/raw/`) alone. The rule has no exception for the default prefixes, so the listing of `raw-history/raw/` holds the history of `raw/` and of nothing else. Two conditions: the prefixes of two environments must not lie inside each other (`static` and `static/trial`), and two databases must not be published over one raw prefix, because the lock belongs to the database and the raw entries and `index.json` would be written under two locks.
 
 **Withdraw** publishes a manifest without the entry first, then deletes `static/GSxxxxx/`. The raw entry stays. The ID is recorded in `publish-state/static/withdrawn.json`: it can come back for the same glycan and is refused for any other.
 

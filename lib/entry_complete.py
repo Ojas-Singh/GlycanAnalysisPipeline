@@ -665,7 +665,7 @@ def complete_entry(
     written.  One completion at a time per process.
     """
     import lib.config as config
-    from lib import glystatic, lookups, static_levels
+    from lib import glystatic, lookups, replicas, static_levels
     from lib.glybake import GlycoShapeBaker
     from lib.glymeta import GlycanMetadataProcessor
     from lib.storage import local_storage
@@ -750,6 +750,8 @@ def complete_entry(
         problems.append("the archetype has neither a WURCS nor a GlyTouCan accession "
                         "(the static stage of main.py calls such a folder incomplete)")
     used = {f"static/{name}" for name in files}
+    if not replicas.public_placement():
+        used.add(f"static/{replicas.STATIC_PATH}")      # kept by the publisher for the administrators
     ignored = sorted(relative[len("static/"):] for relative in bundle.files
                      if relative.startswith("static/") and relative not in used)
     if ignored:
