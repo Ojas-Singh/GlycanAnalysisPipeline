@@ -10,13 +10,19 @@ from __future__ import annotations
 import lib.config as config
 from lib.storage import get_storage_manager
 
-from typing import Optional
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import io
 import numpy as np
 import polars as pl
 import joblib  # type: ignore
 from joblib import Parallel, delayed
+
+logger = logging.getLogger(__name__)
+
+# Seed of the randomized SVD that scikit-learn's PCA chooses for most landscapes.
+PCA_RANDOM_STATE = 0
 
 try:
 	from lib.torsion import circular_stats
@@ -32,15 +38,11 @@ except Exception:  # pragma: no cover - fallback if sklearn missing
 
 # Optional clustering / KDE dependencies. If missing, clustering functions will raise
 try:
-	from typing import List, Dict, Tuple, Any
-	import logging
 	from sklearn.neighbors import KernelDensity
 	from sklearn.model_selection import GridSearchCV
 	from sklearn.preprocessing import StandardScaler
 	from scipy.optimize import minimize
-	import matplotlib.pyplot as _plt
 	_HAS_CLUSTERING = True
-	logger = logging.getLogger(__name__)
 
 except Exception:
 	_HAS_CLUSTERING = False
@@ -55,6 +57,12 @@ except Exception:
 	linkage = None  # type: ignore
 	fcluster = None  # type: ignore
 	dendrogram = None  # type: ignore
+
+# matplotlib is not used here; that it is missing must not switch off the
+# representatives above (it did, and then failed on an undefined logger).
+try:  # pragma: no cover - optional dependency handling
+	import matplotlib.pyplot as _plt
+except Exception:  # pragma: no cover
 	_plt = None  # type: ignore
 
 # Optional imports for entropy estimation (lightweight fallbacks provided if missing)
@@ -227,7 +235,7 @@ def pca_conformation_landscape(
 		X_proc /= std
 
 	if use_sklearn and _HAS_SKLEARN:
-		pca = _SkPCA(n_components=n_components, svd_solver="auto")
+		pca = _SkPCA(n_components=n_components, svd_solver="auto", random_state=PCA_RANDOM_STATE)
 		scores = pca.fit_transform(X_proc)
 		evr = pca.explained_variance_ratio_
 	else:
@@ -544,21 +552,37 @@ def _nearest_center_labels(
 	return labels
 
 
+def kcenter_first_center(data_scaled: np.ndarray) -> int:
+	"""Index of the first k-center: the point nearest the centroid of the (standardised) data.
+
+	It is a function of the data alone, so the same trajectory always gives the
+	same centers, and two trajectories of the same length do not start from
+	the same frame index (as they did when it was a seeded random index).  On a
+	tie the lowest index.
+	"""
+	centroid = np.mean(data_scaled, axis=0)
+	return int(np.argmin(np.linalg.norm(data_scaled - centroid, axis=1)))
+
+
 def kcenter_coverage_clustering(
 	data: np.ndarray,
 	max_clusters: int = 128,
 	coverage_threshold: float = 0.95,
 	min_coverage_improvement: float = 0.01,
-	seed: int = 42
 ) -> tuple[np.ndarray, int]:
 	"""Coverage-based farthest-point (k-center) clustering procedure.
-	
+
 	This algorithm iteratively selects cluster centers that maximize coverage of the
 	data space, using a greedy farthest-point strategy. It stops when either:
 	1. Maximum number of clusters is reached
-	2. Coverage threshold is achieved  
+	2. Coverage threshold is achieved
 	3. Coverage improvement becomes negligible
-	
+
+	The first center is the most central point (:func:`kcenter_first_center`),
+	every further one the point farthest from the centers chosen so far (the
+	lowest index on a tie), so the result is deterministic and draws nothing
+	from a random generator.
+
 	Parameters
 	----------
 	data : np.ndarray
@@ -569,9 +593,7 @@ def kcenter_coverage_clustering(
 		Stop when this fraction of points are within reasonable distance of centers
 	min_coverage_improvement : float, default 0.01
 		Stop when adding a new center improves coverage by less than this amount
-	seed : int, default 42
-		Random seed for reproducible center selection
-		
+
 	Returns
 	-------
 	labels : np.ndarray
@@ -579,7 +601,6 @@ def kcenter_coverage_clustering(
 	n_clusters : int
 		Number of clusters found
 	"""
-	np.random.seed(seed)
 	n_samples, n_features = data.shape
 	
 	if n_samples <= max_clusters:
@@ -595,14 +616,14 @@ def kcenter_coverage_clustering(
 		# Simple standardization if sklearn not available
 		data_scaled = (data - np.mean(data, axis=0)) / np.std(data, axis=0)
 	
-	# Initialize with random first center
+	# Initialize with the most central point
 	centers = []
 	center_indices = []
-	first_idx = np.random.randint(0, n_samples)
+	first_idx = kcenter_first_center(data_scaled)
 	centers.append(data_scaled[first_idx])
 	center_indices.append(first_idx)
-	
-	logger.info(f"k-center: Starting with random center at index {first_idx}")
+
+	logger.info(f"k-center: Starting with the most central point, index {first_idx}")
 
 	# Greedy farthest-point selection until we have `max_clusters` centers.
 	# This ensures we always return the requested number of representatives
@@ -618,12 +639,14 @@ def kcenter_coverage_clustering(
 
 		# Select next center as the point farthest from all existing centers
 		farthest_idx = int(np.argmax(distances_to_centers))
-		# If the farthest point is already selected (duplicate), pick a random remaining index
+		# If the farthest point is already selected (every point coincides with
+		# a center), take the first point that is not a center yet
 		if farthest_idx in center_indices:
-			remaining = [i for i in range(n_samples) if i not in center_indices]
+			chosen = set(center_indices)
+			remaining = [i for i in range(n_samples) if i not in chosen]
 			if not remaining:
 				break
-			farthest_idx = int(np.random.choice(remaining))
+			farthest_idx = int(remaining[0])
 
 		centers.append(data_scaled[farthest_idx])
 		center_indices.append(farthest_idx)

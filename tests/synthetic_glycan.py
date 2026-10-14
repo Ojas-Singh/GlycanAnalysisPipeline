@@ -8,7 +8,7 @@ Gaussian displacement. Bond lengths stay plausible, so the frame-quality filter 
 unless a frame is deliberately broken.
 
 At most 500 frames keeps the PCA fit on scikit-learn's exact solver (the randomized one, used for larger
-inputs, draws from NumPy's unseeded global generator), so two runs of the pipeline give the same numbers.
+inputs, is seeded as well), so two runs of the pipeline give the same numbers.
 """
 from __future__ import annotations
 

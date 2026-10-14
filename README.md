@@ -139,8 +139,8 @@ coverage set (5 to 128 structures, from the conformational entropy). Level 3,
 the k-center set of up to 512 structures, is no longer published and is off by
 default: with levels `1,2` nothing of it is computed, written, required or
 exported, in the process stage and in the static stage. Levels 1 and 2 do not
-depend on it (each k-center run seeds the generator itself), so they are the
-same with and without it.
+depend on it (the k-center clustering draws nothing from a random generator),
+so they are the same with and without it.
 
 - `--levels 1,2,3` (or `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3`) restores Level 3
   everywhere: clustering, `output/level_3/`, `torsion_level_3_reps`, the
@@ -161,6 +161,14 @@ same with and without it.
 - A published `static/` database that has Level 3 is turned into the one
   without it, with no `process/` data and no recomputation, by
   [`scripts/static_drop_levels.py`](#static-database-without-level-3-scriptsstatic_drop_levelspy).
+
+The analysis of a trajectory is reproducible: the PCA is seeded (scikit-learn
+takes its randomized SVD for most glycans), the GMM is seeded, and the
+k-center clustering of Level 2 (and 3) starts from the frame nearest the
+centroid of the standardised PCA coordinates and draws nothing at random.
+`coverage_clusters_per_main` (in `pca.json`, `info.json` and `data.json`)
+lists, for every Level 1 cluster, the Level 2 clusters whose frames lie mostly
+in it, both by the numbers they are published under (`Cluster 0` the largest).
 
 Process-only runs keep `process/` Hugging Face friendly: tabular analysis files are written as Parquet under `embedding/` and `embedding/exports/`, while `process/output/` keeps only static-ready non-tabular artifacts (`info.json`, `torparts.npz`, representative PDBs, and SVG plots). Static generation later converts those Parquet exports back to the website CSV files under `static/`.
 
