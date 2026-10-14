@@ -429,6 +429,34 @@ def test_tables_of_a_static_entry_and_of_a_process_folder_give_the_same_document
     assert from_static == replicas.diagnose(tables, replicas.replica_boundaries(manifest), glycam_name="x")
 
 
+def test_folders_named_after_a_branched_glycan_are_read(tmp_path):
+    # Process folders carry the GLYCAM name, whose brackets polars would expand as a glob.
+    import polars as pl
+
+    tables, manifest = synthetic([{"frames": 2000, "populations": EVEN}] * 2)
+    n = len(tables.source_frame)
+    pca = pl.DataFrame({"frame": np.arange(n), "PC1": tables.pcs[:, 0].astype(float), "PC2": tables.pcs[:, 1].astype(float),
+                        "PC3": np.zeros(n), "source_frame": tables.source_frame, "cluster": tables.cluster})
+    tor = pl.DataFrame({"frame": np.arange(n), "source_frame": tables.source_frame,
+                        **{name: tables.torsions[:, j] for j, name in enumerate(tables.torsion_names)},
+                        "cluster": tables.cluster, "center": [None] * n})
+    info = {"torsions": {"metadata": _metadata()}}
+    name = "DManpa1-3[DManpa1-6]DManpb1-4DGlcpNAcb1-4[LFucpa1-6]DGlcpNAcb1-OH"
+    process, static = tmp_path / "process" / name, tmp_path / "static" / name
+    (process / "embedding" / "exports").mkdir(parents=True)
+    (process / "output").mkdir(parents=True)
+    (static / "output").mkdir(parents=True)
+    pca.write_parquet(process / "embedding" / "exports" / "pca.parquet")
+    tor.write_parquet(process / "embedding" / "exports" / "torsion_glycosidic.parquet")
+    pca.write_csv(static / "output" / "pca.csv")
+    tor.write_csv(static / "output" / "torsion_glycosidic.csv")
+    for folder in (process, static):
+        (folder / "output" / "info.json").write_text(json.dumps(info))
+    expected = replicas.diagnose(tables, replicas.replica_boundaries(manifest), glycam_name=name)
+    assert replicas.diagnose_result(process, manifest, manifest["frames"], glycam_name=name) == expected
+    assert replicas.diagnose_static(static, manifest, glycam_name=name) == expected
+
+
 def test_tables_that_disagree_are_refused():
     with pytest.raises(replicas.ReplicaError):
         replicas.FrameTables(source_frame=[0, 2, 1], cluster=[0, 0, 0], pcs=np.zeros((3, 2)), torsions=np.zeros((3, 0)),
