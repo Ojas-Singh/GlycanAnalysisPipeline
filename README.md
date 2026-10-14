@@ -17,6 +17,7 @@ GAP takes the trajectories of one glycan (all its simulations, dry) and produces
 | Publishing | The static database with `sync_manifest.json`, which the website synchronises from | Login node; S3-compatible storage (Cloudflare R2) or Oracle | [S3 storage (Cloudflare R2)](#s3-storage-cloudflare-r2) |
 | Publishing one entry | The bundle of one analysed entry becomes `static/GSxxxxx/` and `raw/<GLYCAM name>/`; the root files and `sync_manifest.json` follow from the stored ones. Also: replace, withdraw | The server that approves entries; S3-compatible storage | [One entry: `scripts/publish_entry.py`](#one-entry-scriptspublish_entrypy) |
 | Replica diagnostics | How well the independent simulations of an entry agree, and whether it needs more sampling: `replicas.json` per entry, from the analysis or, for a published entry, from its stored tables | With the analysis of an entry; `scripts/replica_diagnostics.py` for the published ones | [Replica diagnostics](#replica-diagnostics) |
+| Entry audit | Every problem of a published entry as an issue for the administrators' website (`issues.json`: code, severity, evidence, files, suggested actions) | `scripts/audit_entries.py`, over the static database, the raw archive, `replicas.json` and the registry; only reads | [Entry audit](#entry-audit) |
 
 Level 3 (a coverage set of up to 512 structures) is no longer produced by default; `GLYCOSHAPE_CLUSTER_LEVELS=1,2,3` brings it back, and folders that still contain it are accepted.
 
@@ -618,6 +619,24 @@ Over the published database (1,001 entries; the archive has three more that are 
 | all (1,001) | 579 | 308 | 55 | 59 |
 
 All 19 glycans of the thesis' list of candidates for more sampling are `more_sampling_needed`; the 36 others with that verdict are 30 with assumed runs, five whose frames the filter thinned and one without a GlyTouCan accession, which the thesis left out of that list. Among the reasons, `rotamer_missing` holds for 286 entries, `cluster_missing` for 234, `population_tv` for 73 and `omega_never_changes` for 64 (all of them 1–6 linkages; no α2–6 ω stays in one rotamer).
+
+## Entry audit
+
+`lib/audit.py` gives every published entry a list of issues for the administrators' website, where the owner sees each problem and decides what to do about it. Each issue type is a check of the thesis audit, ported (the type says which: `found_by`). Everything is only read; nothing is looked up on the network.
+
+```bash
+.venv/bin/python scripts/audit_entries.py --static-dir static --archive-dir archive --out audit \
+    [--replicas-dir replicas] [--registry-seed registry-seed.json] \
+    [--registry-export submission_ids.json --registry-export glycans.json] \
+    [--crabwurcs path/to/crabwurcs] [--glycan GS00020 ...] [--workers 10] [--no-trajectory]
+.venv/bin/python scripts/audit_entries.py --list-codes      # the issue types, severities and actions as JSON
+```
+
+It writes `<out>/GSxxxxx/issues.json` (schema `glycoshape-entry-issues`, version 1; documented in `lib/audit.py`), `<out>/GSxxxxx/facts.json` (what the rules were applied to) and `<out>/summary.json` (counts by issue type and severity, what the bulk re-analysis resolves by itself and what needs the owner, the collection-level lists, the time taken). An issue has a stable `code` and `key`, a `severity` (`blocking`, `should-fix`, `note`), a one-sentence `title`, its `evidence`, the `files` involved (by store: `static`, `raw`, `replicas`, `registry`), suggested `actions` from a fixed set (`rename`, `edit-metadata`, `reanalyse` with the options `exclude_replicas` and `declare_simulated_anomer`, `request-replicas`, `redo`, `withdraw`, `merge-ids`, `none`), and whether the bulk re-analysis with the fixed GAP resolves it (`resolved_by_reanalysis`) or the owner has to decide (`needs_owner`).
+
+What the simulated molecule is, is read from its coordinates (`lib/audit_structure.py`): rings, carbon chains, the configuration of every stereocentre as the side of its heteroatom in the Fischer projection (the WURCS skeleton code), the anomer against the anomeric reference atom, and the linkages; this is compared with the WURCS of the name, which crabWURCS writes (it must be the release that writes furanose rings and bracketed substituents correctly; `--crabwurcs` or `GLYCOSHAPE_CRABWURCS_BIN`). The reader agrees with the residue codes of the structures of the raw archive (1,004 entries) for 6,759 of the 6,781 residues whose code states an anomer; the other 22 are residues of CHARMM-GUI entries that the audit reports. The class rules of the coverage figure are in `lib/audit_classes.py`.
+
+Over the published database (1,001 entries, with `replicas.json` from `scripts/replica_diagnostics.py` and the registry seed) it takes about 36 s with 10 workers on the 20-core ARM machine (median 0.3 s per entry, at most 7 s; 0.4 GB), reading the first and last frame of every run and 12 frames per run for the stereocentres. It finds 1,517 issues: 77 blocking, 212 should-fix, 1,228 notes; 817 of them the bulk re-analysis with the fixed GAP resolves by itself (stored WURCS and IUPAC, inventory fields, the accumulated PCA variances), 570 need the owner.
 
 ## Raw trajectory archive
 
