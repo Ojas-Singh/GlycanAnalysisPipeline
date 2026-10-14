@@ -64,6 +64,7 @@ from lib.embedding import (
 )
 from lib import glypdbio
 from lib.torsion import (
+    TORSION_CONVENTIONS,
     build_torsion_metadata,
     classify_glycosidic_from_name,
     circular_stats,
@@ -379,6 +380,9 @@ def _level_summary_from_metadata(metadata: List[Dict]) -> Dict:
     non_glycosidic = [entry for entry in metadata if entry.get("family") != "glycosidic"]
     return {
         "metadata": metadata,
+        # The definitions of phi, psi and omega (omega is C4-C5-C6-O6, the IUPAC
+        # O5-C5-C6-O6 plus about 120 degrees).
+        "conventions": dict(TORSION_CONVENTIONS),
         "name_mapping": {entry["original_name"]: entry["canonical_name"] for entry in metadata},
         "glycosidic": glycosidic,
         "non_glycosidic": non_glycosidic,

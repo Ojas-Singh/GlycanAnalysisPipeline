@@ -242,6 +242,29 @@ When every folder is there the root files are written in the order of the finali
 
 A database of the size of the published one (1,001 glycans, 29 GB without the Level 3 structures, of which 13 GB `torsion_all.csv` and 4.5 GB `info.json`) took one minute with 8 workers and 2 GB of memory, half of it for the glycan folders and half for the archives and the manifest; eight glycans of the largest size in work together took 5 GB. `--skip-finalize` stops after the glycan folders.
 
+### Torsion angles
+
+The torsions of an entry are in `output/torsion_all.csv` (every frame),
+`torsion_glycosidic.csv` and `torsion_level_*_reps.csv`, in degrees from -180
+to 180; `info.json` describes every column (`torsions.metadata`: the four
+atoms, their residues, the family and subtype) and states the definitions
+below (`torsions.conventions`). A glycosidic torsion is named
+`<donor residue>_<acceptor residue>_<phi|psi|omega>`.
+
+| Torsion | Atoms |
+|---|---|
+| φ | ring oxygen, anomeric carbon, glycosidic oxygen, acceptor carbon: O5–C1–O–Cx (pyranose donor), O4–C1–O–Cx (aldofuranose), O5–C2–O–Cx (ketofuranose), O6–C2–O–Cx (sialic acid) |
+| ψ | C1–O–Cx–A (C2–O–Cx–A for C2 donors): A is the ring oxygen when Cx is an anomeric carbon, otherwise C(x−1) or C(x+1), whichever the bond table lists first, so check the atoms in the metadata before comparing the ψ of two linkages |
+| ω | **C4–C5–C6–O6** of the acceptor of a 1–6 linkage (C6–C7–C8–O8 of a sialic acid in a 2–8 linkage) |
+
+The stored ω is not the O5–C5–C6–O6 of the IUPAC recommendation. In a
+D-hexopyranose C4 lies about 120° from O5 about the C5–C6 bond, so the stored
+value is the IUPAC ω plus about 120°: the rotamers gg, gt and tg (−60°, +60°
+and 180° with O5–C5–C6–O6) are near **+60°, 180° and −60°** on the stored
+scale. The values are kept on this scale because the website and other tools
+read them. A free C6 hydroxyl (no glycosidic linkage) is a residue-local
+torsion, stored as O5–C5–C6–O6.
+
 ## Staged Oracle/Slurm workflow
 
 Run these commands from the repository checkout. The download and publish stages run on a login node; only the processing stage runs on the AMD Slurm partition.

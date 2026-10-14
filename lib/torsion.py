@@ -34,8 +34,35 @@ except Exception as _exc:  # pragma: no cover - handled lazily
 
 Torsion = Tuple[int, int, int, int]
 
+#: How the stored glycosidic torsions are defined (degrees, -180 to 180).  It is
+#: written into the torsion block of ``info.json`` (``torsions.conventions``).
+#: The stored omega is C4-C5-C6-O6, not the O5-C5-C6-O6 of the IUPAC
+#: recommendation: in a D-hexopyranose C4 lies about 120 degrees from O5 about
+#: the C5-C6 bond, so the stored value is the IUPAC omega plus about 120
+#: degrees, and the rotamers gg, gt, tg (-60, +60, 180 for O5-C5-C6-O6) are
+#: near +60, 180 and -60 on the stored scale.  The values are kept as they are
+#: because the website and other tools read them.
+TORSION_CONVENTIONS: Dict[str, str] = {
+	"phi": (
+		"ring oxygen - anomeric carbon - glycosidic oxygen - acceptor carbon: O5-C1-O-Cx for a pyranose donor, "
+		"O4-C1-O-Cx for an aldofuranose, O5-C2-O-Cx for a ketofuranose, O6-C2-O-Cx for a sialic acid"
+	),
+	"psi": (
+		"anomeric carbon - glycosidic oxygen - acceptor carbon - a neighbour of the acceptor carbon: C1-O-Cx-A "
+		"(C2-O-Cx-A for C2 donors), A being the ring oxygen when Cx is an anomeric carbon, otherwise C(x-1) or "
+		"C(x+1), whichever the bond table lists first (sialic acid donors: C3-C4, C4-C5, C6-C5, C8-C7, C9-C8); "
+		"the fourth atom of each psi is in its atom_names"
+	),
+	"omega": (
+		"C4-C5-C6-O6 of the acceptor of a 1-6 linkage (C6-C7-C8-O8 of a sialic acid in a 2-8 linkage). "
+		"Not the IUPAC O5-C5-C6-O6: the stored value is that omega plus about 120 degrees, so the rotamers "
+		"gg, gt and tg (-60, +60 and 180 with O5-C5-C6-O6) are near +60, 180 and -60 here"
+	),
+}
+
 __all__ = [
 	"Torsion",
+	"TORSION_CONVENTIONS",
 	"get_movable_torsions",
 	"get_torsion_values",
 	"get_torsion_values_batch",
@@ -297,7 +324,6 @@ def _classify_glycosidic_from_parts(atom_names: Sequence[str], residue_ids: Sequ
 		atom1 == "O5"
 		and atom2 == "C1"
 		and atom3.startswith("O")
-		and atom3 != "O5"
 		and atom4.startswith("C")
 		and res1 == res2
 		and res3 == res4
@@ -318,10 +344,22 @@ def _classify_glycosidic_from_parts(atom_names: Sequence[str], residue_ids: Sequ
 	):
 		return f"{res1}_{res3}_phi"
 
+	# Furanoses, with the same ring-oxygen convention: O4 is the ring oxygen
+	# of an aldofuranose (Araf, Galf, Ribf), O5 that of a ketofuranose (Fruf,
+	# Psif), whose anomeric carbon is C2.  Neither bond exists in a pyranose.
+	if (
+		(atom1, atom2) in (("O4", "C1"), ("O5", "C2"))
+		and atom3.startswith("O")
+		and atom4.startswith("C")
+		and res1 == res2
+		and res3 == res4
+		and res1 != res3
+	):
+		return f"{res1}_{res3}_phi"
+
 	if (
 		atom1 == "C1"
 		and atom2.startswith("O")
-		and atom2 != "O5"
 		and atom3.startswith("C")
 		and atom4.startswith(("C", "O"))
 		# In GLYCAM/PDB connectivity the bridging oxygen belongs to the
@@ -682,10 +720,15 @@ def get_glycan_torsions_enhanced(atoms_df, bonds_df) -> List[Torsion]:
 	
 	This method implements the correct phi, psi, and omega definitions:
 	- phi: O5-C1-O-Cx' (glycosidic linkage angle)
-	- psi: C1-O-Cx'-Cx+1' (continuation angle)  
+	- psi: C1-O-Cx'-Cx+1' (continuation angle; the fourth atom is the first
+	  neighbour of Cx' in the bond table, C(x-1)' or C(x+1)')
 	- Neu5 phi: O6-C2-O-Cx' (C2 is the anomeric carbon)
 	- Neu5 psi: C2-O-Cx'-Cnext'
-	- omega: C4-C5-C6-O6 (side chain angle)
+	- omega: C4-C5-C6-O6 (side chain angle).  This is not the IUPAC omega
+	  O5-C5-C6-O6: it is that angle plus about 120 degrees, so gg, gt and tg
+	  are near +60, 180 and -60 on the stored scale (see TORSION_CONVENTIONS).
+	Donors without an O5-C1 ring bond (furanoses, ketoses) get their phi and
+	psi from the rotatable-bond pass below; the names classify them.
 	"""
 	_require_rdkit()
 	
