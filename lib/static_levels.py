@@ -586,8 +586,8 @@ def finalize_database(
         timed("inventory", started)
 
         # 3. The archives.  data.json is in every GSxxxxx.zip, so all are built again, the way the
-        # baker builds them.  create_master_archive builds them once more itself and reports no
-        # failure of one of them, hence the first pass and the comparison.
+        # baker builds them.  create_master_archive builds them once more itself (and raises BakeError
+        # when one fails); the first pass in parallel and the comparison stay as the check of that.
         started = time.perf_counter()
 
         def archive(glycan_id: str) -> Tuple[str, bool]:

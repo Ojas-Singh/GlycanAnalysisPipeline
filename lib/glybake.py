@@ -337,6 +337,20 @@ def glycan_archive_members(glycan_dir: Path, output_levels: Iterable[str] = ("le
     return members
 
 
+class BakeError(RuntimeError):
+    """A root file was not written because some glycan folders could not be read or archived.
+
+    ``failures`` lists ``(glycan ID, reason)`` of every one of them, so that a
+    partial database is never published as if it were complete.
+    """
+
+    def __init__(self, what: str, failures: List[Tuple[str, str]]):
+        self.failures = list(failures)
+        shown = "; ".join(f"{glycan_id}: {reason}" for glycan_id, reason in self.failures[:5])
+        more = f" (and {len(self.failures) - 5} more)" if len(self.failures) > 5 else ""
+        super().__init__(f"{what} not written: {len(self.failures)} glycan(s) failed: {shown}{more}")
+
+
 class GlycoShapeBaker:
     """Main class for creating GlycoShape database archives and files."""
     ARCHIVE_OUTPUT_LEVELS = ("level_1",)
@@ -483,7 +497,9 @@ class GlycoShapeBaker:
         """Create master GlycoShape archive from all individual glycan archives.
 
         Its members are the ``GSxxxxx.zip`` of every glycan, in the order of
-        their names (:func:`write_archive`).
+        their names (:func:`write_archive`).  When the archive of a glycan
+        cannot be built, no master archive is written (an old one is removed
+        first) and :class:`BakeError` lists the glycans.
 
         Args:
             output_file: Name of the master archive file
@@ -498,23 +514,23 @@ class GlycoShapeBaker:
 
             # Create individual archives first
             self.logger.info("Creating individual glycan archives...")
-            success_count = 0
-            total_count = 0
+            failed: List[Tuple[str, str]] = []
             glycan_dirs = sorted(path for path in self.database_dir.glob("GS*") if path.is_dir())
 
             for glycan_dir in glycan_dirs:
-                total_count += 1
-                if self.create_individual_glycan_archive(glycan_dir):
-                    success_count += 1
+                if not self.create_individual_glycan_archive(glycan_dir):
+                    failed.append((glycan_dir.name, "its archive could not be built"))
+                elif not (glycan_dir / f"{glycan_dir.name}.zip").is_file():
+                    failed.append((glycan_dir.name, "its archive is missing"))
 
-            self.logger.info(f"Created {success_count}/{total_count} individual archives")
+            self.logger.info(f"Created {len(glycan_dirs) - len(failed)}/{len(glycan_dirs)} individual archives")
+            if failed:
+                raise BakeError(output_file, failed)
 
             # Create master archive
             self.logger.info("Creating master archive...")
             write_archive(output_path, (
-                (archive_path.name, archive_path)
-                for archive_path in (glycan_dir / f"{glycan_dir.name}.zip" for glycan_dir in glycan_dirs)
-                if archive_path.exists()
+                (f"{glycan_dir.name}.zip", glycan_dir / f"{glycan_dir.name}.zip") for glycan_dir in glycan_dirs
             ))
 
             self.logger.info(f"Successfully created master archive: {output_file}")
@@ -526,32 +542,52 @@ class GlycoShapeBaker:
     def create_consolidated_json(self, output_file: str = "GLYCOSHAPE.json") -> None:
         """Create consolidated JSON file from all data.json files.
 
+        Every ``GSxxxxx`` folder has to have a readable ``data.json`` that
+        holds a JSON object.  When one does not, nothing is written and
+        :class:`BakeError` lists every such glycan: an inventory without a
+        glycan whose folder is published would be a partial database.
+
         Args:
             output_file: Name of output JSON file
         """
         try:
             output_path = self.database_dir / output_file
             consolidated_data = {}
+            failed: List[Tuple[str, str]] = []
+            storage = get_storage_manager()
 
             # Process each glycan directory
-            for glycan_dir in self.database_dir.glob("GS*"):
+            for glycan_dir in sorted(self.database_dir.glob("GS*")):
                 if not glycan_dir.is_dir():
                     continue
 
                 glycan_id = glycan_dir.name
                 json_path = glycan_dir / "data.json"
 
-                if json_path.exists():
-                    self.logger.info(f"Processing JSON for {glycan_id}")
-                    try:
-                        storage = get_storage_manager()
-                        json_path_str = str(json_path)
-                        with storage.open(json_path_str, 'r') as f:
-                            consolidated_data[glycan_id] = json.load(f)
-                    except json.JSONDecodeError as e:
-                        self.logger.error(f"Invalid JSON in {json_path}: {str(e)}")
-                    except Exception as e:
-                        self.logger.error(f"Error reading {json_path}: {str(e)}")
+                if not json_path.exists():
+                    self.logger.error(f"No data.json in {glycan_dir}")
+                    failed.append((glycan_id, "no data.json"))
+                    continue
+                self.logger.info(f"Processing JSON for {glycan_id}")
+                try:
+                    with storage.open(str(json_path), 'r') as f:
+                        data = json.load(f)
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Invalid JSON in {json_path}: {str(e)}")
+                    failed.append((glycan_id, f"invalid JSON in data.json: {e}"))
+                    continue
+                except Exception as e:
+                    self.logger.error(f"Error reading {json_path}: {str(e)}")
+                    failed.append((glycan_id, f"data.json could not be read: {e}"))
+                    continue
+                if not isinstance(data, dict):
+                    self.logger.error(f"{json_path} does not hold a JSON object")
+                    failed.append((glycan_id, "data.json does not hold a JSON object"))
+                    continue
+                consolidated_data[glycan_id] = data
+
+            if failed:
+                raise BakeError(output_file, failed)
 
             # Write consolidated JSON
             self.logger.info(f"Writing consolidated JSON to {output_file}")
