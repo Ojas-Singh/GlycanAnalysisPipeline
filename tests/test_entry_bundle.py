@@ -35,6 +35,7 @@ MEMBERS = [
         "static/landscape/preprocessing.npz", "static/output/info.json", "static/output/torparts.npz",
         "static/output/pca.csv", "static/output/torsion_all.csv", "static/output/torsion_glycosidic.csv",
         "static/output/torsion_level_1_reps.csv", "static/output/torsion_level_2_reps.csv",
+        "static/output/replicas.json",
         *[f"static/output/level_{level}/{name}" for level in (1, 2) for name in LEVEL_FILES],
     ]),
     "result.json", "run.log",
@@ -287,7 +288,7 @@ def test_missing_member(run, tmp_path):
     bundle = Bundle(run["bundle"])
     del bundle.members["static/output/pca.csv"]
     refused(tmp_path, bundle.write(tmp_path / "a.tar"),
-            r"member static/output/torparts.npz comes where static/output/pca.csv is expected \(missing or out of order\)")
+            r"member static/output/replicas.json comes where static/output/pca.csv is expected \(missing or out of order\)")
     bundle = Bundle(run["bundle"])
     del bundle.members["run.log"]
     refused(tmp_path, bundle.write(tmp_path / "b.tar"), "member run.log is missing: the archive ends before it")

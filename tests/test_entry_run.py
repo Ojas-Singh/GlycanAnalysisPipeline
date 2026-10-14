@@ -27,6 +27,7 @@ STATIC_FILES = sorted([
     "landscape/landscape_metadata.json", "landscape/pca_model.joblib", "landscape/preprocessing.npz",
     "output/info.json", "output/torparts.npz", "output/pca.csv", "output/torsion_all.csv",
     "output/torsion_glycosidic.csv", "output/torsion_level_1_reps.csv", "output/torsion_level_2_reps.csv",
+    "output/replicas.json",
     *[f"output/level_{level}/{name}" for level in (1, 2)
       for name in ("dist.svg", "GLYCAM/alpha.pdb", "GLYCAM/beta.pdb", "PDB/alpha.pdb", "PDB/beta.pdb")],
 ])
@@ -139,7 +140,7 @@ def test_result_folder_of_an_archive_entry(inputs, archive_result):
 
     # timings per step and the frame-quality summary
     steps = ("input", "store", "pca", "torsions", "clustering", "torsion_stats", "create_info", "structures",
-             "plots", "export", "static_ready", "result", "total")
+             "plots", "export", "static_ready", "replicas", "result", "total")
     assert list(result["timings_sec"]) == list(steps)
     assert all(isinstance(result["timings_sec"][step], float) for step in steps)
     assert result["timings_sec"]["total"] >= sum(result["timings_sec"][step] for step in steps[:-1]) * 0.99
@@ -169,6 +170,15 @@ def test_result_folder_of_an_archive_entry(inputs, archive_result):
     assert not [name for name in list(static) + list(process) if "level_3" in name]
     assert "identifier" not in json.dumps(result["analysis"]) and result["left_to_publishing"]
 
+    # how well the replicas agree: one block of 480 frames without a run record cannot be divided
+    replicas_doc = json.loads(static["output/replicas.json"])
+    assert replicas_doc["schema"] == "glycoshape-replica-diagnostics" and replicas_doc["schema_version"] == 1
+    assert replicas_doc["glycam_name"] == GLYCAM_NAME and replicas_doc["glycoshape_id"] is None
+    assert replicas_doc["frames"] == {"trajectory": 480, "retained": 478, "unassigned": 0}
+    assert replicas_doc["boundaries"]["basis"] == "none" and replicas_doc["boundaries"]["replicas"] == 1
+    assert replicas_doc["verdict"]["value"] == "not_assessable"
+    assert sum(replicas_doc["replicas"][0]["population"]) == pytest.approx(1.0, abs=1e-3)
+
 
 def test_static_folder_is_what_the_static_stage_makes_of_the_process_folder(archive_result, tmp_path):
     from lib import static_ready
@@ -176,7 +186,8 @@ def test_static_folder_is_what_the_static_stage_makes_of_the_process_folder(arch
     output, _ = archive_result
     static_ready.write_static_ready(output / "process" / GLYCAM_NAME, tmp_path / "again", GLYCAM_NAME)
     first, again = files_of(output / "static"), files_of(tmp_path / "again")
-    assert first == again
+    # the replica diagnostics are the one file that needs the archive manifest besides the process folder
+    assert first.pop("output/replicas.json") and first == again
     # structures of the reducing-end anomers in both namings, without identifier remarks
     alpha = first["output/level_1/GLYCAM/alpha.pdb"].decode()
     assert alpha.startswith("REMARK   GLYCAN MULTI-MODEL PDB  LEVEL LEVEL_1  ANOMER ALPHA\nMODEL        1\n")
@@ -199,8 +210,18 @@ def test_pdb_folder_gives_the_same_analysis_as_its_archive_entry(inputs, archive
     a, b = files_of(output / "static"), files_of(tmp_path / "result" / "static")
     assert sorted(a) == sorted(b)
     for name in a:
-        if not name.endswith("dist.svg"):
+        if not name.endswith("dist.svg") and name != "output/replicas.json":
             assert a[name] == b[name], name
+    # the same measures; only the evidence for the (unknown) runs differs: a simulation.pdb folder has no manifest
+    from_archive_doc, from_pdb_doc = json.loads(a["output/replicas.json"]), json.loads(b["output/replicas.json"])
+    assert from_archive_doc["boundaries"]["evidence"]["source_record"] == "one_block"
+    assert "no archive manifest" in from_pdb_doc["boundaries"]["evidence"]["why"]
+    for key in ("frames", "replicas", "clusters", "halves", "linkages", "landscape", "torsion_histograms"):
+        if key == "replicas":
+            strip = lambda items: [{k: v for k, v in item.items() if k not in ("name",)} for item in items]
+            assert strip(from_archive_doc[key]) == strip(from_pdb_doc[key])
+        else:
+            assert from_archive_doc[key] == from_pdb_doc[key], key
 
 
 def test_current_result_is_reused_and_force_recomputes(inputs, archive_result, tmp_path):

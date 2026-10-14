@@ -98,7 +98,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from lib import archive, archive_transfer, entry_complete, glybake, id_registry, static_delta, static_publish
+from lib import archive, archive_transfer, entry_complete, glybake, id_registry, replicas, static_delta, static_publish
 from lib.storage import S3Settings, create_s3_backend, file_sha256, parallel_map
 
 PUBLISH, REPLACE, WITHDRAW = "publish", "replace", "withdraw"
@@ -254,6 +254,10 @@ class Target:
 
     def record_key(self, glycan_id: str) -> str:
         return f"{self.state_prefix}/{self.static_prefix}/entries/{glycan_id}.json"
+
+    def replicas_key(self, glycan_id: str) -> str:
+        """The administrators' copy of the replica diagnostics of a glycan (``lib/replicas.py``)."""
+        return replicas.admin_key(self.state_prefix, self.static_prefix, glycan_id)
 
 
 class Store:
@@ -1420,11 +1424,51 @@ def publish_entry(
                 report["switch"] = done
                 _remember(cache_dir, derived_dir, derived)
                 report["status"] = "published"
+        kept = keep_replicas(target, static_store, bundle, glycan_id, dry_run, log)
+        if kept is not None:
+            report["replicas"] = kept
     report["seconds"] = round(time.perf_counter() - started, 3)
     journal.data["status"] = "dry-run" if dry_run else report["status"]
     journal.data["transfers"] = stats
     journal.save()
     return report
+
+
+def keep_replicas(target: Target, store: Store, bundle: entry_complete.Bundle, glycan_id: str, dry_run: bool,
+                  log: Log = print) -> Optional[Dict[str, Any]]:
+    """What becomes of ``output/replicas.json`` of a bundle once its entry is published; ``None`` without one.
+
+    Published with the entry (``lib.replicas.public_placement``) it is a file of
+    the glycan folder like any other and nothing is left to do here.  Otherwise
+    (the default) it is kept for the administrators at
+    :meth:`Target.replicas_key`, outside the published prefix, after the
+    publication: a copy with the same bytes is left alone, so a run that is
+    repeated writes nothing.  When the copy cannot be written the command
+    stops with :class:`PublishEntryError`; the entry is published, and the
+    same command (which finds it published) writes the copy.
+    """
+    path = bundle.static_dir / replicas.STATIC_PATH
+    if not path.is_file():
+        return None
+    payload = path.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    if replicas.public_placement():
+        return {"placement": "public", "path": f"{glycan_id}/{replicas.STATIC_PATH}", "size": len(payload),
+                "sha256": digest}
+    key = target.replicas_key(glycan_id)
+    kept: Dict[str, Any] = {"placement": "admin", "key": key, "size": len(payload), "sha256": digest, "written": False}
+    if dry_run:
+        return kept
+    try:
+        if not store.holds(key, len(payload), digest):
+            store.write(key, payload)
+            kept["written"] = True
+            log(f"kept the replica diagnostics for the administrators: {key}")
+    except Exception as exc:
+        raise PublishEntryError(
+            f"the entry is published, and its replica diagnostics could not be kept at {key} "
+            f"({type(exc).__name__}: {exc}): run the same command again") from exc
+    return kept
 
 
 def _release_quietly(target: Target, store: Store, lock: Optional[Dict[str, Any]], log: Log) -> None:

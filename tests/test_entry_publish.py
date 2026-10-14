@@ -188,8 +188,9 @@ def test_publishing_adds_one_glycan_and_touches_no_other(world, bundle_dir, synt
     assert archive_transfer.compare_with_index(world.backend, "raw", index)["ok"]
     assert world.keys("raw-history/") == []
 
-    # nothing is left of the run but the record of the entry
-    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [f"{STATE}/entries/{GS}.json"]
+    # nothing is left of the run but the record of the entry and the administrators' copy of its replica diagnostics
+    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [
+        f"{STATE}/entries/{GS}.json", f"{STATE}/replicas/{GS}.json"]
     kept = json.loads(world.backend.read_binary(f"{STATE}/entries/{GS}.json"))
     assert kept["status"] == "published" and kept["glycam_name"] == name and kept["entry"]["hash"] == approved
     assert kept["global_hash"] == new["global_hash"] and kept["global_hash_before"] == old["global_hash"]
@@ -651,7 +652,11 @@ def test_a_copy_that_fails_stops_the_switch_and_leaves_it_to_be_completed(slow_w
         assert done["switched"] == len(switched) - len(ended) and done["manifest_written"]
     assert sorted(world.client.switched("ended")) == sorted({key for key, _, new in switched if not new} | {manifest})
     assert world.client.switched("ended")[-1] == manifest
-    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [f"{STATE}/entries/{GS}.json"]
+    assert world.keys("publish-staging/") == [] and world.keys(STATE) == [
+        f"{STATE}/entries/{GS}.json", f"{STATE}/replicas/{GS}.json"]
+    if failing == "static/GlycoShape.zip":                  # the same command keeps the diagnostics of the new bundle
+        assert world.backend.read_binary(f"{STATE}/replicas/{GS}.json") == (
+            extended_bundle / "static" / "output" / "replicas.json").read_bytes()
     assert world.reader.try_sync() is None and world.reader.fresh(tmp_path / "behind").try_sync() is None
     assert world.reader.global_hash != old_hash and static_publish.check_published(world.backend, "static", log=quiet)["ok"]
 
@@ -1226,7 +1231,8 @@ def test_a_trial_under_other_prefixes_of_the_same_bucket_shares_no_key_with_the_
     assert world.keys("raw-history/") == replaced["raw"]["history"]
     assert world.keys("publish-state/") == [
         f"{STATE}/lock.json", "publish-state/trial/static/entries/GS00002.json",
-        f"publish-state/trial/static/entries/{GS}.json", "publish-state/trial/static/withdrawn.json"]
+        f"publish-state/trial/static/entries/{GS}.json", f"publish-state/trial/static/replicas/{GS}.json",
+        "publish-state/trial/static/withdrawn.json"]
     assert world.keys("publish-staging/") == []
 
     # and the real one is published afterwards as if there had been no trial
@@ -1241,3 +1247,41 @@ def test_a_trial_under_other_prefixes_of_the_same_bucket_shares_no_key_with_the_
     assert entry_publish.status(trial, "GS00002")["entry"]["state"] == "withdrawn"
     assert world.reader.try_sync() is None and world.reader.glycans() == sorted(PUBLISHED + (GS,))
     assert website.try_sync() is None and website.glycans() == sorted(set(PUBLISHED + (GS,)) - {"GS00002"})
+
+
+# ---------------------------------------------------------------------------
+# Replica diagnostics: kept for the administrators, or published with the entry
+# ---------------------------------------------------------------------------
+def test_the_replica_diagnostics_are_kept_for_the_administrators_outside_the_published_prefix(world, bundle_dir, monkeypatch):
+    monkeypatch.delenv("GLYCOSHAPE_REPLICAS_PUBLIC", raising=False)
+    diagnostics = (bundle_dir / "static" / "output" / "replicas.json").read_bytes()
+    key = f"{STATE}/replicas/{GS}.json"
+    planned = world.publish(bundle_dir, dry_run=True)
+    assert world.writes() == [] and planned["replicas"] == {
+        "placement": "admin", "key": key, "size": len(diagnostics),
+        "sha256": hashlib.sha256(diagnostics).hexdigest(), "written": False}
+    assert not [warning for warning in planned["warnings"] if "replicas.json" in warning]   # not a file left out
+
+    report = world.publish(bundle_dir)
+    assert report["status"] == "published" and report["replicas"]["written"] is True
+    assert world.backend.read_binary(key) == diagnostics
+    assert world.keys(STATE) == [f"{STATE}/entries/{GS}.json", key]
+    assert world.reader.try_sync() is None and (world.reader.folder / GS / "data.json").is_file()
+    assert not (world.reader.folder / GS / "output" / "replicas.json").exists()
+    assert "output/replicas.json" not in stored_manifest(world.backend)["glycans"][GS]["files"]
+
+    world.client.calls.clear()
+    again = world.publish(bundle_dir)                                          # the same bytes are left alone
+    assert again["status"] == "already-published" and again["replicas"]["written"] is False
+    assert not [call for call in world.writes() if call[2] == key]
+
+
+def test_public_replica_diagnostics_are_a_file_of_the_published_folder(world, bundle_dir, monkeypatch):
+    monkeypatch.setenv("GLYCOSHAPE_REPLICAS_PUBLIC", "1")
+    diagnostics = (bundle_dir / "static" / "output" / "replicas.json").read_bytes()
+    report = world.publish(bundle_dir)
+    assert report["status"] == "published" and report["replicas"]["placement"] == "public"
+    assert report["replicas"]["path"] == f"{GS}/output/replicas.json"
+    assert world.reader.try_sync() is None
+    assert (world.reader.folder / GS / "output" / "replicas.json").read_bytes() == diagnostics
+    assert world.keys(f"{STATE}/replicas/") == []
