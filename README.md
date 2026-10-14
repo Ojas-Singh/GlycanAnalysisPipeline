@@ -527,7 +527,7 @@ The measurements are those of the sampling-robustness analysis of the thesis (se
 
 | | |
 |---|---|
-| per replica | frames, retained frames, time per frame and simulated time; Level 1 population (fraction of its frames in each cluster); the Level 1 clusters that hold at least 10% of the pooled frames and less than 1% of its own; rotamer occupancy (thirds of the circle around 60°, 180° and −60°; gg, gt, tg for ω of a 1–6 or 2–6 linkage) and rotamer transitions of every glycosidic torsion; TV and overlap between its two halves; the rank of the jump into its first frame (below) |
+| per replica | frames, retained frames, time per frame and simulated time; Level 1 population (fraction of its frames in each cluster); the Level 1 clusters that hold at least 10% of the pooled frames and less than 1% of its own; rotamer occupancy (thirds of the circle around 60°, 180° and −60° of the stored angle; for ω of a 1–6 or 2–6 linkage gt, tg, gg in an entry of torsion definitions version 2 and gg, gt, tg in one of version 1, read from `torsions.conventions` of `info.json`) and rotamer transitions of every glycosidic torsion; TV and overlap between its two halves; the rank of the jump into its first frame (below) |
 | between replicas | over all pairs of full-length replicas, the mean and the largest: total variation distance (TV) of the populations, 0.5 Σ\|p − q\|, the share of frames that would have to change cluster; overlap of the (PC1, PC2) distributions, Σ min(P, Q) on a 25 × 25 grid over the 0.5th to 99.5th percentile of the frames of the entry; Jensen–Shannon divergence (base 2) of every glycosidic torsion, 36 bins of 10°, and of every linkage (its largest torsion); the standard error of each pooled population |
 | halves | first against second half of one replica (within) and first half of one against second half of another (across): the same amount of data either way |
 | floor | the same between-replica measures after the frames were dealt at random to the replicas: what uncorrelated frames of one distribution give for this many frames, against which a disagreement is read. One deal, seeded with the number of the GlycoShape ID as in the thesis; on the node, before an entry has an ID, with its GLYCAM name, so that the two differ by the noise of the deal (for GS00877 a TV of 0.006 against 0.0096) |
@@ -568,7 +568,8 @@ The thresholds apply to the values as the file shows them (four decimals), as in
 **The file.** `replicas.json` (schema `glycoshape-replica-diagnostics`, version 1; compact JSON, 10 to 130 KB, median 33 KB) is a function of the entry and the parameters only: no time stamp, the same analysis gives the same bytes. Its keys:
 
 ```
-schema, schema_version, glycam_name, glycoshape_id (null before publishing), generator, parameters
+schema, schema_version, glycam_name, glycoshape_id (null before publishing), generator, parameters,
+              torsion_conventions_version (1 or 2: the omega scale of the entry)
 frames        trajectory, retained, unassigned
 boundaries    basis, recorded_by, replicas, full_length_replicas, full_length_by, evidence
 replicas[]    index, name, first_frame, frames, retained, basis, recorded_by, segment, time_per_frame_ps,
@@ -580,7 +581,8 @@ halves        population_tv_within/across, overlap_within/across
 floor         population_tv, overlap, seed
 linkages[]    donor, acceptor, label, class, subclass, positions, jsd, jsd_torsion, jsd_floor, jsd_within, jsd_across,
               rotamer_absdiff, rotamer_missing, torsions {phi|psi|omega: name, jsd, jsd_max, jsd_floor, jsd_within,
-              jsd_across, rotamer_absdiff, rotamers[replica][3], transitions[replica], rotamer_names (gg, gt, tg)}
+              jsd_across, rotamer_absdiff, rotamers[replica][3], transitions[replica], rotamer_centres (IUPAC angle of each
+              third of an omega), rotamer_names (gg/gt/tg of each third, 1-6 and 2-6)}
 torsion_histograms   bins, from_degrees, torsions[] {name, counts[replica][36]}: the torsions whose replicas agree least
 verdict       value, reasons[], criteria, thresholds
 landscape     pc1_range, pc2_range, grid, sigma_cells, mass; pooled[] {mass, lines}; replicas[] {replica, frames_outside,
