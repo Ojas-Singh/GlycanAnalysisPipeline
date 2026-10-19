@@ -283,6 +283,11 @@ def _print_entry(report: dict) -> None:
     lookups = entry["lookups"]
     _say(f"  lookups: {'offline' if lookups['offline'] else 'online'}, {lookups['counts']}; "
          f"unanswered {lookups['unanswered'] or 'none'}; empty fields {entry['gaps'] or 'none'}")
+    states = lookups.get("glytoucan") or {}
+    if states:
+        _say("  GlyTouCan: " + "; ".join(
+            f"{variant} {state.get('accession') or state.get('status', '?').replace('_', ' ')}"
+            for variant, state in states.items()))
 
 
 def _print_plan(report: dict) -> None:

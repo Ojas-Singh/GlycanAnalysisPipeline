@@ -87,6 +87,7 @@ def install(monkeypatch: Any, online: bool = True, crabwurcs: bool = True, snfg:
     else:
         monkeypatch.setattr(name_utils, "iupac2properties", lambda iupac: None)   # what it returns when PubChem is down
     monkeypatch.setattr(name_utils, "crabwurcs_convert", fake_crabwurcs if crabwurcs else (lambda *a, **k: None))
+    monkeypatch.setattr(name_utils, "crabwurcs_normalize", (lambda wurcs, timeout=30: wurcs) if crabwurcs else (lambda *a, **k: None))
     if not crabwurcs:                                    # nor the Java fallback, which a machine may have
         monkeypatch.setattr(name_utils, "smiles2wurcs", lambda smiles: None)
     if snfg:

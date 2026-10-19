@@ -624,6 +624,57 @@ def identity_gaps(data: Dict[str, Any]) -> List[str]:
     return gaps
 
 
+#: What became of the GlyTouCan accession of a variant (:func:`accession_states`).
+ACCESSION_STATUSES = ("found", "given", "not_registered", "no_answer", "no_wurcs", "not_looked_up")
+
+
+def accession_states(data: Dict[str, Any], summary: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """The GlyTouCan accession of each variant and how it was come by.
+
+    ``found``: a service named it for the variant's WURCS; ``given``: the
+    entry has it from elsewhere (the submission, an administrator) and no
+    lookup confirmed it; ``not_registered``: a service answered and GlyTouCan
+    has none for the WURCS; ``no_answer``: no service answered (or lookups
+    were off); ``no_wurcs``: the variant has no WURCS to look up;
+    ``not_looked_up``: there is a WURCS and no lookup of it was recorded.
+    """
+    from lib import lookups
+
+    outcomes = {item.get("wurcs"): item for item in (summary or {}).get("accessions") or [] if isinstance(item, dict)}
+    states: Dict[str, Dict[str, Any]] = {}
+    for variant in ("archetype", "alpha", "beta"):
+        entry = data.get(variant) if isinstance(data.get(variant), dict) else {}
+        accession = str(entry.get("glytoucan") or "").strip() or None
+        wurcs = str(entry.get("wurcs") or "").strip() or None
+        outcome = outcomes.get(wurcs) if wurcs else None
+        if accession:
+            status = "found" if outcome and outcome.get("accession") == accession else "given"
+        elif not wurcs:
+            status = "no_wurcs"
+        elif outcome and outcome.get("status") in (lookups.NOT_REGISTERED, lookups.NO_ANSWER):
+            status = outcome["status"]
+        else:
+            status = "not_looked_up"
+        states[variant] = {"accession": accession, "status": status,
+                           "source": (outcome or {}).get("source") if status in ("found", "not_registered") else None}
+    return states
+
+
+def accession_warnings(states: Dict[str, Dict[str, Any]]) -> List[str]:
+    """The warnings of a report about the accessions: which variants are not registered, which could not be looked up."""
+    def which(status: str) -> List[str]:
+        return [variant for variant, state in states.items() if state.get("status") == status]
+
+    warnings = []
+    if which("not_registered"):
+        warnings.append(f"GlyTouCan accession not registered: {', '.join(which('not_registered'))} "
+                        "(GlyTouCan answered and has none for its WURCS; register the structure, then look it up again)")
+    if which("no_answer"):
+        warnings.append(f"GlyTouCan accession lookup failed: {', '.join(which('no_answer'))} "
+                        "(neither GlyCosmos nor GlyTouCan answered; look it up again later)")
+    return warnings
+
+
 def _folder_files(folder: Path) -> Dict[str, Dict[str, Any]]:
     files = {}
     for path in sorted(p for p in folder.rglob("*") if p.is_file()):
@@ -879,8 +930,14 @@ def folder_report(folder: Path, data: Dict[str, Any], levels, summary: Dict[str,
     if not archetype.get("wurcs") and not archetype.get("glytoucan"):
         problems.append("the archetype has neither a WURCS nor a GlyTouCan accession "
                         "(the static stage of main.py calls such a folder incomplete)")
-    if summary["unanswered"]:
-        warnings.append("lookups without an answer: " + ", ".join(summary["unanswered"]))
+    from lib import lookups
+
+    # The accessions are said per variant (not registered, or not answered); the other lookups by name.
+    summary = {**summary, "glytoucan": accession_states(data, summary)}
+    warnings += accession_warnings(summary["glytoucan"])
+    others = [name for name in summary["unanswered"] if name not in lookups.ACCESSION_LOOKUPS]
+    if others:
+        warnings.append("lookups without an answer: " + ", ".join(others))
     if summary["tools"].get("crabwurcs", {}).get("available") is False:
         warnings.append("crabWURCS could not be run: " + summary["tools"]["crabwurcs"]["detail"])
     return {

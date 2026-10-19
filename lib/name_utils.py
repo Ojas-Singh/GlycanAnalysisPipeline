@@ -1,6 +1,8 @@
 
 import re
 import sys
+from dataclasses import dataclass
+from typing import Optional, Tuple
 import shutil
 import os
 import requests
@@ -249,6 +251,36 @@ def crabwurcs_convert(value, source_format, target_format, timeout=30):
         detail,
     )
     return None
+
+def crabwurcs_normalize(wurcs, timeout=30):
+    """The canonical spelling of a WURCS, with the local crabWURCS (``normalize-wurcs``; no network).
+
+    ``None`` when crabWURCS is unavailable or cannot read the WURCS.
+    """
+    text_value = str(wurcs or "").strip()
+    if not text_value:
+        return None
+    try:
+        result = subprocess.run(
+            [config.crabwurcs_executable, "normalize-wurcs"],
+            input=text_value,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.debug("crabWURCS normalisation unavailable: %s", exc)
+        if isinstance(exc, FileNotFoundError):
+            lookups.tool("crabwurcs", False, f"executable not found: {config.crabwurcs_executable}")
+        return None
+    lookups.tool("crabwurcs", True, str(config.crabwurcs_executable))
+    normalized = result.stdout.strip()
+    if result.returncode == 0 and normalized.startswith("WURCS="):
+        return normalized
+    logger.debug("crabWURCS could not normalise %s: %s", text_value[:80], result.stderr.strip() or f"exit code {result.returncode}")
+    return None
+
 
 def wurcs2extendediupac(wurcs):
     """
@@ -902,7 +934,11 @@ def validate_wurcs(wurcs):
         return None
 
 def normalize_wurcs(wurcs):
-    url = "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs"
+    """The canonical spelling of a WURCS: the local crabWURCS first, GlyCosmos' converter when it cannot."""
+    local = crabwurcs_normalize(wurcs)
+    if local:
+        return local
+    url = GLYCOSMOS_WURCS2WURCS
     try:
         response = lookups.post(url, lookup="normalize_wurcs", subject=wurcs, json=[wurcs])
         response.raise_for_status()
@@ -915,30 +951,157 @@ def normalize_wurcs(wurcs):
         logger.error(f"Failed to normalize WURCS: {str(e)}")
         return None  
     
-def wurcs2glytoucan(wurcs):
-    """Resolve a WURCS string to a GlyTouCan ID using GlyCosmos.
+# --- GlyTouCan accessions ----------------------------------------------------------------------------
+#
+# An accession is asked for by the WURCS of a structure.  GlyCosmos first (its format converter
+# canonicalises the WURCS and names the accession; its exact-match list as a fallback), then
+# GlyTouCan's own SPARQL endpoint, by exact match on the WURCS as written and on its canonical
+# spelling by the local crabWURCS.  GlyCosmos is behind a bot protection that refuses some servers
+# (HTTP 403 "Just a moment..."); GlyTouCan's endpoint answers them.  The outcome tells "not
+# registered" (a service answered and has no accession) from "no answer" (none answered).
 
-    GlyTouCan stores canonical WURCS strings, while valid WURCS produced by
-    converters may differ only in residue/linkage ordering.  The historical
-    ``wurcs2gtcids`` lookup is an exact-string query and reports those valid
-    aliases as missing.  Ask the format converter first because it
-    canonicalizes the structure and includes the matching accession.
-    
-    Args:
-        wurcs (str): WURCS format string
-        
-    Returns:
-        str: GlyTouCan ID or None if request fails
+GLYCOSMOS_WURCS2WURCS = "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs"
+GLYCOSMOS_WURCS2GTCIDS = "https://api.glycosmos.org/sparqlist/wurcs2gtcids"
+GLYTOUCAN_SPARQL_ENDPOINT = "https://ts.glytoucan.org/sparql"
+#: WURCS per SPARQL query (an ``IN`` list of exact strings: about a second for 50).
+SPARQL_BATCH = 50
+#: Where GlyTouCan registers a structure (shown to whoever has to register one).
+GLYTOUCAN_REGISTRATION = "https://glytoucan.org/Users/structure"
+
+
+@dataclass(frozen=True)
+class AccessionLookup:
+    """How the accession lookup of one WURCS ended.
+
+    ``status`` is ``found``, ``not_registered`` (a service answered and has
+    no accession for it) or ``no_answer`` (no service answered); ``source``
+    the service that answered (``glycosmos`` or ``glytoucan``); ``errors``
+    what the services that did not answer said.
+    """
+
+    wurcs: str
+    status: str
+    accession: Optional[str] = None
+    source: Optional[str] = None
+    errors: Tuple[str, ...] = ()
+
+
+def _http_status(exc):
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int):
+        return code
+    match = re.match(r"(\d{3}) ", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _glycosmos_answer(item):
+    """``(accession, said_missing)`` of one item of a GlyCosmos answer."""
+    if not isinstance(item, dict):
+        return None, False
+    accession = str(item.get("id") or "").strip()
+    if accession:
+        return accession, False
+    return None, "not found" in str(item.get("message") or "").lower()
+
+
+def _sparql_text(value):
+    """A SPARQL string literal (JSON escapes are SPARQL escapes)."""
+    return json.dumps(str(value))
+
+
+def _glytoucan_exact(texts, subject):
+    """GlyTouCan's accessions of exact WURCS strings: ``{text: accession}``; raises when it does not answer."""
+    texts = list(dict.fromkeys(texts))
+    query = f"""
+PREFIX glycan: <http://purl.jp/bio/12/glyco/glycan#>
+PREFIX glytoucan: <http://www.glytoucan.org/glyco/owl/glytoucan#>
+SELECT DISTINCT ?sequence ?id WHERE {{
+  ?saccharide glytoucan:has_primary_id ?id ;
+              glycan:has_glycosequence ?glycosequence .
+  ?glycosequence glycan:in_carbohydrate_format glycan:carbohydrate_format_wurcs ;
+                 glycan:has_sequence ?sequence .
+  FILTER (STR(?sequence) IN ({", ".join(_sparql_text(text) for text in texts)}))
+}}
+"""
+    response = lookups.post(
+        GLYTOUCAN_SPARQL_ENDPOINT,
+        lookup="glytoucan_sparql",
+        subject=subject,
+        data={"query": query},
+        headers={"Accept": "application/sparql-results+json"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    bindings = payload.get("results", {}).get("bindings") if isinstance(payload, dict) else None
+    if not isinstance(bindings, list):
+        raise ValueError("GlyTouCan answered without SPARQL results")
+    found = {}
+    for binding in bindings:
+        sequence = ((binding or {}).get("sequence") or {}).get("value")
+        accession = str(((binding or {}).get("id") or {}).get("value") or "").strip()
+        if sequence is None or not accession:
+            continue
+        found.setdefault(str(sequence), set()).add(accession)
+    answer = {}
+    for text, accessions in found.items():
+        if len(accessions) > 1:
+            logger.warning("GlyTouCan has %d accessions for one WURCS (%s); taking %s",
+                           len(accessions), ", ".join(sorted(accessions)), sorted(accessions)[0])
+        answer[text] = sorted(accessions)[0]
+    return answer
+
+
+def glytoucan_accessions(wurcs_values, batch_size=SPARQL_BATCH):
+    """Accessions of WURCS strings in GlyTouCan's SPARQL endpoint, by exact match.
+
+    Each WURCS is asked for as it is written and in the canonical spelling of
+    the local crabWURCS (``normalize-wurcs``; no network).  Returns
+    ``{wurcs: accession or None}`` (``None``: GlyTouCan has none); raises
+    ``requests.RequestException`` (or ``ValueError``) when GlyTouCan does
+    not answer.
+    """
+    unique = list(dict.fromkeys(str(w or "").strip() for w in wurcs_values if str(w or "").strip()))
+    offline = lookups.is_offline()
+    spellings = {}
+    for wurcs in unique:
+        normalized = None if offline else crabwurcs_normalize(wurcs)
+        spellings[wurcs] = [wurcs] + ([normalized] if normalized and normalized != wurcs else [])
+    results = {}
+    for start in range(0, len(unique), batch_size):
+        chunk = unique[start:start + batch_size]
+        texts = [text for wurcs in chunk for text in spellings[wurcs]]
+        found = _glytoucan_exact(texts, chunk[0] if len(chunk) == 1 else f"{len(chunk)} WURCS")
+        for wurcs in chunk:
+            results[wurcs] = next((found[text] for text in spellings[wurcs] if text in found), None)
+    return results
+
+
+def _settled(wurcs, status, accession=None, source=None, errors=(), since=None):
+    lookups.settle_accession(wurcs, status, accession, source, since)
+    return AccessionLookup(wurcs, status, accession, source, tuple(errors))
+
+
+def lookup_accession(wurcs):
+    """The GlyTouCan accession of a WURCS, and how the lookup ended (:class:`AccessionLookup`).
+
+    GlyCosmos' format converter (which canonicalises the WURCS), its exact
+    list unless GlyCosmos refused (HTTP 403) or said it has none, then
+    GlyTouCan's SPARQL endpoint.  ``found`` when any service names an
+    accession, ``not_registered`` when one answered and none has it,
+    ``no_answer`` when none answered.
     """
     wurcs = str(wurcs or "").strip()
     if not wurcs:
-        return None
-
+        return AccessionLookup("", lookups.NO_ANSWER, errors=("no WURCS",))
+    since = lookups.mark()
     errors = []
+    answered = refused = False
 
     try:
         response = lookups.post(
-            "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs",
+            GLYCOSMOS_WURCS2WURCS,
             lookup="wurcs2glytoucan",
             subject=wurcs,
             json=[wurcs],
@@ -946,90 +1109,116 @@ def wurcs2glytoucan(wurcs):
         )
         response.raise_for_status()
         data = response.json()
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            glytoucan_id = str(data[0].get("id") or "").strip()
-            if glytoucan_id:
-                return glytoucan_id
+        accession, missing = _glycosmos_answer(data[0] if isinstance(data, list) and data else None)
+        if accession:
+            return _settled(wurcs, lookups.FOUND, accession, "glycosmos", since=since)
+        answered = missing
     except Exception as exc:
-        errors.append(f"canonical lookup: {exc}")
+        errors.append(f"GlyCosmos converter: {exc}")
+        refused = _http_status(exc) == 403
 
-    # Retain the exact-match endpoint as a fallback in case the format
-    # converter accepts the WURCS but does not include accession metadata.
+    # The exact-match list, when the converter accepted the WURCS without saying whether it has an accession.
+    if not answered and not refused:
+        try:
+            response = lookups.get(
+                GLYCOSMOS_WURCS2GTCIDS,
+                lookup="wurcs2glytoucan_exact",
+                subject=wurcs,
+                params={"wurcs": wurcs},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            for match in data if isinstance(data, list) else []:
+                accession, missing = _glycosmos_answer(match)
+                if accession:
+                    return _settled(wurcs, lookups.FOUND, accession, "glycosmos", since=since)
+                answered = answered or missing
+        except Exception as exc:
+            errors.append(f"GlyCosmos exact match: {exc}")
+
+    # GlyTouCan itself: it answers where GlyCosmos refuses, and has what GlyCosmos has not synchronised yet.
     try:
-        response = lookups.get(
-            "https://api.glycosmos.org/sparqlist/wurcs2gtcids",
-            lookup="wurcs2glytoucan_exact",
-            subject=wurcs,
-            params={"wurcs": wurcs},
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, list):
-            for match in data:
-                if not isinstance(match, dict):
-                    continue
-                glytoucan_id = str(match.get("id") or "").strip()
-                if glytoucan_id:
-                    return glytoucan_id
+        accession = glytoucan_accessions([wurcs]).get(wurcs)
+        if accession:
+            return _settled(wurcs, lookups.FOUND, accession, "glytoucan", since=since)
+        return _settled(wurcs, lookups.NOT_REGISTERED, None, "glytoucan", errors, since=since)
     except Exception as exc:
-        errors.append(f"exact lookup: {exc}")
+        errors.append(f"GlyTouCan SPARQL: {exc}")
 
-    if errors:
-        logger.error(
-            "Failed to convert WURCS to GlyTouCan ID (%s)",
-            "; ".join(errors),
-        )
-    return None
+    if answered:
+        logger.info("GlyTouCan has no accession for %s (GlyCosmos answered; GlyTouCan did not)", wurcs[:120])
+        return _settled(wurcs, lookups.NOT_REGISTERED, None, "glycosmos", errors, since=since)
+    logger.error("Failed to convert WURCS to GlyTouCan ID (%s)", "; ".join(errors))
+    return _settled(wurcs, lookups.NO_ANSWER, None, None, errors)
 
 
-def wurcs2glytoucan_many(wurcs_values, batch_size=100):
-    """Resolve multiple WURCS strings with GlyCosmos' batch converter.
+def wurcs2glytoucan(wurcs):
+    """The GlyTouCan accession of a WURCS, or ``None`` (not registered, or no service answered).
 
-    Returns a mapping for every non-empty input.  Values are ``None`` only
-    when no accession could be found.  Malformed or partial batch responses
-    fall back to the scalar resolver rather than silently misaligning IDs.
+    :func:`lookup_accession` says which.
     """
-    unique_wurcs = list(dict.fromkeys(
-        str(wurcs or "").strip()
-        for wurcs in wurcs_values
-        if str(wurcs or "").strip()
-    ))
-    results = {}
+    return lookup_accession(wurcs).accession
 
-    for start in range(0, len(unique_wurcs), batch_size):
-        batch = unique_wurcs[start:start + batch_size]
+
+def lookup_accessions_many(wurcs_values, batch_size=100):
+    """:func:`lookup_accession` of many WURCS: GlyCosmos' batch converter, then GlyTouCan for the rest.
+
+    Returns ``{wurcs: AccessionLookup}`` for every non-empty input.  A
+    malformed or partial batch answer is not used (the IDs would not line up
+    with the WURCS): its WURCS are asked of GlyTouCan.
+    """
+    unique = list(dict.fromkeys(str(w or "").strip() for w in wurcs_values if str(w or "").strip()))
+    results = {}
+    for start in range(0, len(unique), batch_size):
+        chunk = unique[start:start + batch_size]
+        since = lookups.mark()
+        errors = []
+        said_missing = set()
         try:
             response = lookups.post(
-                "https://api.glycosmos.org/glycanformatconverter/2.10.4/wurcs2wurcs",
+                GLYCOSMOS_WURCS2WURCS,
                 lookup="wurcs2glytoucan_many",
-                subject=f"{len(batch)} WURCS",
-                json=batch,
+                subject=f"{len(chunk)} WURCS",
+                json=chunk,
                 timeout=60,
             )
             response.raise_for_status()
             payload = response.json()
-            if not isinstance(payload, list) or len(payload) != len(batch):
+            if not isinstance(payload, list) or len(payload) != len(chunk):
                 raise ValueError(
-                    f"expected {len(batch)} converter results, got "
+                    f"expected {len(chunk)} converter results, got "
                     f"{len(payload) if isinstance(payload, list) else type(payload).__name__}"
                 )
-
-            for wurcs, item in zip(batch, payload):
-                glytoucan_id = (
-                    str(item.get("id") or "").strip()
-                    if isinstance(item, dict)
-                    else ""
-                )
-                results[wurcs] = glytoucan_id or None
+            for wurcs, item in zip(chunk, payload):
+                accession, missing = _glycosmos_answer(item)
+                if accession:
+                    results[wurcs] = _settled(wurcs, lookups.FOUND, accession, "glycosmos")
+                elif missing:
+                    said_missing.add(wurcs)
         except Exception as exc:
-            logger.warning(
-                "Batch WURCS-to-GlyTouCan lookup failed for %d entries; "
-                "falling back to individual lookup: %s",
-                len(batch),
-                exc,
-            )
-            for wurcs in batch:
-                results[wurcs] = wurcs2glytoucan(wurcs)
-
+            logger.warning("Batch WURCS-to-GlyTouCan lookup at GlyCosmos failed for %d entries; "
+                           "asking GlyTouCan: %s", len(chunk), exc)
+            errors.append(f"GlyCosmos converter: {exc}")
+        pending = [wurcs for wurcs in chunk if wurcs not in results]
+        if pending:
+            try:
+                found = glytoucan_accessions(pending)
+                for wurcs in pending:
+                    status = lookups.FOUND if found.get(wurcs) else lookups.NOT_REGISTERED
+                    results[wurcs] = _settled(wurcs, status, found.get(wurcs), "glytoucan", errors)
+            except Exception as exc:
+                errors.append(f"GlyTouCan SPARQL: {exc}")
+                for wurcs in pending:
+                    if wurcs in said_missing:
+                        results[wurcs] = _settled(wurcs, lookups.NOT_REGISTERED, None, "glycosmos", errors)
+                    else:
+                        results[wurcs] = _settled(wurcs, lookups.NO_ANSWER, None, None, errors)
+        if all(results[wurcs].status != lookups.NO_ANSWER for wurcs in chunk):
+            lookups.cover(since, "glytoucan" if pending else "glycosmos")
     return results
+
+
+def wurcs2glytoucan_many(wurcs_values, batch_size=100):
+    """``{wurcs: accession or None}`` of :func:`lookup_accessions_many`."""
+    return {wurcs: lookup.accession for wurcs, lookup in lookup_accessions_many(wurcs_values, batch_size).items()}

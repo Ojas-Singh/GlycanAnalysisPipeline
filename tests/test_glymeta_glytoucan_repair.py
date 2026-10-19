@@ -78,10 +78,17 @@ class GlyTouCanRepairTests(unittest.TestCase):
             {"message": "Accession not found."},
         ]
 
-        with patch(
-            "lib.name_utils.requests.post",
-            return_value=response,
-        ) as post:
+        sparql = Mock()
+        sparql.raise_for_status.return_value = None
+        sparql.json.return_value = {"results": {"bindings": []}}
+
+        def answer(url, **kwargs):
+            return sparql if url == name_utils.GLYTOUCAN_SPARQL_ENDPOINT else response
+
+        with (
+            patch("lib.name_utils.requests.post", side_effect=answer) as post,
+            patch.object(name_utils, "crabwurcs_normalize", side_effect=lambda wurcs, timeout=30: wurcs),
+        ):
             result = name_utils.wurcs2glytoucan_many(
                 ["WURCS=2.0/one", "WURCS=2.0/two", "WURCS=2.0/one"]
             )
@@ -94,9 +101,13 @@ class GlyTouCanRepairTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            post.call_args.kwargs["json"],
+            post.call_args_list[0].kwargs["json"],
             ["WURCS=2.0/one", "WURCS=2.0/two"],
         )
+        # What GlyCosmos has no accession for is asked of GlyTouCan (it may not have synchronised yet).
+        self.assertEqual(post.call_args_list[1].args[0], name_utils.GLYTOUCAN_SPARQL_ENDPOINT)
+        self.assertIn('"WURCS=2.0/two"', post.call_args_list[1].kwargs["data"]["query"])
+        self.assertNotIn('"WURCS=2.0/one"', post.call_args_list[1].kwargs["data"]["query"])
 
     def test_missing_report_rechecks_and_deduplicates_wurcs(self):
         wurcs = "WURCS=2.0/1,1,0/[a2122h-1b_1-5]/1/"

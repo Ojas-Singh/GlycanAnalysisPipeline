@@ -20,6 +20,16 @@ place the requests go through, so that
 
 Without :func:`recording` nothing is kept and the behaviour is the one of
 the settings.  The log belongs to the thread (context) that opened it.
+
+Every request names the pipeline in its ``User-Agent`` (:data:`USER_AGENT`).
+
+GlyTouCan accessions are looked up in more than one service (GlyCosmos,
+then GlyTouCan's own SPARQL endpoint; ``lib.name_utils.lookup_accession``).
+The outcome of each such lookup is kept apart from its requests
+(:func:`settle_accession`): ``found``, ``not_registered`` (a service
+answered and has no accession for the WURCS) or ``no_answer`` (none
+answered).  A request that failed while another service answered for the
+same WURCS is marked ``covered_by`` that service and is not unanswered.
 """
 from __future__ import annotations
 
@@ -37,6 +47,13 @@ import lib.config as config
 #: Statuses of a recorded request.  All but ``ok`` mean that the answer is missing.
 OK, HTTP_ERROR, FAILED, OFFLINE, SKIPPED = "ok", "http_error", "failed", "offline", "skipped"
 UNANSWERED = (HTTP_ERROR, FAILED, OFFLINE, SKIPPED)
+#: Outcomes of an accession lookup (:func:`settle_accession`).
+FOUND, NOT_REGISTERED, NO_ANSWER = "found", "not_registered", "no_answer"
+ACCESSION_OUTCOMES = (FOUND, NOT_REGISTERED, NO_ANSWER)
+#: The lookups that ask for a GlyTouCan accession (lib.name_utils): their outcome is the one of the WURCS.
+ACCESSION_LOOKUPS = ("wurcs2glytoucan", "wurcs2glytoucan_exact", "wurcs2glytoucan_many", "glytoucan_sparql")
+#: What every request of the pipeline says it is (GlyCosmos refuses some default user agents).
+USER_AGENT = "GlycoShape-GlycanAnalysisPipeline/1.0 (+https://github.com/Ojas-Singh/GlycanAnalysisPipeline)"
 _SUBJECT_LIMIT = 300
 _ERROR_LIMIT = 300
 
@@ -54,6 +71,8 @@ class LookupLog:
     budget: Optional[float] = None
     requests: List[Dict[str, Any]] = field(default_factory=list)
     tools: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: The outcome of every accession lookup: ``{"wurcs", "status", "accession", "source"}``.
+    accessions: List[Dict[str, Any]] = field(default_factory=list)
     _started: float = field(default_factory=time.monotonic, repr=False)
 
     def remaining(self) -> Optional[float]:
@@ -63,20 +82,36 @@ class LookupLog:
         return self.budget - (time.monotonic() - self._started)
 
     def unanswered(self) -> List[str]:
-        """Names of the lookups of which at least one request got no answer, sorted."""
-        return sorted({entry["lookup"] for entry in self.requests if entry["status"] in UNANSWERED})
+        """Names of the lookups of which at least one request got no answer, sorted.
+
+        A request that failed while another service answered the same question
+        (``covered_by``) is not counted.
+        """
+        return sorted({entry["lookup"] for entry in self.requests
+                       if entry["status"] in UNANSWERED and not entry.get("covered_by")})
 
     def summary(self) -> Dict[str, Any]:
-        """A JSON document of the log: settings, counts per status, what to retry, every request."""
+        """A JSON document of the log: settings, counts per status, what to retry, every request.
+
+        ``accessions`` are the outcomes of the accession lookups, one per WURCS
+        (the last one when a WURCS was looked up twice), and
+        ``accession_counts`` their counts.
+        """
         counts = {status: 0 for status in (OK,) + UNANSWERED}
         for entry in self.requests:
             counts[entry["status"]] += 1
+        outcomes = {item["wurcs"]: item for item in self.accessions}
+        accession_counts = {status: 0 for status in ACCESSION_OUTCOMES}
+        for item in outcomes.values():
+            accession_counts[item["status"]] += 1
         return {
             "offline": self.offline,
             "timeout_seconds": self.timeout if self.timeout is not None else float(config.lookup_timeout),
             "budget_seconds": self.budget,
             "counts": counts,
             "unanswered": self.unanswered(),
+            "accession_counts": accession_counts,
+            "accessions": [dict(item) for item in outcomes.values()],
             "tools": {name: dict(state) for name, state in sorted(self.tools.items())},
             "requests": [dict(entry) for entry in self.requests],
         }
@@ -144,6 +179,45 @@ def tool(name: str, available: bool, detail: str = "") -> None:
         state["detail"] = str(detail)[:_ERROR_LIMIT]
 
 
+def mark() -> int:
+    """Where the log of this thread stands now (the number of requests it holds; 0 without a log).
+
+    Give it to :func:`settle_accession` as ``since``: the requests made after
+    it are the ones of that lookup.
+    """
+    log = _ACTIVE.get()
+    return len(log.requests) if log is not None else 0
+
+
+def settle_accession(wurcs: str, status: str, accession: Optional[str] = None, source: Optional[str] = None,
+                     since: Optional[int] = None) -> None:
+    """Record how the accession lookup of ``wurcs`` ended.
+
+    ``status`` is :data:`FOUND`, :data:`NOT_REGISTERED` or :data:`NO_ANSWER`;
+    ``source`` the service that answered.  When a service answered, the
+    accession requests since ``since`` that got no answer are marked
+    ``covered_by`` it: another service failed, and the question was answered.
+    """
+    if status not in ACCESSION_OUTCOMES:
+        raise ValueError(f"not an outcome of an accession lookup: {status!r}")
+    log = _ACTIVE.get()
+    if log is None:
+        return
+    if status != NO_ANSWER and since is not None:
+        cover(since, source or "another service")
+    log.accessions.append({"wurcs": str(wurcs), "status": status, "accession": accession, "source": source})
+
+
+def cover(since: int, by: str) -> None:
+    """Mark the accession requests since ``since`` that got no answer as answered by ``by``."""
+    log = _ACTIVE.get()
+    if log is None:
+        return
+    for entry in log.requests[since:]:
+        if entry["status"] in UNANSWERED and entry["lookup"] in ACCESSION_LOOKUPS:
+            entry.setdefault("covered_by", by)
+
+
 def _short(value: Any, limit: int) -> str:
     text = "" if value is None else str(value)
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -187,14 +261,24 @@ def _attempt(lookup: str, subject: Any, service: str, timeout: Optional[float], 
     return response
 
 
+def _headers(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """The request's arguments with the pipeline's ``User-Agent`` (unless the caller gave one)."""
+    headers = dict(kwargs.get("headers") or {})
+    if not any(str(name).lower() == "user-agent" for name in headers):
+        headers["User-Agent"] = USER_AGENT
+    return {**kwargs, "headers": headers}
+
+
 def get(url: str, *, lookup: str, subject: Any = None, timeout: Optional[float] = None, **kwargs: Any) -> Any:
     """``requests.get`` with a timeout, refused when offline, recorded when a log is active."""
+    kwargs = _headers(kwargs)
     return _attempt(lookup, subject, urlsplit(url).netloc, timeout,
                     lambda limit: requests.get(url, timeout=limit, **kwargs))
 
 
 def post(url: str, *, lookup: str, subject: Any = None, timeout: Optional[float] = None, **kwargs: Any) -> Any:
     """``requests.post`` with a timeout, refused when offline, recorded when a log is active."""
+    kwargs = _headers(kwargs)
     return _attempt(lookup, subject, urlsplit(url).netloc, timeout,
                     lambda limit: requests.post(url, timeout=limit, **kwargs))
 

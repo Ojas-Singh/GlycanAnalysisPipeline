@@ -55,7 +55,7 @@ def test_every_request_of_the_name_services_goes_through_the_lookups_module():
     source = (REPO_ROOT / "lib" / "name_utils.py").read_text()
     code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
     assert not re.search(r"requests\.(get|post|request|Session)\(", code)
-    assert code.count("lookups.get(") + code.count("lookups.post(") == 12
+    assert code.count("lookups.get(") + code.count("lookups.post(") == 13
     assert "timeout=MOLWURCS_TIMEOUT_SECONDS" in code            # the Java fallback is bounded as well
 
 
