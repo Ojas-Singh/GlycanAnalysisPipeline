@@ -1,0 +1,6 @@
+{
+ "note": "What api.glycosmos.org answers the production server (OVH, 2026-10-19): Cloudflare's bot challenge, HTTP 403, for every request. The HTML is shortened.",
+ "status": 403,
+ "headers": {"content-type": "text/html; charset=UTF-8", "server": "cloudflare", "cf-mitigated": "challenge"},
+ "body": "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body><noscript>Enable JavaScript and cookies to continue</noscript></body></html>"
+}

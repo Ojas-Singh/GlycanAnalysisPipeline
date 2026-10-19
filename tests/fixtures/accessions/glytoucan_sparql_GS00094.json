@@ -1,0 +1,43 @@
+{
+ "request": {
+  "method": "POST",
+  "url": "https://ts.glytoucan.org/sparql",
+  "query": "\nPREFIX glycan: <http://purl.jp/bio/12/glyco/glycan#>\nPREFIX glytoucan: <http://www.glytoucan.org/glyco/owl/glytoucan#>\nSELECT DISTINCT ?sequence ?id WHERE {\n  ?saccharide glytoucan:has_primary_id ?id ;\n              glycan:has_glycosequence ?glycosequence .\n  ?glycosequence glycan:in_carbohydrate_format glycan:carbohydrate_format_wurcs ;\n                 glycan:has_sequence ?sequence .\n  FILTER (STR(?sequence) IN (\"WURCS=2.0/5,9,8/[u2122h_2*NCC/3=O][a2122h-1b_1-5_2*NCC/3=O][a1122h-1b_1-5][a1122h-1a_1-5][a2112h-1b_1-5]/1-2-3-4-2-5-4-4-4/a4-b1_b4-c1_c3-d1_c6-g1_d2-e1_e4-f1_g3-h1_g6-i1\", \"WURCS=2.0/5,9,8/[a2122h-1a_1-5_2*NCC/3=O][a2122h-1b_1-5_2*NCC/3=O][a1122h-1b_1-5][a1122h-1a_1-5][a2112h-1b_1-5]/1-2-3-4-2-5-4-4-4/a4-b1_b4-c1_c3-d1_c6-g1_d2-e1_e4-f1_g3-h1_g6-i1\", \"WURCS=2.0/4,9,8/[a2122h-1b_1-5_2*NCC/3=O][a1122h-1b_1-5][a1122h-1a_1-5][a2112h-1b_1-5]/1-1-2-3-1-4-3-3-3/a4-b1_b4-c1_c3-d1_c6-g1_d2-e1_e4-f1_g3-h1_g6-i1\"))\n}\n"
+ },
+ "status": 200,
+ "body": {
+  "head": {
+   "link": [],
+   "vars": [
+    "sequence",
+    "id"
+   ]
+  },
+  "results": {
+   "distinct": false,
+   "ordered": true,
+   "bindings": [
+    {
+     "sequence": {
+      "type": "literal",
+      "value": "WURCS=2.0/5,9,8/[u2122h_2*NCC/3=O][a2122h-1b_1-5_2*NCC/3=O][a1122h-1b_1-5][a1122h-1a_1-5][a2112h-1b_1-5]/1-2-3-4-2-5-4-4-4/a4-b1_b4-c1_c3-d1_c6-g1_d2-e1_e4-f1_g3-h1_g6-i1"
+     },
+     "id": {
+      "type": "literal",
+      "value": "G67924FL"
+     }
+    },
+    {
+     "sequence": {
+      "type": "literal",
+      "value": "WURCS=2.0/4,9,8/[a2122h-1b_1-5_2*NCC/3=O][a1122h-1b_1-5][a1122h-1a_1-5][a2112h-1b_1-5]/1-1-2-3-1-4-3-3-3/a4-b1_b4-c1_c3-d1_c6-g1_d2-e1_e4-f1_g3-h1_g6-i1"
+     },
+     "id": {
+      "type": "literal",
+      "value": "G16828VN"
+     }
+    }
+   ]
+  }
+ }
+}
