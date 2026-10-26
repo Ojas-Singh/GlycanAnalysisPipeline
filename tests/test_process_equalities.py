@@ -336,7 +336,8 @@ def test_landscape_in_float64_and_in_threads_is_the_float32_landscape(tmp_path):
 
 
 def reference_pca(landscape, per_pair_scale=False):
-    """The fit of lib.v2._fit_pca_and_write_landscape before the memory changes."""
+    """The fit of lib.v2._fit_pca_and_write_landscape before the memory changes: centred distances, divided by
+    their standard deviations only with ``per_pair_scale``."""
     from sklearn.decomposition import PCA
 
     X = np.asarray(landscape, dtype=float)
@@ -350,13 +351,9 @@ def reference_pca(landscape, per_pair_scale=False):
         X_proc = X_proc / pair_stds[np.newaxis, :]
     feature_means = X_proc.mean(axis=0)
     X_proc -= feature_means
-    feature_stds = X_proc.std(axis=0, ddof=1)
-    feature_stds = np.nan_to_num(feature_stds, nan=1.0, posinf=1.0, neginf=1.0)
-    feature_stds[feature_stds == 0] = 1.0
-    X_proc /= feature_stds
     pca = PCA(n_components=min(10, n_frames, n_pairs), svd_solver="auto", random_state=0)
     scores = pca.fit_transform(X_proc)
-    return pca, scores, feature_means, feature_stds, pair_stds
+    return pca, scores, feature_means, pair_stds
 
 
 @pytest.mark.parametrize("frames,atoms,solver", [(1000, 14, "covariance_eigh"), (400, 20, "full"), (900, 50, "randomized")])
@@ -368,7 +365,7 @@ def test_pca_fit_in_place_equals_the_former_fit(tmp_path, monkeypatch, frames, a
     landscape, chosen = get_conformation_landscape(data_dir, method="noH_noROH_fast", sample_size=300, seed=0,
                                                    return_atom_indices=True)
     np.random.seed(123)                     # the fit does not depend on the global generator
-    pca, scores, means, stds, pair_stds = reference_pca(landscape, per_pair_scale)
+    pca, scores, means, pair_stds = reference_pca(landscape, per_pair_scale)
     assert pca._fit_svd_solver == solver
 
     monkeypatch.setattr(config, "max_workers", 3)
@@ -382,7 +379,7 @@ def test_pca_fit_in_place_equals_the_former_fit(tmp_path, monkeypatch, frames, a
     assert same_bits(frame.select([f"PC{i}" for i in range(1, 11)]).to_numpy(), np.ascontiguousarray(scores))
     assert evr == [float(x) for x in pca.explained_variance_ratio_]
     stored = np.load(tmp_path / "embedding" / "landscape" / "preprocessing.npz")
-    assert same_bits(stored["feature_means"], means) and same_bits(stored["feature_stds"], stds)
+    assert same_bits(stored["feature_means"], means) and "feature_stds" not in stored.files
     if per_pair_scale:
         assert same_bits(stored["pair_stds"], pair_stds)
     model = joblib.load(tmp_path / "embedding" / "landscape" / "pca_model.joblib")

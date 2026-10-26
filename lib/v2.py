@@ -644,10 +644,17 @@ def _fit_pca_and_write_landscape(
     The float64 matrix of the fit is the largest object of the pipeline
     (frames x pairs x 8 bytes: 18.8 GB for 159,940 frames and 14,706 pairs).
     It exists once: with ``overwrite_landscape`` a float64 landscape is
-    standardised in place, the standard deviations are taken block of columns
-    by block of columns (NumPy's std otherwise allocates a second matrix), and
-    scikit-learn centres the matrix itself instead of a copy of it. The
-    arithmetic of every value is unchanged.
+    centred in place (and, with ``per_pair_scale``, divided by the standard
+    deviation of each pair, taken block of columns by block of columns: NumPy's
+    std otherwise allocates a second matrix), and scikit-learn centres the
+    matrix itself instead of a copy of it.
+
+    The distances are centred but not divided by their standard deviations:
+    every pair keeps its variance in square angstroms, so the components follow
+    the large motions of the glycan rather than giving the fluctuation of a
+    bonded distance the same weight as an antenna moving.
+    ``per_pair_scale`` divides each pair by its standard deviation first (the
+    correlation-matrix PCA of the earlier database).
     """
     if np.ndim(landscape) != 2:
         raise ValueError("landscape must be 2D (n_frames, n_features)")
@@ -679,10 +686,6 @@ def _fit_pca_and_write_landscape(
 
     feature_means = _column_mean(X_proc, n_threads)
     _scale_rows(X_proc, np.subtract, feature_means, n_threads)
-    feature_stds = _column_std(X_proc, n_threads)
-    feature_stds = np.nan_to_num(feature_stds, nan=1.0, posinf=1.0, neginf=1.0)
-    feature_stds[feature_stds == 0] = 1.0
-    _scale_rows(X_proc, np.divide, feature_stds, n_threads)
 
     n_components = min(10, n_frames, n_pairs)
     from sklearn.decomposition import PCA as _SkPCA
@@ -725,7 +728,8 @@ def _fit_pca_and_write_landscape(
         "n_atoms": int(chosen_sorted.size),
         "n_pairs": int(n_pairs),
         "n_components": int(n_components),
-        "scale": True,
+        "center": True,
+        "scale": bool(per_pair_scale),
         "per_pair_scale": bool(per_pair_scale),
         "explained_variance_ratio": evr,
         "cumulative_variance": cumulative,
@@ -739,7 +743,6 @@ def _fit_pca_and_write_landscape(
 
     npz_data = dict(
         feature_means=feature_means.astype(np.float64),
-        feature_stds=feature_stds.astype(np.float64),
         pair_i=pair_i.astype(np.int32),
         pair_j=pair_j.astype(np.int32),
         atom_indices=chosen_sorted.astype(np.int32),
@@ -765,7 +768,7 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
 
     logger.info("Computing ROH-excluded conformation landscape (may be memory intensive)")
     # The landscape is asked for as float64 (float32 distances, widened) and
-    # handed over to the fit, which standardises it in place: one matrix
+    # handed over to the fit, which centres it in place: one matrix
     # instead of the float32 one, its float64 copy and the working copy.
     landscape, chosen_atoms = get_conformation_landscape(
         frame_data_dir,
@@ -802,7 +805,8 @@ def step_pca(frame_data_dir: str, embedding_dir: str, force: bool = False, per_p
                     "cumulative_variance": cumulative,
                     "n_components": len(evr_list),
                     "params": {
-                        "scale": True,
+                        "center": True,
+                        "scale": bool(per_pair_scale),
                         "per_pair_scale": per_pair_scale,
                         "method": "noH_noROH_fast",
                         "sample_size": 300,
