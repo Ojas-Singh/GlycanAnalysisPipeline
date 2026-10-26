@@ -165,6 +165,14 @@ so they are the same with and without it.
   without it, with no `process/` data and no recomputation, by
   [`scripts/static_drop_levels.py`](#static-database-without-level-3-scriptsstatic_drop_levelspy).
 
+The PCA landscape is the PCA of the centred heavy-atom pair distances, in
+square angstroms: the distances are not divided by their standard deviations,
+so the components follow the large motions of the glycan (an antenna moving)
+rather than giving a stiff bonded distance the same weight. `per_pair_scale`
+divides every pair by its standard deviation first (the correlation-matrix PCA
+of the database before 2026-10-26). `landscape_metadata.json` records
+`center` and `scale`, and `preprocessing.npz` the means.
+
 The analysis of a trajectory is reproducible: the PCA is seeded (scikit-learn
 takes its randomized SVD for most glycans), the GMM is seeded, and the
 k-center clustering of Level 2 (and 3) starts from the frame nearest the
