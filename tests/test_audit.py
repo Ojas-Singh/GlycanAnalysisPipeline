@@ -206,6 +206,16 @@ def test_the_name_disagrees_port():
     assert audit._name_disagrees(info, "GlcNAc(a1-6)Man", [2, 3]) is None
 
 
+def test_the_name_disagrees_port_reads_furanose_anomers():
+    # GLYCAM writes a furanose's anomer as D (alpha) or U (beta), as in GS00473 (LArafb1-2LArafb1-OH)
+    info = {"torsions": {"glycosidic": [
+        {"canonical_name": "3_2_phi", "subtype": "phi", "residue_names": ["0aU", "0aU", "2aU", "2aU"],
+         "atom_names": ["O4", "C1", "O2", "C2"]}]}}
+    assert audit._name_disagrees(info, "Araf(b1-2)Araf", [2, 3]) is None
+    assert audit._name_disagrees(info, "Araf(a1-2)Araf", [2, 3]) == {
+        "in_name_not_in_structure": {"a1-2": 1}, "in_structure_not_in_name": {"b1-2": 1}}
+
+
 def test_mass_rule_tells_a_sulfate_and_hydrogens():
     f = facts(entry={"mass": 2267.28}, tree={"residues": 10, "groups": {"sulfate": 6, "sialic": 0, "uronic": 5,
                                                                         "phosphocholine": 0}},
