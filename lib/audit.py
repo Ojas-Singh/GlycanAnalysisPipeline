@@ -469,7 +469,7 @@ def _name_disagrees(info: Optional[Mapping[str, Any]], iupac: Optional[str], sug
             continue
         rn = phi["residue_names"][0]
         an = phi["atom_names"]
-        ab = {"A": "a", "B": "b"}.get(rn[2:3]) or ANOMER_EXCEPTIONS.get(rn[1:3], "?")
+        ab = {"A": "a", "B": "b", "D": "a", "U": "b"}.get(rn[2:3]) or ANOMER_EXCEPTIONS.get(rn[1:3], "?")
         built[f"{ab}{an[1][1:]}-{an[2][1:]}"] += 1
     named = Counter(f"{a}{c}-{p}" for a, c, p in re.findall(r"\(([ab])(\d)-(\d)\)", iupac))
     if not named or sum(named.values()) != sum(built.values()) or named == built:
