@@ -194,3 +194,19 @@ def test_names_with_open_or_odd_linkages_are_read():
     assert tree[0].base == "GlcNAc" and tree[0].parent is None
     with pytest.raises(ValueError):
         glyclass.parse_iupac_condensed("Gal(b1-4")
+
+
+def test_generated_description_leaves_out_submission_comments_and_a_zero_temperature():
+    from lib.glymeta import GlycanMetadataProcessor
+
+    data = {
+        "archetype": {"ID": "GS00999", "iupac": "Man(a1-2)Man", "package": "GROMACS", "forcefield": "CHARMM36m",
+                      "temperature": 0.0, "components": {"Man": 2}},
+        "search_meta": {"keywords": ["O-Glycan"], "common_names": []},
+    }
+    text = GlycanMetadataProcessor(".", pb_client=None)._generate_description(data, {"user_comments": "Donegal"})
+    assert "Donegal" not in text and "0.0K" not in text
+    assert text == ("GS00999 is a glycan with IUPAC notation Man(a1-2)Man. Classified as: O-Glycan. "
+                    "Simulated with MD package GROMACS, force field CHARMM36m. Composed of 2x Man.")
+    data["archetype"]["temperature"] = 310.0
+    assert "force field CHARMM36m, 310.0K." in GlycanMetadataProcessor(".", pb_client=None)._generate_description(data, {})

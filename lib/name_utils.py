@@ -36,6 +36,22 @@ from glycowork.motif.graph import compare_glycans
 
 
 
+def oxford_fits(name, iupac):
+    """Whether an Oxford-style name can belong to a glycan: it names no GalNAc and no sulfate the glycan lacks.
+
+    lib/oxford.json files thousands of sequences under names that mention a GalNAc or a sulfate the
+    sequence does not have ("A1GalNAc1" for plain A1, "A2GalNAc2[SO4-2]2" for plain A2); such a name
+    is never given.
+    """
+    name, iupac = str(name or ""), str(iupac or "")
+    if "GalNAc" in name and "GalNAc" not in iupac:
+        return False
+    sulfated = re.search(r"(?<=[0-9N])S(?![a-z])", iupac) is not None
+    if ("SO4" in name or "SO3" in name) and not sulfated:
+        return False
+    return True
+
+
 def get_oxford(iupac, oxford_dict='oxford.json'):
     # Convert to absolute path relative to this file's location
     if not Path(oxford_dict).is_absolute():
@@ -49,7 +65,7 @@ def get_oxford(iupac, oxford_dict='oxford.json'):
     
     for oxford_name, iupac_list in oxford_data.items():
         for iupac_from_json in iupac_list:
-            if len(iupac_from_json) == input_length:
+            if len(iupac_from_json) == input_length and oxford_fits(oxford_name, iupac):
                 if compare_glycans(iupac_from_json, iupac):
                     return oxford_name
     

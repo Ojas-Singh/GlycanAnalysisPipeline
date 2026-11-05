@@ -300,7 +300,9 @@ def test_what_the_folder_holds(bundle_dir, tmp_path, monkeypatch):
     assert sorted(data["archetype"]["cluster_levels"]) == ["level_1", "level_2"]
     assert data["search_meta"]["common_names"] == ["Mannobiose"]
     assert data["search_meta"]["keywords"] == ["Curated", "FF:GLYCAM_06j", "MD:GROMACS", "Source:manual"]
-    assert data["search_meta"]["description"].endswith("Run by the test.") and "aliases" not in data["search_meta"]
+    # the submission's comment is a note for the curators, not part of the published description
+    description = data["search_meta"]["description"]
+    assert "Run by the test." not in description and description.endswith("Composed of 2x Man.") and "aliases" not in data["search_meta"]
     assert report["search_meta"] == data["search_meta"] and report["identity"]["alpha"]["glytoucan"]
 
     # a PDB file is the static-ready one under the REMARK block of its anomer
