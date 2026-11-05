@@ -44,7 +44,8 @@ def search_enrichment(
     ``keywords``, ``common_names`` and ``description`` are the curated ones;
     ``package``, ``forcefield`` and ``source_type`` add the keywords
     ``MD:<package>``, ``FF:<force field>`` and ``Source:<type>``; ``comments``
-    end a generated description.  The fields come from the PocketBase
+    are passed on but never published in the description (they are notes of
+    the submission for the curators).  The fields come from the PocketBase
     records (``lib.pocketbase.extract_search_enrichment``) or from a
     submission record (``lib.entry_complete``).
     """
@@ -326,7 +327,12 @@ class GlycanMetadataProcessor:
         if forcefield:
             sim_parts.append(f"force field {forcefield}")
         temperature = archetype.get("temperature")
-        if temperature is not None:
+        try:
+            # 0 K is a missing temperature (some CHARMM submissions), not one to print.
+            known_temperature = temperature is not None and float(temperature) > 0
+        except (TypeError, ValueError):
+            known_temperature = False
+        if known_temperature:
             sim_parts.append(f"{temperature}K")
         if sim_parts:
             parts.append(f"Simulated with {', '.join(sim_parts)}.")
@@ -342,11 +348,8 @@ class GlycanMetadataProcessor:
             comp_str = ", ".join(f"{v}x {k}" for k, v in components.items())
             parts.append(f"Composed of {comp_str}.")
 
-        # User comments from PocketBase
-        user_comments = pb_enrichment.get("user_comments", "")
-        if user_comments:
-            parts.append(user_comments)
-
+        # The comments of a submission ("Auto upload from GOTW", a batch name) are notes for the
+        # curators, not a description of the glycan: they stay with the submission record.
         return " ".join(parts)
 
     def _sync_pocketbase_metadata(self, data: Dict, search_meta: Dict) -> None:
